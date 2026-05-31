@@ -77,6 +77,24 @@ impl ScratchStore {
         StoreDatabase::with_store_dir(self.db_path(), store_dir)
     }
 
+    /// Create a second, empty store that shares this store's *logical*
+    /// store directory but lives at a different physical location
+    /// (`local?store=…&real=…`). This is the destination of substitution
+    /// tests: `nix copy --to <dest>` must be able to register paths whose
+    /// logical prefix is this store's directory.
+    pub fn create_destination(&self) -> DestinationStore {
+        let dir = tempfile::tempdir().expect("creating tempdir failed");
+        let root = dir.path().display().to_string();
+        let logical = self.store_dir_path().display().to_string();
+        DestinationStore {
+            uri: format!(
+                "local?store={logical}&real={root}/store&state={root}/state&log={root}/log"
+            ),
+            physical_store_dir: dir.path().join("store"),
+            dir,
+        }
+    }
+
     fn nix_store_cmd(&self) -> Command {
         let mut cmd = Command::new("nix-store");
         cmd.arg("--store").arg(self.store_uri());
@@ -232,6 +250,36 @@ impl ScratchStore {
         let nar_hash = Hash32::parse_sha256(info.get("narHash")?.as_str()?)?;
         let nar_size = info.get("narSize")?.as_u64()?;
         Some((nar_hash, nar_size))
+    }
+}
+
+/// A destination store for substitution tests (see
+/// [`ScratchStore::create_destination`]).
+pub struct DestinationStore {
+    /// `--store` URI for nix commands targeting this store.
+    pub uri: String,
+    /// Where store path contents physically end up.
+    pub physical_store_dir: PathBuf,
+    dir: tempfile::TempDir,
+}
+
+impl Drop for DestinationStore {
+    fn drop(&mut self) {
+        // Nix strips write permission from store contents; restore it so
+        // the TempDir can actually delete them afterwards.
+        let _ = Command::new("chmod")
+            .arg("-R")
+            .arg("u+w")
+            .arg(self.dir.path())
+            .status();
+    }
+}
+
+impl DestinationStore {
+    /// Physical location of one store path in this store.
+    pub fn physical_path(&self, store_path: &Path) -> PathBuf {
+        self.physical_store_dir
+            .join(store_path.file_name().expect("store path has a basename"))
     }
 }
 

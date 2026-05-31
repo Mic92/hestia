@@ -170,10 +170,15 @@ pub struct Pack {
     pub chunks: Vec<(ChunkHash, PackedChunk)>,
 }
 
+/// GHA cache key for a pack blob (`pack-<sha256 hex>`).
+pub fn pack_cache_key(hash: &PackHash) -> String {
+    format!("pack-{}", hash.to_hex())
+}
+
 impl Pack {
     /// Cache key for this pack.
     pub fn cache_key(&self) -> String {
-        format!("pack-{}", self.hash.to_hex())
+        pack_cache_key(&self.hash)
     }
 
     /// Manifest chunk locations pointing into this pack.

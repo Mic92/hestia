@@ -857,6 +857,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmonia-store-nar-info"
+version = "3.1.0"
+source = "git+https://github.com/nix-community/harmonia?rev=3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba#3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba"
+dependencies = [
+ "harmonia-store-content-address",
+ "harmonia-store-path",
+ "harmonia-store-path-info",
+ "harmonia-utils-hash",
+ "harmonia-utils-signature",
+ "serde",
+]
+
+[[package]]
 name = "harmonia-store-path"
 version = "3.1.0"
 source = "git+https://github.com/nix-community/harmonia?rev=3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba#3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba"
@@ -988,6 +1001,7 @@ dependencies = [
  "harmonia-file-core",
  "harmonia-file-nar",
  "harmonia-store-db",
+ "harmonia-store-nar-info",
  "harmonia-store-path",
  "harmonia-store-path-info",
  "harmonia-utils-hash",
