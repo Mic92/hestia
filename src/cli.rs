@@ -40,6 +40,24 @@ pub struct ServeArgs {
     /// Drain and exit after this many seconds without activity.
     #[arg(long, value_name = "SECONDS")]
     pub idle_exit: Option<u64>,
+
+    /// Branch name for the manifest root key
+    /// [default: $GITHUB_REF_NAME, or "local"].
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Nix system string for the manifest root key [default: detected].
+    #[arg(long)]
+    pub system: Option<String>,
+
+    /// Trusted upstream signature key names; paths signed by any of these
+    /// are never uploaded. Repeatable [default: cache.nixos.org-1].
+    #[arg(long = "upstream-key", value_name = "KEY_NAME")]
+    pub upstream_keys: Vec<String>,
+
+    /// Nix store database to read path metadata from.
+    #[arg(long, default_value = "/nix/var/nix/db/db.sqlite")]
+    pub db_path: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -97,6 +115,11 @@ mod tests {
         assert_eq!(args.socket, PathBuf::from(DEFAULT_SOCKET));
         assert_eq!(args.idle_exit, None);
 
+        assert_eq!(args.branch, None);
+        assert_eq!(args.system, None);
+        assert!(args.upstream_keys.is_empty());
+        assert_eq!(args.db_path, PathBuf::from("/nix/var/nix/db/db.sqlite"));
+
         let cli = parse(&[
             "hestia",
             "serve",
@@ -106,6 +129,16 @@ mod tests {
             "0.0.0.0:8080",
             "--idle-exit",
             "120",
+            "--branch",
+            "main",
+            "--system",
+            "riscv64-linux",
+            "--upstream-key",
+            "cache.nixos.org-1",
+            "--upstream-key",
+            "company-cache-1",
+            "--db-path",
+            "/custom/db.sqlite",
         ]);
         let Command::Serve(args) = cli.command else {
             panic!("expected serve");
@@ -113,6 +146,16 @@ mod tests {
         assert_eq!(args.socket, PathBuf::from("/run/hestia.sock"));
         assert_eq!(args.listen, "0.0.0.0:8080");
         assert_eq!(args.idle_exit, Some(120));
+        assert_eq!(args.branch.as_deref(), Some("main"));
+        assert_eq!(args.system.as_deref(), Some("riscv64-linux"));
+        assert_eq!(
+            args.upstream_keys,
+            vec![
+                "cache.nixos.org-1".to_string(),
+                "company-cache-1".to_string()
+            ]
+        );
+        assert_eq!(args.db_path, PathBuf::from("/custom/db.sqlite"));
     }
 
     #[test]
