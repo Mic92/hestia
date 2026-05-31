@@ -31,10 +31,19 @@ jobs:
   # tokens visible to shell steps and that the results endpoint is reachable.
   # If this job fails, the whole project needs rethinking (see PLAN.md,
   # Critical Constraint 1).
+  #
+  # Phase 1 milestone: the real-API integration tests round-trip a blob
+  # through the actual GHA cache (Twirp reserve/finalize, Azure PUT/Range
+  # GET) and manage entries via the REST API.
   token-probe:
     runs-on: ubuntu-latest
+    permissions:
+      # actions:write is needed by the REST delete test
+      actions: write
+      contents: read
     steps:
       - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
       - uses: ./action
       - name: Assert cache tokens are visible to shell steps
         run: |
@@ -59,3 +68,7 @@ jobs:
             echo "Could not reach $ACTIONS_RESULTS_URL" >&2
             exit 1
           fi
+      - name: Run real-API integration tests
+        run: nix develop -c cargo test --test gha_real -- --ignored --nocapture
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
