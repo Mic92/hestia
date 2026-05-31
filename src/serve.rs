@@ -1,6 +1,10 @@
+//! `hestia serve`: the per-job daemon (hook listener + write pipeline).
+
+use std::process::ExitCode;
+
 use crate::cli::ServeArgs;
 
-pub fn run(args: &ServeArgs) {
+pub async fn run(args: &ServeArgs) -> ExitCode {
     eprintln!(
         "hestia serve: not implemented yet \
          (would listen on {} for substitution requests, \
@@ -9,4 +13,5 @@ pub fn run(args: &ServeArgs) {
         args.socket.display(),
         args.idle_exit,
     );
+    ExitCode::FAILURE
 }

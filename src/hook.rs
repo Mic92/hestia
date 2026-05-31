@@ -1,6 +1,10 @@
+//! `hestia hook`: the post-build-hook client.
+
+use std::process::ExitCode;
+
 use crate::cli::HookArgs;
 
-pub fn run(args: &HookArgs) {
+pub async fn run(args: &HookArgs) -> ExitCode {
     // A failing post-build-hook fails the build, so this command must
     // always exit 0, even once it is implemented.
     eprintln!(
@@ -9,4 +13,5 @@ pub fn run(args: &HookArgs) {
         args.paths.len(),
         args.socket.display(),
     );
+    ExitCode::SUCCESS
 }

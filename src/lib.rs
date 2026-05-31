@@ -4,5 +4,10 @@
 //! need to reach; the `hestia` binary in `main.rs` is a thin CLI on top.
 
 pub mod chunker;
+pub mod cli;
+pub mod drain;
+pub mod gc;
 pub mod gha;
+pub mod hook;
 pub mod manifest;
+pub mod serve;

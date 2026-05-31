@@ -1,19 +1,17 @@
-mod cli;
-mod drain;
-mod gc;
-mod hook;
-mod serve;
+use std::process::ExitCode;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Command};
+use hestia::cli::{Cli, Command};
+use hestia::{drain, gc, hook, serve};
 
-fn main() {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve(args) => serve::run(&args),
-        Command::Hook(args) => hook::run(&args),
-        Command::Drain(args) => drain::run(&args),
+        Command::Serve(args) => serve::run(&args).await,
+        Command::Hook(args) => hook::run(&args).await,
+        Command::Drain(args) => drain::run(&args).await,
         Command::Gc(args) => gc::run(&args),
     }
 }
