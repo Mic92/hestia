@@ -11,5 +11,6 @@ pub mod gha;
 pub mod hook;
 pub mod manifest;
 pub mod pathinfo;
+pub mod protocol;
 pub mod serve;
 pub mod upstream;
