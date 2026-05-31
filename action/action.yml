@@ -1,0 +1,46 @@
+name: hestia-cache
+description: >
+  Nix binary cache backed by the GitHub Actions cache. Captures the Actions
+  runtime tokens (which are only injected into actions, never into `run:`
+  steps) and exports them so the hestia daemon started from shell steps can
+  talk to the cache API.
+
+inputs:
+  hestia-binary:
+    description: >
+      Path to a hestia binary, or a version to install. Installation is not
+      implemented yet; this input is recorded for later phases.
+    required: false
+    default: hestia
+
+runs:
+  using: composite
+  steps:
+    # ACTIONS_RUNTIME_TOKEN and ACTIONS_RESULTS_URL exist only in the process
+    # environment of JS actions. Re-export them via GITHUB_ENV so later shell
+    # steps (and the hestia daemon they start) can use them. The token is a
+    # credential, so mask it in logs first.
+    - name: Capture GitHub Actions cache tokens
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const token = process.env.ACTIONS_RUNTIME_TOKEN || '';
+          const resultsUrl = process.env.ACTIONS_RESULTS_URL || '';
+          if (token) {
+            core.setSecret(token);
+          }
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', token);
+          core.exportVariable('ACTIONS_RESULTS_URL', resultsUrl);
+
+    # Placeholder: later phases install the hestia binary, write nix.conf
+    # (extra-substituters + post-build-hook) and start `hestia serve`.
+    - name: Install and start hestia (placeholder)
+      shell: bash
+      run: |
+        echo "hestia-cache: would install hestia from '${{ inputs.hestia-binary }}'"
+        echo "hestia-cache: would start 'hestia serve' and configure nix.conf"
+
+    # Composite actions have no native `post:` hook. Delegate to a nested
+    # node action whose post: entry point runs `hestia drain` at job teardown.
+    - name: Register drain post-step
+      uses: ./action/post

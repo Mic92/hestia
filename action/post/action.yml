@@ -1,0 +1,10 @@
+name: hestia-drain
+description: >
+  Internal helper for hestia-cache. Composite actions cannot declare a
+  `post:` hook, so this nested node action exists solely to run
+  `hestia drain` when the job tears down.
+
+runs:
+  using: node20
+  main: main.js
+  post: post.js
