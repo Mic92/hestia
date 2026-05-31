@@ -89,7 +89,7 @@ not on crates.io):
 | Store path walk + NAR events | `harmonia-file-nar`: `NarDumper` (`dump(path)`) | Produces `Stream<NarEvent>`: file data as `Bytes` (small files buffered, large files mmap'd), directories/symlinks as events. Exactly the per-file access FastCDC needs. |
 | NAR serialization (events → bytes) | `harmonia-file-nar`: `NarByteStream`, `NarWriter` | Converts `NarEvent` stream to NAR framing. Used twice: (a) write side to compute `nar_hash`, (b) read side to serve reassembled NARs. **Same code path → byte-identical NARs → hashes match by construction.** |
 | File tree type for manifest | `harmonia-file-core`: `FileTree<C>` (generic over content) | `FileTree<ChunkList>` = manifest tree. Already has serde. |
-| PathInfo via nix-daemon protocol | `harmonia-store-remote`: `DaemonClient`, `ConnectionPool`, `query_path_info` | No `nix path-info` subprocess; pooled unix-socket connections. |
+| PathInfo from the store database | `harmonia-store-db`: `StoreDb`, `query_path_info` | Direct SQLite reads, same as harmonia-cache in production. Works without a daemon (single-user installs, scratch stores in tests). *(Originally planned as harmonia-store-remote / daemon protocol; revised in Phase 3, see Open Question 11.)* |
 | narinfo construction + formatting | `harmonia-store-nar-info`: `build_narinfo()`, text serialization | Handles URL/Compression/References/Sig lines; supports signing if we add it later. |
 | Store path types | `harmonia-store-path`: `StorePath`, `StorePathHash` | Parsing/validation. |
 | Signature parsing (upstream filter) | `harmonia-utils-signature`: `Signature::name()` | "Is this path signed by cache.nixos.org-1?" |
@@ -107,9 +107,10 @@ them to the same `NarByteStream`. No harmonia changes needed.
   serving, TLS, HTML templates, prometheus. Hestia's substituter is ~3 routes
   over a manifest — write it fresh (~300 LOC), reference harmonia-cache's
   handlers for protocol details.
-- `harmonia-store-db` (direct SQLite): daemon protocol is the safer default
-  (works with sandboxing/multi-user); revisit only if daemon round-trips show
-  up in profiles.
+- `harmonia-store-remote` (nix-daemon protocol): originally chosen as "the
+  safer default", dropped in Phase 3 in favor of `harmonia-store-db` — a
+  daemon only exists on multi-user installs, while the database exists
+  wherever paths were built (Open Question 11).
 
 ## New Dependencies
 
@@ -136,8 +137,9 @@ hestia serve                       (one process per CI job)
 │     /{hash}.narinfo    → manifest lookup → build_narinfo() → record access
 │     /nar/{hash}.nar    → chunks → NarEvents → NarByteStream → stream
 └── on drain (action post-step) or idle-exit:
-      paths → DaemonClient.query_path_info → filter upstream-signed
+      paths → store-db query_path_info → filter upstream-signed
       → NarDumper events → FastCDC chunks (skip known) + nar_hash
+        recomputed from the chunked representation (integrity gate)
       → pack new chunks → Twirp reserve → Azure PUT → finalize
       → manifest merge: paths, chunks, pack, root = pushed ∪ accessed
       → SaveMutable "m#N+1" (retry/re-merge on conflict)
@@ -318,17 +320,38 @@ under Open Questions (10).
 
 ### Phase 3: Write pipeline + hook
 
-- `hook.rs`: `hestia hook` (client) + unix socket listener in serve
-- `upstream.rs`: signature-name filtering (default trusted:
-  `cache.nixos.org-1`, configurable)
-- `pipeline.rs`: paths → `query_path_info` (harmonia-store-remote) → filter
-  → `dump()` events → tee(chunker, nar_hash) → pack → upload → manifest
-  commit with root update
-- `serve.rs`: daemon lifecycle (socket, drain command, idle-exit, SIGTERM)
-- Tests: end-to-end with real store paths + fake-gha backend; daemon
-  drain under concurrent hook sends
-- **Milestone: `nix build` with post-build-hook on a runner → paths appear
-  as pack + manifest entries in the repo's GHA cache.**
+**Status: done** (except the on-runner milestone, which needs the repo
+pushed to GitHub with the action wrapper providing real tokens; everything
+below the GHA API boundary is covered by scratch-store + fake-gha tests).
+Deviations recorded under Open Questions (11–12).
+
+- [x] `protocol.rs` + `hook.rs`: JSON-lines socket protocol; `hestia hook`
+      reads `$OUT_PATHS` (or explicit args) and always exits 0 — verified
+      by spawning the real binary against unreachable sockets, error
+      responses, and servers that hang up
+- [x] `upstream.rs`: signature-name filtering (default trusted:
+      `cache.nixos.org-1`, repeatable `--upstream-key` to override)
+- [x] `pathinfo.rs`: store-database reads via harmonia-store-db (NOT the
+      daemon protocol — see Open Question 11)
+- [x] `pipeline.rs`: batch path-info query → filter (invalid / upstream /
+      already-stored with last_pushed bump) → chunk → NAR-hash verification
+      from the chunked representation (integrity gate, see Open Question
+      12) → pack → upload (already_exists = skip) → SaveMutable commit with
+      re-merge; root = pushed ∪ accessed; `AccessLog` is the Phase 4
+      substituter integration point
+- [x] `serve.rs`: daemon lifecycle (hook socket, serialized drains with
+      failed-drain retry, idle-exit, SIGTERM/SIGINT → final drain);
+      `drain.rs`: post-step client with one-line summary, fails loudly
+      (unlike hook)
+- [x] Tests: hermetic scratch stores (`nix-store --store 'local?store=…'
+      --add`, fabricated upstream signatures via `nix store sign`,
+      references via `builtins.toFile`) + fake-gha; pipeline e2e incl.
+      dedup re-runs and cross-path chunk sharing; daemon drain under
+      concurrent hook sends; SaveMutable conflict between two concurrent
+      pipelines
+- [ ] **Milestone: `nix build` with post-build-hook on a runner → paths
+      appear as pack + manifest entries in the repo's GHA cache.** Pending
+      first push.
 
 ### Phase 4: Substituter
 
@@ -521,11 +544,16 @@ API gets faked, and only because GitHub gives no other choice locally.
     subprocess fallback was also considered and rejected (subprocess
     parsing for no environment gain). Tests needing a store database probe
     for it at runtime and skip with a notice when missing.
-12. **chunk_path walks the path twice** (Phase 2): once via NarDumper for
-    chunking and once via NarByteStream for the NAR hash. Phase 3 should
-    tee a single event stream into both consumers (PLAN's original design)
-    if profiling shows the double walk matters; for CI-sized paths it does
-    not.
+12. **chunk_path walks the path twice** (Phase 2) — resolved in Phase 3.
+    The pipeline now computes the NAR hash from the *chunked
+    representation* (`nar_hash_from_chunks`: synthesized events →
+    NarWriter → SHA-256) instead of a second disk walk. Besides removing
+    the double walk, this is a strictly stronger check: equality with the
+    store database's nar_hash proves the data hestia uploads can be served
+    back byte-identically (a chunker bug now fails the drain instead of
+    surfacing as hash mismatches on some future substitution). It is also
+    the exact code path the Phase 4 substituter will use, so write and
+    read side cannot drift apart.
 
 ## Mistakes Fixed from Earlier Draft
 
