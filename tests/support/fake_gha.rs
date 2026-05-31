@@ -49,6 +49,16 @@ struct Entry {
     last_accessed_at: u64,
 }
 
+/// One recorded blob download (used by tests asserting fetch behavior,
+/// e.g. "prefetched chunks are not fetched twice").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRequest {
+    /// Cache key of the entry the blob belongs to (e.g. `pack-<hex>`).
+    pub key: String,
+    /// Raw `Range` header value, if the request was a range read.
+    pub range: Option<String>,
+}
+
 #[derive(Debug)]
 struct Inner {
     dir: PathBuf,
@@ -57,6 +67,7 @@ struct Inner {
     next_sig: u64,
     valid_sigs: HashSet<String>,
     clock: u64,
+    blob_requests: Vec<BlobRequest>,
 }
 
 impl Inner {
@@ -291,6 +302,16 @@ async fn blob_get(
     let now = inner.tick();
     inner.entries[position].last_accessed_at = now;
 
+    // Record the download for tests that assert fetch behavior.
+    let request = BlobRequest {
+        key: inner.entries[position].key.clone(),
+        range: headers
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+    };
+    inner.blob_requests.push(request);
+
     match headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
@@ -414,6 +435,7 @@ pub struct FakeGha {
     pub base_url: String,
     /// Repository slug the REST routes are mounted under.
     pub repo: String,
+    inner: Arc<Mutex<Inner>>,
     task: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
@@ -427,15 +449,17 @@ impl FakeGha {
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}");
 
+        let inner = Arc::new(Mutex::new(Inner {
+            dir: dir.path().to_path_buf(),
+            entries: Vec::new(),
+            next_id: 0,
+            next_sig: 0,
+            valid_sigs: HashSet::new(),
+            clock: 0,
+            blob_requests: Vec::new(),
+        }));
         let state = AppState {
-            inner: Arc::new(Mutex::new(Inner {
-                dir: dir.path().to_path_buf(),
-                entries: Vec::new(),
-                next_id: 0,
-                next_sig: 0,
-                valid_sigs: HashSet::new(),
-                clock: 0,
-            })),
+            inner: Arc::clone(&inner),
             base_url: base_url.clone(),
         };
 
@@ -458,9 +482,15 @@ impl FakeGha {
         Self {
             base_url,
             repo: "fake/repo".to_string(),
+            inner,
             task,
             _dir: dir,
         }
+    }
+
+    /// All blob downloads served so far, in order.
+    pub fn blob_requests(&self) -> Vec<BlobRequest> {
+        self.inner.lock().unwrap().blob_requests.clone()
     }
 
     /// Twirp client pointed at this fake.
