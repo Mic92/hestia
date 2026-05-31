@@ -18,6 +18,7 @@ use hestia::pathinfo::StoreDatabase;
 use hestia::pipeline::{self, AccessLog, MANIFEST_PREFIX, PipelineContext};
 use hestia::protocol::{self, DrainStats, Request};
 use hestia::serve::Daemon;
+use hestia::substituter::{ManifestStore, Substituter};
 use hestia::upstream::UpstreamFilter;
 
 use support::fake_gha::FakeGha;
@@ -43,20 +44,32 @@ fn pipeline_context(
 /// A daemon running in the background of the test.
 struct RunningDaemon {
     socket: PathBuf,
+    manifest_store: ManifestStore,
+    access_log: AccessLog,
     handle: JoinHandle<Result<DrainStats, pipeline::Error>>,
     shutdown: oneshot::Sender<()>,
 }
 
 impl RunningDaemon {
     async fn start(socket: PathBuf, idle_exit: Option<Duration>, ctx: PipelineContext) -> Self {
-        let daemon =
-            Daemon::bind(&socket, idle_exit, ctx, AccessLog::new()).expect("binding daemon failed");
+        let manifest_store = ManifestStore::new();
+        let access_log = AccessLog::new();
+        let daemon = Daemon::bind(
+            &socket,
+            idle_exit,
+            ctx,
+            access_log.clone(),
+            manifest_store.clone(),
+        )
+        .expect("binding daemon failed");
         let (shutdown, shutdown_rx) = oneshot::channel();
         let handle = tokio::spawn(daemon.run(async {
             let _ = shutdown_rx.await;
         }));
         Self {
             socket,
+            manifest_store,
+            access_log,
             handle,
             shutdown,
         }
@@ -262,6 +275,7 @@ async fn idle_exit_drains_and_returns() {
         Some(Duration::from_millis(300)),
         pipeline_context(&fake, &http, store.database()),
         AccessLog::new(),
+        ManifestStore::new(),
     )
     .expect("binding daemon failed");
 
@@ -389,6 +403,97 @@ async fn drain_cli_binary_fails_against_dead_socket() {
         !output.status.success(),
         "drain must report failure when the daemon is unreachable"
     );
+}
+
+#[tokio::test]
+async fn substituter_serves_paths_pushed_by_daemon_drains() {
+    // The serve-level wiring (what `hestia serve` assembles): the daemon
+    // and the substituter share a ManifestStore and an AccessLog. Paths
+    // pushed through the hook socket become substitutable after a drain,
+    // without restarting anything; narinfo hits show up in the daemon's
+    // access log so the next drain pins them.
+    let test = async {
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let fixture = store.add_fixture("serve-substituter", 131);
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        let socket = store_socket_path(&store);
+        let daemon = RunningDaemon::start(
+            socket,
+            None,
+            pipeline_context(&fake, &http, store.database()),
+        )
+        .await;
+
+        // Mount the substituter on the daemon's shared state, exactly like
+        // serve::run does.
+        let substituter = Substituter::new(
+            store.database().store_dir().clone(),
+            daemon.manifest_store.clone(),
+            daemon.access_log.clone(),
+            fake.twirp(&http),
+            http.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, substituter.into_router())
+                .await
+                .unwrap();
+        });
+
+        let hash = path_hash_of(&fixture);
+        let narinfo_url = format!("{base_url}/{hash}.narinfo");
+
+        // Nothing pushed yet: miss.
+        let response = http.get(&narinfo_url).send().await.unwrap();
+        assert_eq!(response.status(), 404);
+
+        // Hook + drain through the socket.
+        daemon.add(&[&fixture]).await;
+        let response = daemon.request(&Request::Drain).await;
+        assert_eq!(response.stats.expect("drain stats").pushed, 1);
+
+        // The drain refreshed the shared manifest: the path is servable now.
+        let response = http.get(&narinfo_url).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "path pushed by a drain must be substitutable without a restart"
+        );
+        let narinfo = response.text().await.unwrap();
+        let nar_url = narinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("URL: "))
+            .expect("narinfo has a URL line");
+
+        let response = http
+            .get(format!("{base_url}/{nar_url}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let (expected_hash, expected_size) = store.nar_hash_oracle(&fixture).unwrap();
+        let nar = response.bytes().await.unwrap();
+        assert_eq!(nar.len() as u64, expected_size);
+        assert_eq!(hestia::manifest::Hash32::digest(nar), expected_hash);
+
+        // The narinfo hit landed in the daemon's access log...
+        assert!(daemon.access_log.snapshot().contains(&hash));
+
+        // ...so the final drain pins it in the root even though nothing new
+        // was pushed.
+        daemon.stop().await.expect("final drain failed");
+        server.abort();
+        let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
+        assert!(manifest.roots[TEST_ROOT_KEY].paths.contains(&hash));
+    };
+    tokio::time::timeout(Duration::from_secs(120), test)
+        .await
+        .expect("test timed out: deadlock or hung server");
 }
 
 /// Socket path inside the scratch store's tempdir (cleaned up with it).

@@ -1,16 +1,26 @@
 //! `hestia serve`: the per-job daemon.
 //!
-//! Phase 3 scope: the post-build-hook listener (unix socket) and the drain
-//! lifecycle. The substituter HTTP server (`--listen`) is Phase 4; its
-//! integration point — the [`AccessLog`] — already exists.
+//! Two servers share one process:
+//!
+//! * the post-build-hook listener (unix socket): buffers locally-built
+//!   paths and uploads them on drain;
+//! * the substituter (HTTP): serves previously cached paths back to Nix.
+//!
+//! They are coupled through two pieces of shared state: the [`AccessLog`]
+//! (substituter records narinfo hits, drains turn them into GC roots) and
+//! the [`ManifestStore`] (drains publish newly pushed paths, the
+//! substituter serves them without a restart).
 //!
 //! Lifecycle:
 //!
 //! ```text
-//! bind socket -> accept hook/drain/status requests
-//!   add    -> buffer paths in memory
-//!   drain  -> run the write pipeline over buffered + accessed paths
-//!   status -> report buffered count
+//! load manifest -> bind hook socket + substituter listener
+//!   add     -> buffer paths in memory
+//!   drain   -> run the write pipeline over buffered + accessed paths
+//!              -> refresh the served manifest
+//!   status  -> report buffered count
+//!   narinfo -> record access, prefetch chunks
+//!   nar     -> serve chunks fetched from packs
 //! exit on: shutdown signal (SIGTERM/SIGINT) or idle timeout
 //!   -> one final drain before returning
 //! ```
@@ -35,6 +45,7 @@ use crate::gha::twirp::TwirpClient;
 use crate::pathinfo::StoreDatabase;
 use crate::pipeline::{self, AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
 use crate::protocol::{DrainStats, Request, Response, encode_line};
+use crate::substituter::{ManifestStore, Substituter};
 use crate::upstream::UpstreamFilter;
 
 /// How often the idle-exit timer checks for inactivity.
@@ -44,8 +55,11 @@ const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 struct DaemonState {
     /// Store paths registered by hooks, waiting for the next drain.
     buffered: Mutex<BTreeSet<String>>,
-    /// Paths served by the substituter (Phase 4 fills this).
+    /// Paths served by the substituter (narinfo hits).
     access_log: AccessLog,
+    /// Manifest shared with the substituter; refreshed after every
+    /// successful drain so newly pushed paths become servable.
+    manifest_store: ManifestStore,
     /// The write pipeline.
     pipeline: PipelineContext,
     /// Serializes drains: concurrent drain requests run one at a time.
@@ -84,6 +98,17 @@ impl DaemonState {
         match self.pipeline.run(paths.clone(), accessed, now_unix()).await {
             Ok(stats) => {
                 self.touch();
+                // Publish the new manifest to the substituter. Reload from
+                // the cache (instead of keeping the local merge result) so
+                // paths committed by concurrent jobs become servable too.
+                if stats.manifest_version > 0 {
+                    match self.pipeline.load_manifest().await {
+                        Ok(manifest) => self.manifest_store.set(manifest),
+                        Err(err) => eprintln!(
+                            "hestia serve: reloading the manifest after a drain failed: {err}"
+                        ),
+                    }
+                }
                 Ok(stats)
             }
             Err(err) => {
@@ -135,6 +160,7 @@ impl Daemon {
         idle_exit: Option<Duration>,
         pipeline: PipelineContext,
         access_log: AccessLog,
+        manifest_store: ManifestStore,
     ) -> std::io::Result<Self> {
         if let Some(parent) = socket.parent() {
             std::fs::create_dir_all(parent)?;
@@ -150,6 +176,7 @@ impl Daemon {
             state: Arc::new(DaemonState {
                 buffered: Mutex::new(BTreeSet::new()),
                 access_log,
+                manifest_store,
                 pipeline,
                 drain_lock: tokio::sync::Mutex::new(()),
                 last_activity: Mutex::new(Instant::now()),
@@ -159,9 +186,22 @@ impl Daemon {
         })
     }
 
-    /// The daemon's access log (handed to the Phase 4 substituter).
+    /// The daemon's access log (shared with the substituter).
     pub fn access_log(&self) -> AccessLog {
         self.state.access_log.clone()
+    }
+
+    /// The manifest shared with the substituter.
+    pub fn manifest_store(&self) -> ManifestStore {
+        self.state.manifest_store.clone()
+    }
+
+    /// An activity callback for the substituter: requests served over HTTP
+    /// reset the idle-exit timer just like hook traffic does (a Nix that is
+    /// actively substituting must not be cut off).
+    pub fn activity_hook(&self) -> crate::substituter::ActivityHook {
+        let state = Arc::clone(&self.state);
+        Arc::new(move || state.touch())
     }
 
     /// Serve until `shutdown` resolves or the idle timeout expires, then
@@ -289,17 +329,35 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         .unwrap_or_else(|| "local".to_string());
     let system = args.system.clone().unwrap_or_else(pipeline::current_system);
 
+    let store_dir = store.store_dir().clone();
     let pipeline = PipelineContext {
-        twirp,
-        http,
+        twirp: twirp.clone(),
+        http: http.clone(),
         store,
         upstream,
         root_key: pipeline::root_key(&branch, &system),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
     };
 
+    // Load the manifest committed by previous runs so the substituter can
+    // serve those paths from the start. No manifest yet (first run) or a
+    // load failure both mean "serve nothing until the first drain".
+    let manifest_store = ManifestStore::new();
+    match pipeline.load_manifest().await {
+        Ok(manifest) => manifest_store.set(manifest),
+        Err(err) => {
+            eprintln!("hestia serve: cannot load the manifest, substituting nothing: {err}");
+        }
+    }
+
     let idle_exit = args.idle_exit.map(Duration::from_secs);
-    let daemon = match Daemon::bind(&args.socket, idle_exit, pipeline, AccessLog::new()) {
+    let daemon = match Daemon::bind(
+        &args.socket,
+        idle_exit,
+        pipeline,
+        AccessLog::new(),
+        manifest_store.clone(),
+    ) {
         Ok(daemon) => daemon,
         Err(err) => {
             eprintln!(
@@ -310,9 +368,30 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         }
     };
 
+    // The substituter HTTP server shares the manifest and access log with
+    // the daemon and runs until the daemon exits.
+    let substituter = Substituter::new(store_dir, manifest_store, daemon.access_log(), twirp, http)
+        .with_activity_hook(daemon.activity_hook());
+    let listener = match tokio::net::TcpListener::bind(&args.listen).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!(
+                "hestia serve: cannot bind substituter address {}: {err}",
+                args.listen
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let substituter_task = tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, substituter.into_router()).await {
+            eprintln!("hestia serve: substituter server failed: {err}");
+        }
+    });
+
     eprintln!(
-        "hestia serve: listening on {} (root key: {}-{})",
+        "hestia serve: hook socket {}, substituter http://{} (root key: {}-{})",
         args.socket.display(),
+        args.listen,
         branch,
         system
     );
@@ -329,7 +408,9 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         }
     };
 
-    match daemon.run(shutdown).await {
+    let result = daemon.run(shutdown).await;
+    substituter_task.abort();
+    match result {
         Ok(stats) => {
             eprintln!(
                 "hestia serve: final drain pushed {} path(s), {} pack(s), {} bytes \
