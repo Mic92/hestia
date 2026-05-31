@@ -72,3 +72,49 @@ jobs:
         run: nix develop -c cargo test --test gha_real -- --ignored --nocapture
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+  # Phase 4 milestone: hestia's own CI dogfoods hestia. The first run
+  # populates the cache (post-build-hook -> drain); every later run
+  # substitutes from it instead of rebuilding.
+  #
+  # enabled-after-first-push: this job stays disabled until the token-probe
+  # job has proven on a real runner that token capture and the cache API
+  # work (it cannot be tested before the repository's first push). Enable
+  # it by setting the repository variable HESTIA_DOGFOOD to "true".
+  dogfood:
+    if: ${{ vars.HESTIA_DOGFOOD == 'true' }} # enabled-after-first-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
+      # Capture ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL for the daemon.
+      - uses: ./action
+      - name: Build hestia
+        run: nix build .# -o hestia-bin
+      - name: Start hestia serve and wire it into nix.conf
+        run: |
+          set -euo pipefail
+          # The daemon: hook listener + substituter, draining on SIGTERM.
+          nohup ./hestia-bin/bin/hestia serve \
+            --listen 127.0.0.1:37515 \
+            --socket /tmp/hestia/hook.sock > /tmp/hestia-serve.log 2>&1 &
+          # post-build-hook must be a program, not a subcommand: tiny shim.
+          sudo tee /usr/local/bin/hestia-post-build-hook > /dev/null <<EOF
+          #!/bin/sh
+          exec "$PWD/hestia-bin/bin/hestia" hook --socket /tmp/hestia/hook.sock
+          EOF
+          sudo chmod +x /usr/local/bin/hestia-post-build-hook
+          {
+            echo "extra-substituters = http://127.0.0.1:37515?trusted=true"
+            echo "post-build-hook = /usr/local/bin/hestia-post-build-hook"
+          } | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon
+      - name: Build through the cache
+        # Anything that produces local (unsigned) store paths works; the
+        # devshell pulls in the whole rust toolchain closure.
+        run: nix develop -c cargo --version
+      - name: Drain (upload new paths, commit manifest)
+        run: ./hestia-bin/bin/hestia drain --socket /tmp/hestia/hook.sock --timeout 300
+      - name: Show daemon log
+        if: always()
+        run: cat /tmp/hestia-serve.log

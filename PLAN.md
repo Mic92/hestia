@@ -355,20 +355,41 @@ Deviations recorded under Open Questions (11–12).
 
 ### Phase 4: Substituter
 
-- `substituter.rs`: axum app
-  - `/nix-cache-info` (Priority 30, WantMassQuery 1)
-  - `/{hash}.narinfo`: manifest lookup → `build_narinfo()` (Compression:
-    none) → record access
-  - `/nar/{hash}.nar`: chunk plan → batched Range fetches per pack
-    (parallel, prefetch on narinfo hit) → synthesize `NarEvent`s →
-    `NarByteStream` → stream response
-  - any chunk 404 → whole NAR 404 (nix falls through; never partial data)
-- Tests: narinfo text vs `nix path-info --json`; NAR round-trip hash check;
-  scratch-store substitution: `nix copy --from http://localhost:37515
-  --store /tmp/scratch` into an empty chroot store, compare contents
-- **Milestone: second CI run substitutes from cache instead of rebuilding;
-  ephemeral runner store gets populated from packs. Hestia's own CI starts
-  dogfooding hestia.**
+**Status: done** (except the on-runner milestone, which needs the repo
+pushed to GitHub; the `dogfood` CI job is committed but disabled — see
+below). Deviations and findings recorded under Open Questions (13–16).
+
+- [x] `substituter.rs`: axum app
+  - [x] `/nix-cache-info` (Priority 30, WantMassQuery 1, scratch-store
+        aware StoreDir)
+  - [x] `/{hash}.narinfo`: manifest lookup → `build_narinfo()` +
+        `format_narinfo_txt()` from harmonia (Compression: none, unsigned)
+        → record access → spawn background chunk prefetch
+  - [x] `/nar/{narhash}.nar`: chunk plan grouped by pack → coalesced Range
+        fetches (adjacent chunks share a request), packs in parallel,
+        signed pack URLs cached with TTL + refreshed on 403 → synthesize
+        NAR from tree + chunks → hash-verify → respond (see Open
+        Question 14: buffered, not streamed)
+  - [x] any chunk failure (eviction, 404, hash mismatch) → whole NAR 404
+        (nix falls through; never partial data)
+- [x] Wired into `hestia serve`: shared `ManifestStore` (loaded at startup,
+      refreshed after every drain) + shared `AccessLog` (narinfo hits join
+      the next drain's root); substituter traffic resets the idle-exit timer
+- [x] Tests: narinfo fields vs `nix path-info --json`; NAR round-trip hash
+      check; scratch-store substitution via real `nix copy` and via
+      `nix-store --realise` with a `?trusted=true` substituter (byte-for-
+      byte tree comparison); pack eviction → clean 404 + failed `nix copy`
+      leaves no partial path; access recording → root update; prefetch → no
+      duplicate pack reads; URL expiry mid-serving → transparent refresh;
+      manifest refresh without restart
+- [ ] **Milestone: second CI run substitutes from cache instead of
+      rebuilding; ephemeral runner store gets populated from packs.
+      Hestia's own CI starts dogfooding hestia.** Pending first push: the
+      `dogfood` job in `.github/workflows/ci.yml` builds hestia, starts
+      `hestia serve`, wires nix.conf (substituter + post-build-hook), and
+      drains — but is gated behind the repository variable `HESTIA_DOGFOOD`
+      (marker: `enabled-after-first-push`) until the token-probe job has
+      proven the cache API works on a real runner.
 
 ### Phase 5: GC
 
@@ -453,9 +474,10 @@ tokens:
 - **Crash safety**: kill the pipeline between every pair of steps →
   invariants hold (old packs referenced until manifest commit, orphans
   cleaned next run).
-- **Dogfooding**: from Phase 4 on, hestia's own CI uses hestia. Cache
-  misses, corruption, and eviction handling show up as slow or failing
-  builds immediately.
+- **Dogfooding**: from Phase 4 on, hestia's own CI uses hestia (the
+  `dogfood` job in ci.yml; disabled until the first push, marker
+  `enabled-after-first-push`). Cache misses, corruption, and eviction
+  handling show up as slow or failing builds immediately.
 
 No NixOS VM test: it cannot have real tokens (so it would test the fake
 backend — same coverage as layer 2/3, slower), and the "clean store"
@@ -554,6 +576,42 @@ API gets faked, and only because GitHub gives no other choice locally.
     surfacing as hash mismatches on some future substitution). It is also
     the exact code path the Phase 4 substituter will use, so write and
     read side cannot drift apart.
+13. **The manifest stores full store paths, not just hashes** (Phase 4
+    schema change). narinfo responses need full basenames
+    (`<hash>-<name>`) for the StorePath and References lines, so
+    `PathEntry` records `store_path: StorePath` and keeps references and
+    deriver as `StorePath` values instead of `PathHash`/`String`. The
+    manifest key stays the hash; the reachability walk derives keys from
+    the stored paths. Breaking schema change, irrelevant in practice: no
+    manifest exists outside tests before the first push.
+14. **NAR responses are buffered and verified, not streamed** (Phase 4).
+    The plan sketched streaming through `NarByteStream`; the
+    implementation assembles the full NAR in memory, checks its SHA-256
+    against the manifest's nar_hash, and only then responds. Reason: the
+    "never partial/corrupt data" rule. With a streamed response, a chunk
+    failure or hash mismatch discovered mid-body can only abort the
+    connection after bytes (with a 200 status) have already been sent.
+    All chunks must be fetched before serving anyway, so buffering costs
+    one extra copy of nar_size bytes, briefly. Revisit if NARs get large
+    enough for this to matter (CI artifacts are typically well under 1 GB).
+15. **Nix store-URL details for substitution** (Phase 4 test findings).
+    (a) Nix's http binary cache client checks the cache's advertised
+    StoreDir against its *own* store prefix, which defaults to
+    /nix/store — substituting from a cache that serves a scratch store
+    needs `?store=<dir>` in the substituter URL. Irrelevant in production
+    (real runners use /nix/store) but required in hermetic tests.
+    (b) `?trusted=true` is honored by the substitution goal (`nix-store
+    --realise`, normal builds), but plain `nix copy --from` does not
+    consult it; the equivalent there is `--no-check-sigs`. Both flows are
+    covered by tests.
+16. **Blocking subprocess calls deadlock single-threaded async tests**
+    (Phase 4 test-infra finding). A `std::process::Command::output()`
+    call inside a `#[tokio::test]` blocks the only runtime thread; if the
+    subprocess (e.g. `nix copy`) talks to an axum server spawned on the
+    same runtime, both wait on each other forever. Rule for all server
+    tests: subprocesses go through `tokio::process`, and every test body
+    is wrapped in `tokio::time::timeout` so a future regression fails
+    instead of hanging the suite.
 
 ## Mistakes Fixed from Earlier Draft
 
