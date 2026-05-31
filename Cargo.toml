@@ -31,6 +31,16 @@ axum = "0.8"
 # Content-defined chunking
 fastcdc = "4"
 
+# Errors
+thiserror = "2"
+
+# JSON bodies for the Twirp / REST / Azure APIs
+serde_json = "1"
+
+[dev-dependencies]
+# Verifies the hardcoded cache version constant
+sha2 = "0.11"
+
 # Harmonia crates (not on crates.io; pinned to a specific rev)
 harmonia-file-core = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
 harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
