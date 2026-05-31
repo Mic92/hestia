@@ -539,6 +539,32 @@ pub async fn nar_hash_from_chunks(
     sink.finish()
 }
 
+/// Serialize a complete NAR from a path's *stored representation* (file
+/// tree + chunk data).
+///
+/// This is the read-side code path: the substituter rebuilds NARs from
+/// manifest trees plus fetched chunks with exactly this function. It shares
+/// the event synthesis with [`nar_hash_from_chunks`], which the write
+/// pipeline uses as its integrity gate — so the bytes served here are by
+/// construction the bytes whose hash was verified before upload.
+pub async fn nar_from_chunks(
+    tree: &FileTree<ChunkList>,
+    chunks: &BTreeMap<ChunkHash, Bytes>,
+) -> Result<Vec<u8>, Error> {
+    let mut events = Vec::new();
+    collect_events(Bytes::new(), &tree.0, chunks, &mut events)?;
+
+    let mut buffer: Vec<u8> = Vec::new();
+    {
+        let mut writer = NarWriter::new(&mut buffer);
+        for event in events {
+            writer.feed(event).await?;
+        }
+        writer.close().await?;
+    }
+    Ok(buffer)
+}
+
 /// Decompress and verify one chunk extracted from pack bytes.
 ///
 /// `compressed` is the byte slice at `[offset, offset + compressed_size)` of
@@ -756,6 +782,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(from_chunks, from_disk);
+    }
+
+    #[tokio::test]
+    async fn nar_from_chunks_reproduces_disk_serialization() {
+        // The substituter's NAR synthesis must produce byte-identical output
+        // to harmonia's disk walk (NarByteStream), not just the same hash.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("fixture");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("file"), b"contents\n").unwrap();
+        std::fs::write(root.join("nested/blob"), test_data(400_000, 21)).unwrap();
+        std::os::unix::fs::symlink("file", root.join("link")).unwrap();
+
+        let chunked = chunk_path(&root).await.unwrap();
+        let nar = nar_from_chunks(&chunked.tree, &chunked.chunk_map())
+            .await
+            .unwrap();
+
+        let mut from_disk = Vec::new();
+        let mut stream = NarByteStream::new(root.clone());
+        while let Some(bytes) = stream.next().await {
+            from_disk.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(nar, from_disk, "synthesized NAR must match the disk walk");
+
+        // And it agrees with the hash helper used by the write pipeline.
+        let (hash, size) = nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map())
+            .await
+            .unwrap();
+        assert_eq!(Hash32::digest(&nar), hash);
+        assert_eq!(nar.len() as u64, size);
+    }
+
+    #[tokio::test]
+    async fn nar_from_chunks_fails_on_missing_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("fixture");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), test_data(100_000, 22)).unwrap();
+
+        let chunked = chunk_path(&root).await.unwrap();
+        let mut chunks = chunked.chunk_map();
+        chunks.pop_first().unwrap();
+
+        assert!(matches!(
+            nar_from_chunks(&chunked.tree, &chunks).await,
+            Err(Error::MissingChunk(_))
+        ));
     }
 
     #[tokio::test]
