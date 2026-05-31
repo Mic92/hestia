@@ -505,14 +505,22 @@ API gets faked, and only because GitHub gives no other choice locally.
     hash is the natural merge operation. Also: harmonia's `Hash::FromStr`
     is commented out upstream; hash parsing goes through
     `harmonia_utils_hash::fmt::Any<Sha256>`.
-11. **PathInfo comes from the nix-daemon protocol only** (Phase 3
-    decision). The testing-strategy fallback idea (shell out to
-    `nix path-info --json` where no daemon is reachable) was dropped as
-    over-engineering: every environment hestia serves runs a daemon, and
-    the only daemon-less environment in practice is the Nix build sandbox,
-    which has no store database either — a CLI fallback would not work
-    there any better. Tests that need real PathInfo probe the daemon
-    socket at runtime and skip with a notice when it is unreachable.
+11. **PathInfo comes from direct store-database reads, not the daemon
+    protocol** (Phase 3 decision, revising the original plan). The plan
+    table picked harmonia-store-remote ("daemon protocol is the safer
+    default"), but that claim did not survive contact: a daemon only
+    exists on multi-user installs, while the SQLite database exists
+    wherever paths were built — and a post-build-hook by definition runs
+    on the machine that built the paths. harmonia-cache reads the database
+    directly in production, so the access path is battle-tested. Direct
+    reads also make tests hermetic: a scratch store created with
+    `nix-store --store 'local?store=…' --add` is queryable without
+    spawning a daemon, lets tests fabricate upstream signatures
+    (`nix store sign` with a key named `cache.nixos.org-1`), and controls
+    references via `builtins.toFile` interpolation. A `nix path-info`
+    subprocess fallback was also considered and rejected (subprocess
+    parsing for no environment gain). Tests needing a store database probe
+    for it at runtime and skip with a notice when missing.
 12. **chunk_path walks the path twice** (Phase 2): once via NarDumper for
     chunking and once via NarByteStream for the NAR hash. Phase 3 should
     tee a single event stream into both consumers (PLAN's original design)

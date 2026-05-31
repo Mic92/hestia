@@ -52,13 +52,15 @@ serde_json = "1"
 # Harmonia crates (not on crates.io; pinned to a specific rev)
 # Dropped after Phase 2/3 scope decisions (re-add when needed):
 #   harmonia-store-nar-info      -> Phase 4 substituter (build_narinfo)
-#   harmonia-store-path-info     -> UnkeyedValidPathInfo comes via the
-#                                    harmonia-store-remote re-export
+#   harmonia-store-remote        -> path info comes from direct store
+#                                    database reads (harmonia-store-db),
+#                                    which works without a running daemon
 #   harmonia-utils-base-encoding -> nothing needs raw base32 yet
 harmonia-file-core = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
 harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
 harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
-harmonia-store-remote = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
 harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
 harmonia-utils-io = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
 harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
