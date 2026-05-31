@@ -43,6 +43,16 @@ async fn committed_manifest(ctx: &PipelineContext) -> Option<(u64, Manifest)> {
     Some((entry.index, manifest))
 }
 
+/// The store path basename (`<hash>-<name>`).
+fn fixture_name(store_path: &Path) -> String {
+    store_path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
 /// The manifest path key for a store path.
 fn path_hash_of(store_path: &Path) -> PathHash {
     let name = store_path.file_name().unwrap().to_str().unwrap();
@@ -136,9 +146,20 @@ async fn pushes_paths_end_to_end() {
     assert!(fixture_entry.ca.is_some(), "added paths are CA");
     assert_eq!(fixture_entry.last_pushed, now);
 
-    // top's entry records its reference to dep.
+    // top's entry records its reference to dep (full basename, so the
+    // substituter can put it on the narinfo References line).
     let top_entry = &manifest.paths[&path_hash_of(&top)];
-    assert_eq!(top_entry.references, vec![path_hash_of(&dep)]);
+    assert_eq!(
+        top_entry.store_path.to_string(),
+        fixture_name(&top),
+        "entry must record its own full basename"
+    );
+    let reference_names: Vec<String> = top_entry
+        .references
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(reference_names, vec![fixture_name(&dep)]);
 
     // All chunks of all paths are locatable in uploaded packs.
     assert_all_chunks_locatable(&manifest);

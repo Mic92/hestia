@@ -43,8 +43,8 @@ pub struct PathInfo {
     pub nar_size: u64,
     /// Store paths this path references (may include itself).
     pub references: Vec<StorePath>,
-    /// Absolute deriver path, if known.
-    pub deriver: Option<String>,
+    /// Deriver store path, if known.
+    pub deriver: Option<StorePath>,
     /// Content address (nix text form, e.g. `fixed:r:sha256:…`), if the
     /// path is content-addressed.
     pub ca: Option<String>,
@@ -57,15 +57,14 @@ impl PathInfo {
         PathHash::from_store_path(&self.store_path)
     }
 
-    /// Manifest keys of all referenced paths, excluding the self-reference
-    /// (the manifest reachability walk treats self-edges as no-ops anyway,
-    /// but dropping them keeps entries smaller).
-    pub fn reference_hashes(&self) -> Vec<PathHash> {
-        let own = self.path_hash();
+    /// All referenced store paths, excluding the self-reference (the
+    /// manifest reachability walk treats self-edges as no-ops anyway, but
+    /// dropping them keeps entries smaller).
+    pub fn references_without_self(&self) -> Vec<StorePath> {
         self.references
             .iter()
-            .map(PathHash::from_store_path)
-            .filter(|hash| *hash != own)
+            .filter(|reference| **reference != self.store_path)
+            .cloned()
             .collect()
     }
 }
@@ -82,7 +81,7 @@ pub enum Lookup {
 }
 
 /// Convert harmonia's database record into hestia's [`PathInfo`].
-fn convert(store_dir: &StoreDir, path: StorePath, info: UnkeyedValidPathInfo) -> PathInfo {
+fn convert(path: StorePath, info: UnkeyedValidPathInfo) -> PathInfo {
     PathInfo {
         nar_hash: Hash32(
             info.nar_hash
@@ -92,9 +91,7 @@ fn convert(store_dir: &StoreDir, path: StorePath, info: UnkeyedValidPathInfo) ->
         ),
         nar_size: info.nar_size,
         references: info.references.into_iter().collect(),
-        deriver: info
-            .deriver
-            .map(|deriver| store_dir.display(&deriver).to_string()),
+        deriver: info.deriver,
         ca: info.ca.map(|ca| ca.to_string()),
         signatures: info.signatures.into_iter().collect(),
         store_path: path,
@@ -198,11 +195,7 @@ impl StoreDatabase {
             }
         };
         match db.query_path_info(&self.store_dir, &parsed)? {
-            Some(record) => Ok(Lookup::Found(Box::new(convert(
-                &self.store_dir,
-                record.path,
-                record.info,
-            )))),
+            Some(record) => Ok(Lookup::Found(Box::new(convert(record.path, record.info)))),
             None => Ok(Lookup::Unknown),
         }
     }

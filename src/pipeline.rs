@@ -264,9 +264,10 @@ impl PipelineContext {
             prepared.push(PreparedPath {
                 hash,
                 entry: PathEntry {
+                    references: info.references_without_self(),
+                    store_path: info.store_path,
                     nar_hash,
                     nar_size,
-                    references: info.reference_hashes(),
                     ca: info.ca,
                     deriver: info.deriver,
                     tree: chunked.tree,

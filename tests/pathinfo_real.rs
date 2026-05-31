@@ -75,8 +75,8 @@ fn scratch_store_references_are_recorded() {
     };
 
     // top references dep (and only dep).
-    let reference_hashes = top_info.reference_hashes();
-    assert_eq!(reference_hashes, vec![dep_info.path_hash()]);
+    let references = top_info.references_without_self();
+    assert_eq!(references, vec![dep_info.store_path.clone()]);
 
     // dep references nothing.
     assert!(dep_info.references.is_empty());

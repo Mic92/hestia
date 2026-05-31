@@ -209,16 +209,20 @@ pub struct PackInfo {
 /// One stored path: everything needed to serve narinfo + NAR for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathEntry {
+    /// Full store path basename (`<hash>-<name>`). The manifest key is only
+    /// the hash part; narinfo responses need the name too (StorePath and
+    /// References lines carry full basenames).
+    pub store_path: StorePath,
     pub nar_hash: NarHash,
     pub nar_size: u64,
-    /// Store path hashes this path references. May point at paths that are
+    /// Store paths this path references. May point at paths that are
     /// not in the manifest (upstream paths served by cache.nixos.org).
     #[serde(default)]
-    pub references: Vec<PathHash>,
+    pub references: Vec<StorePath>,
     #[serde(default)]
     pub ca: Option<String>,
     #[serde(default)]
-    pub deriver: Option<String>,
+    pub deriver: Option<StorePath>,
     /// File tree with chunk lists as file contents.
     pub tree: FileTree<ChunkList>,
     /// Last time the GC mark phase reached this path (unix seconds).
@@ -266,6 +270,18 @@ pub struct Manifest {
 // so the result does not depend on who wins the race.
 
 impl PathEntry {
+    /// The manifest key this entry should be stored under.
+    pub fn path_hash(&self) -> PathHash {
+        PathHash::from_store_path(&self.store_path)
+    }
+
+    /// Manifest keys of all referenced paths (used by the reachability
+    /// walk; upstream references resolve to keys not present in the
+    /// manifest, which the walk treats as holes).
+    pub fn reference_hashes(&self) -> impl Iterator<Item = PathHash> + '_ {
+        self.references.iter().map(PathHash::from_store_path)
+    }
+
     /// Merge two entries describing the same store path.
     fn merge(a: Self, b: Self) -> Self {
         // Deterministic winner: newer push wins, nar_hash as tie-break.
@@ -387,9 +403,9 @@ impl Manifest {
             let Some(entry) = self.paths.get(&path) else {
                 continue;
             };
-            for reference in &entry.references {
-                if self.paths.contains_key(reference) && !visited.contains(reference) {
-                    stack.push(*reference);
+            for reference in entry.reference_hashes() {
+                if self.paths.contains_key(&reference) && !visited.contains(&reference) {
+                    stack.push(reference);
                 }
             }
         }
@@ -469,11 +485,16 @@ mod tests {
 
     pub(crate) fn sample_path_entry(seed: u8) -> PathEntry {
         PathEntry {
+            store_path: store_path(seed),
             nar_hash: Hash32::digest([seed]),
             nar_size: 1000 + seed as u64,
             references: vec![],
             ca: None,
-            deriver: Some(format!("{seed}.drv")),
+            deriver: Some(
+                format!("{}-deriver-{seed}.drv", path_hash(seed))
+                    .parse()
+                    .unwrap(),
+            ),
             tree: leaf_tree(vec![Hash32::digest([seed, 1]), Hash32::digest([seed, 2])]),
             last_reachable: 0,
             last_pushed: 100,
@@ -485,6 +506,13 @@ mod tests {
         PathHash(StorePathHash::new([seed; 20]))
     }
 
+    /// Full store path (hash + name) derived deterministically from the seed.
+    pub(crate) fn store_path(seed: u8) -> StorePath {
+        format!("{}-path-{seed}", path_hash(seed))
+            .parse()
+            .expect("deterministic test store path is valid")
+    }
+
     fn sample_manifest() -> Manifest {
         let mut manifest = Manifest::new();
         let chunk_a = Hash32::digest(b"chunk a");
@@ -494,11 +522,12 @@ mod tests {
         manifest.paths.insert(
             path_hash(1),
             PathEntry {
+                store_path: store_path(1),
                 nar_hash: Hash32::digest(b"nar"),
                 nar_size: 4096,
-                references: vec![path_hash(2), path_hash(99)],
+                references: vec![store_path(2), store_path(99)],
                 ca: Some("fixed:sha256:abc".into()),
-                deriver: Some("foo.drv".into()),
+                deriver: Some(format!("{}-foo.drv", path_hash(1)).parse().unwrap()),
                 tree: FileTree(FileSystemObject::Directory(Directory {
                     entries: BTreeMap::from([
                         (
@@ -705,7 +734,7 @@ mod tests {
     // Merge, reachability, liveness
     // -----------------------------------------------------------------------
 
-    fn entry_with_refs(seed: u8, references: Vec<PathHash>, last_pushed: u64) -> PathEntry {
+    fn entry_with_refs(seed: u8, references: Vec<StorePath>, last_pushed: u64) -> PathEntry {
         PathEntry {
             references,
             last_pushed,
@@ -720,14 +749,16 @@ mod tests {
 
         // Same path in both, different push times: newer entry wins, but
         // clocks merge to the maximum of both histories.
+        let old_drv: StorePath = format!("{}-old.drv", path_hash(10)).parse().unwrap();
+        let new_drv: StorePath = format!("{}-new.drv", path_hash(11)).parse().unwrap();
         let mut entry_old = sample_path_entry(1);
         entry_old.last_pushed = 100;
         entry_old.last_reachable = 500;
-        entry_old.deriver = Some("old.drv".into());
+        entry_old.deriver = Some(old_drv);
         let mut entry_new = sample_path_entry(1);
         entry_new.last_pushed = 200;
         entry_new.last_reachable = 50;
-        entry_new.deriver = Some("new.drv".into());
+        entry_new.deriver = Some(new_drv.clone());
 
         a.paths.insert(path_hash(1), entry_old);
         b.paths.insert(path_hash(1), entry_new);
@@ -738,7 +769,7 @@ mod tests {
         let merged = a.merge(b);
         assert_eq!(merged.paths.len(), 3);
         let winner = &merged.paths[&path_hash(1)];
-        assert_eq!(winner.deriver.as_deref(), Some("new.drv"));
+        assert_eq!(winner.deriver, Some(new_drv));
         assert_eq!(winner.last_pushed, 200);
         assert_eq!(winner.last_reachable, 500, "older history's mark survives");
     }
@@ -829,10 +860,10 @@ mod tests {
         // Path 4 exists but is unreachable.
         manifest
             .paths
-            .insert(path_hash(1), entry_with_refs(1, vec![path_hash(2)], 100));
+            .insert(path_hash(1), entry_with_refs(1, vec![store_path(2)], 100));
         manifest.paths.insert(
             path_hash(2),
-            entry_with_refs(2, vec![path_hash(3), path_hash(99)], 100),
+            entry_with_refs(2, vec![store_path(3), store_path(99)], 100),
         );
         manifest
             .paths
@@ -863,11 +894,11 @@ mod tests {
         // 1 <-> 2 reference cycle (self-references happen in practice).
         manifest.paths.insert(
             path_hash(1),
-            entry_with_refs(1, vec![path_hash(2), path_hash(1)], 100),
+            entry_with_refs(1, vec![store_path(2), store_path(1)], 100),
         );
         manifest
             .paths
-            .insert(path_hash(2), entry_with_refs(2, vec![path_hash(1)], 100));
+            .insert(path_hash(2), entry_with_refs(2, vec![store_path(1)], 100));
         manifest.roots.insert(
             "main".into(),
             Root {
@@ -946,6 +977,10 @@ mod tests {
             (0u8..6).prop_map(path_hash)
         }
 
+        fn arb_store_path() -> impl Strategy<Value = StorePath> {
+            (0u8..6).prop_map(store_path)
+        }
+
         fn arb_hash32() -> impl Strategy<Value = Hash32> {
             (0u8..6).prop_map(|seed| Hash32::digest([seed]))
         }
@@ -956,17 +991,28 @@ mod tests {
 
         fn arb_path_entry() -> impl Strategy<Value = PathEntry> {
             (
+                arb_store_path(),
                 arb_hash32(),
                 0u64..10_000,
-                proptest::collection::vec(arb_path_hash(), 0..4),
-                proptest::option::of("[a-z]{1,8}"),
+                proptest::collection::vec(arb_store_path(), 0..4),
+                proptest::option::of(arb_store_path()),
                 arb_chunk_list(),
                 0u64..10_000,
                 0u64..10_000,
             )
                 .prop_map(
-                    |(nar_hash, nar_size, references, deriver, contents, reachable, pushed)| {
+                    |(
+                        store_path,
+                        nar_hash,
+                        nar_size,
+                        references,
+                        deriver,
+                        contents,
+                        reachable,
+                        pushed,
+                    )| {
                         PathEntry {
+                            store_path,
                             nar_hash,
                             nar_size,
                             references,
