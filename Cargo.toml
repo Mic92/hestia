@@ -34,6 +34,9 @@ fastcdc = "4"
 # Errors
 thiserror = "2"
 
+# Blob payloads (cheap clones for upload retries)
+bytes = "1"
+
 # JSON bodies for the Twirp / REST / Azure APIs
 serde_json = "1"
 

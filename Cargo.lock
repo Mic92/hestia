@@ -1033,6 +1033,7 @@ name = "hestia"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "ciborium",
  "clap",
  "fastcdc",

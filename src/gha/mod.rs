@@ -10,6 +10,7 @@
 //! * **GitHub REST** ([`rest`]): list / usage / delete, authenticated with
 //!   `GITHUB_TOKEN`. Used by `hestia gc`.
 
+pub mod blob;
 pub mod twirp;
 
 /// Errors shared by all GHA cache client modules.
