@@ -461,9 +461,11 @@ API gets faked, and only because GitHub gives no other choice locally.
    native `post:`) or use `${{ github.action_path }}`-based resolution.
 6. **reqwest 0.13 renamed the TLS feature**: `rustls-tls` → `rustls`
    (Phase 0 finding; the dependency table said "reqwest (rustls)").
-   Also note: no certificate root store feature is enabled yet; Phase 1
-   must pick `rustls-platform-verifier` (current default pulled in) or
-   `webpki-roots` explicitly when real HTTPS calls are added.
+   Resolved in Phase 1: reqwest 0.13 dropped the `webpki-roots` option
+   entirely, so `rustls-platform-verifier` (system CA certs) is the only
+   choice. Consequence: constructing *any* reqwest Client requires CA
+   certs, even for plain-HTTP localhost use. Real runners have them; the
+   Nix build sandbox gets them via `SSL_CERT_FILE` in nix/package.nix.
 7. **Nix package uses `cargoLock.allowBuiltinFetchGit`** instead of
    per-crate `outputHashes`. Works, but means the package build shells out
    to builtins.fetchGit at eval time (needs network for uncached evals).

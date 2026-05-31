@@ -25,6 +25,14 @@ pub const ENV_GITHUB_API_URL: &str = "GITHUB_API_URL";
 
 const PER_PAGE: u32 = 100;
 
+/// Build the caches collection URL for a repository.
+fn caches_url(api_url: &str, repo: &str) -> String {
+    format!(
+        "{}/repos/{repo}/actions/caches",
+        api_url.trim_end_matches('/')
+    )
+}
+
 /// One cache entry as reported by the REST API.
 ///
 /// `last_accessed_at` is the LRU clock: downloads through the Twirp/Azure
@@ -106,11 +114,7 @@ impl RestClient {
     }
 
     fn caches_url(&self) -> String {
-        format!(
-            "{}/repos/{}/actions/caches",
-            self.api_url.trim_end_matches('/'),
-            self.repo
-        )
+        caches_url(&self.api_url, &self.repo)
     }
 
     fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
@@ -198,14 +202,10 @@ mod tests {
 
     #[test]
     fn caches_url_layout() {
-        let client = RestClient::new(
-            reqwest::Client::new(),
-            "https://api.github.com/",
-            "nix-community/hestia",
-            "token",
-        );
+        // No reqwest::Client here: TLS client construction requires system
+        // CA certs, which do not exist in the Nix build sandbox.
         assert_eq!(
-            client.caches_url(),
+            caches_url("https://api.github.com/", "nix-community/hestia"),
             "https://api.github.com/repos/nix-community/hestia/actions/caches"
         );
     }

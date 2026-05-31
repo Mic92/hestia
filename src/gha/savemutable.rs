@@ -24,6 +24,29 @@ use bytes::Bytes;
 use crate::gha::twirp::{DownloadUrl, Reservation, TwirpClient};
 use crate::gha::{Error, blob};
 
+/// Cache key for version `index` of family `prefix`, e.g. `m#5`.
+fn key_for(prefix: &str, index: u64) -> String {
+    format!("{prefix}#{index}")
+}
+
+/// Restore-key prefix that matches every version of the family, e.g. `m#`.
+fn search_prefix(prefix: &str) -> String {
+    format!("{prefix}#")
+}
+
+/// Extract the numeric index from a full key, e.g. `m#5` -> 5.
+fn parse_index(prefix: &str, key: &str) -> Result<u64, Error> {
+    let family_prefix = search_prefix(prefix);
+    let suffix = key.strip_prefix(&family_prefix).ok_or_else(|| {
+        Error::InvalidResponse(format!(
+            "matched key {key:?} does not start with {family_prefix:?}"
+        ))
+    })?;
+    suffix
+        .parse()
+        .map_err(|_| Error::InvalidResponse(format!("matched key {key:?} has a non-numeric index")))
+}
+
 /// A loaded mutable entry.
 #[derive(Debug, Clone)]
 pub struct MutableEntry {
@@ -79,23 +102,15 @@ impl<'a> SaveMutable<'a> {
     }
 
     fn key_for(&self, index: u64) -> String {
-        format!("{}#{}", self.prefix, index)
+        key_for(&self.prefix, index)
     }
 
     fn search_prefix(&self) -> String {
-        format!("{}#", self.prefix)
+        search_prefix(&self.prefix)
     }
 
     fn parse_index(&self, key: &str) -> Result<u64, Error> {
-        let suffix = key.strip_prefix(&self.search_prefix()).ok_or_else(|| {
-            Error::InvalidResponse(format!(
-                "matched key {key:?} does not start with {:?}",
-                self.search_prefix()
-            ))
-        })?;
-        suffix.parse().map_err(|_| {
-            Error::InvalidResponse(format!("matched key {key:?} has a non-numeric index"))
-        })
+        parse_index(&self.prefix, key)
     }
 
     /// Load the newest entry of this family, or `None` if there is none yet.
@@ -209,32 +224,22 @@ impl<'a> SaveMutable<'a> {
 mod tests {
     use super::*;
 
-    fn save_mutable_for_test<'a>(
-        twirp: &'a TwirpClient,
-        http: &'a reqwest::Client,
-    ) -> SaveMutable<'a> {
-        SaveMutable::new(twirp, http, "m")
-    }
+    // No reqwest::Client in these tests: TLS client construction requires
+    // system CA certs, which do not exist in the Nix build sandbox.
 
     #[test]
     fn key_layout() {
-        let http = reqwest::Client::new();
-        let twirp = TwirpClient::new(http.clone(), "http://localhost", "token");
-        let save = save_mutable_for_test(&twirp, &http);
-        assert_eq!(save.key_for(1), "m#1");
-        assert_eq!(save.key_for(42), "m#42");
-        assert_eq!(save.search_prefix(), "m#");
+        assert_eq!(key_for("m", 1), "m#1");
+        assert_eq!(key_for("m", 42), "m#42");
+        assert_eq!(search_prefix("m"), "m#");
     }
 
     #[test]
     fn parse_index_accepts_only_numeric_suffixes() {
-        let http = reqwest::Client::new();
-        let twirp = TwirpClient::new(http.clone(), "http://localhost", "token");
-        let save = save_mutable_for_test(&twirp, &http);
-        assert_eq!(save.parse_index("m#7").unwrap(), 7);
-        assert_eq!(save.parse_index("m#123456").unwrap(), 123456);
-        assert!(save.parse_index("m#").is_err());
-        assert!(save.parse_index("m#abc").is_err());
-        assert!(save.parse_index("other#1").is_err());
+        assert_eq!(parse_index("m", "m#7").unwrap(), 7);
+        assert_eq!(parse_index("m", "m#123456").unwrap(), 123456);
+        assert!(parse_index("m", "m#").is_err());
+        assert!(parse_index("m", "m#abc").is_err());
+        assert!(parse_index("m", "other#1").is_err());
     }
 }

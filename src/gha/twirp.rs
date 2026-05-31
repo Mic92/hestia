@@ -27,6 +27,11 @@ pub const CACHE_VERSION: &str = "7a32118639289175533829e84c9aaa9fa781f6a5f1b18a9
 
 const SERVICE_PATH: &str = "twirp/github.actions.results.api.v1.CacheService";
 
+/// Build the full URL for one Twirp RPC method.
+fn rpc_url(base_url: &str, method: &str) -> String {
+    format!("{}/{SERVICE_PATH}/{method}", base_url.trim_end_matches('/'))
+}
+
 /// Environment variables a real Actions job provides (via the hestia action
 /// wrapper; shell steps cannot see them otherwise).
 pub const ENV_RESULTS_URL: &str = "ACTIONS_RESULTS_URL";
@@ -145,12 +150,7 @@ impl TwirpClient {
     }
 
     fn rpc_url(&self, method: &str) -> String {
-        format!(
-            "{}/{}/{}",
-            self.base_url.trim_end_matches('/'),
-            SERVICE_PATH,
-            method
-        )
+        rpc_url(&self.base_url, method)
     }
 
     async fn call<Req, Resp>(&self, method: &str, request: &Req) -> Result<Resp, Error>
@@ -271,13 +271,10 @@ mod tests {
 
     #[test]
     fn rpc_url_layout_matches_go_actions_cache() {
-        let client = TwirpClient::new(
-            reqwest::Client::new(),
-            "https://results.example.com/abc/",
-            "token",
-        );
+        // No reqwest::Client here: TLS client construction requires system
+        // CA certs, which do not exist in the Nix build sandbox.
         assert_eq!(
-            client.rpc_url("CreateCacheEntry"),
+            rpc_url("https://results.example.com/abc/", "CreateCacheEntry"),
             "https://results.example.com/abc/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry"
         );
     }

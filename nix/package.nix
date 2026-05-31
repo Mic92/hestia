@@ -1,6 +1,7 @@
 {
   lib,
   rustPlatform,
+  cacert,
 }:
 rustPlatform.buildRustPackage {
   pname = "hestia";
@@ -12,6 +13,7 @@ rustPlatform.buildRustPackage {
       ../Cargo.toml
       ../Cargo.lock
       ../src
+      ../tests
     ];
   };
 
@@ -21,6 +23,11 @@ rustPlatform.buildRustPackage {
     # to maintain an outputHashes entry per crate.
     allowBuiltinFetchGit = true;
   };
+
+  # reqwest's rustls-platform-verifier loads system CA certificates when a
+  # client is constructed -- even for plain-HTTP test servers. The build
+  # sandbox has none, so point it at the nixpkgs CA bundle for the tests.
+  env.SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
 
   meta = {
     description = "Nix binary cache backed by the GitHub Actions cache";
