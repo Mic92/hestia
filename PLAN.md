@@ -505,7 +505,15 @@ API gets faked, and only because GitHub gives no other choice locally.
     hash is the natural merge operation. Also: harmonia's `Hash::FromStr`
     is commented out upstream; hash parsing goes through
     `harmonia_utils_hash::fmt::Any<Sha256>`.
-11. **chunk_path walks the path twice** (Phase 2): once via NarDumper for
+11. **PathInfo comes from the nix-daemon protocol only** (Phase 3
+    decision). The testing-strategy fallback idea (shell out to
+    `nix path-info --json` where no daemon is reachable) was dropped as
+    over-engineering: every environment hestia serves runs a daemon, and
+    the only daemon-less environment in practice is the Nix build sandbox,
+    which has no store database either — a CLI fallback would not work
+    there any better. Tests that need real PathInfo probe the daemon
+    socket at runtime and skip with a notice when it is unreachable.
+12. **chunk_path walks the path twice** (Phase 2): once via NarDumper for
     chunking and once via NarByteStream for the NAR hash. Phase 3 should
     tee a single event stream into both consumers (PLAN's original design)
     if profiling shows the double walk matters; for CI-sized paths it does
