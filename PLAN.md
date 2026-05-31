@@ -266,19 +266,28 @@ validates it on the first push). Deviations recorded under Open Questions
 
 ### Phase 1: GHA cache client
 
-- `gha/twirp.rs`: CreateCacheEntry, FinalizeCacheEntryUpload,
-  GetCacheEntryDownloadURL (port request shapes from go-actions-cache;
-  handle `already_exists`)
-- `gha/blob.rs`: Azure PUT (BlockBlob, single-shot), GET with Range,
-  403 → URL refresh → retry
-- `gha/rest.rs`: list (prefix, pagination), usage, delete (`GITHUB_TOKEN`)
-- `gha/savemutable.rs`: prefix load → highest N, reserve/retry loop
-- `tests/support/fake_gha.rs`: behavioral fake of the GHA cache (see Testing
-  Strategy) — built in this phase, used by every later phase
-- Tests: against fake-gha locally; the same suite runs against the real API
-  in CI (`#[ignore]` locally)
-- **Milestone: round-trip a 100 MB blob through the real GHA cache from CI;
-  Range-read a slice of it; delete it via REST.**
+**Status: done** (code + fake-backend tests green locally; the real-API
+suite runs in the CI `token-probe` job and validates the milestone on the
+first push). Deviations recorded under Open Questions (8–9).
+
+- [x] `gha/twirp.rs`: CreateCacheEntry, FinalizeCacheEntryUpload,
+      GetCacheEntryDownloadURL (request shapes ported from
+      go-actions-cache `cache_v2.go`; `already_exists` surfaces as
+      `Reservation::AlreadyExists`, not an error)
+- [x] `gha/blob.rs`: Azure PUT (BlockBlob, single-shot), GET with Range,
+      403 → caller-provided async refresh callback → retry once
+- [x] `gha/rest.rs`: list (prefix, pagination), usage, delete
+      (`GITHUB_TOKEN`; 404 on delete maps to empty result for idempotence)
+- [x] `gha/savemutable.rs`: prefix load → highest N, reserve/retry loop,
+      re-merge on conflict, stale-reservation skip (crashed writers)
+- [x] `tests/support/fake_gha.rs`: behavioral fake (axum + tempdir blobs)
+      with eviction + URL-expiry injection endpoints
+- [x] Tests: 13 scenarios against fake-gha locally; same scenarios against
+      the real API in `tests/gha_real.rs` (`#[ignore]` locally, run in CI
+      with `cargo test --test gha_real -- --ignored`)
+- [ ] **Milestone: round-trip a blob through the real GHA cache from CI;
+      Range-read a slice of it; delete it via REST.** Pending first push
+      (test uses 256 KB; bump to 100 MB once CI proves the path works).
 
 ### Phase 2: Manifest + chunker
 
@@ -461,6 +470,19 @@ API gets faked, and only because GitHub gives no other choice locally.
    If that becomes a problem (e.g. pure-eval contexts), switch to explicit
    `outputHashes` — every harmonia crate in Cargo.lock needs an entry, all
    sharing the same hash.
+8. **Upload-URL refresh is unsolved** (Phase 1 finding). Download URLs can
+   be refreshed by calling GetCacheEntryDownloadURL again, but there is no
+   Twirp call that re-issues an upload URL for an already-reserved key
+   (CreateCacheEntry returns already_exists). If an upload outlives its SAS
+   URL (~long uploads on slow links), the entry is stuck: it can neither be
+   uploaded nor re-reserved. Mitigation for now: upload promptly after
+   reserving, keep packs well under a size where this matters. Revisit in
+   Phase 3 (pipeline) — possibly split giant packs.
+9. **Twirp lookup misses are ambiguous** (Phase 1 finding): the service can
+   signal "no entry" either as HTTP 200 + `ok=false` or as a Twirp
+   `not_found` error depending on path. The client treats both as a miss;
+   the fake uses `ok=false` (matching go-actions-cache's expectation).
+   Verify against the real service output once CI runs.
 
 ## Mistakes Fixed from Earlier Draft
 
