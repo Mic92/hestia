@@ -244,13 +244,25 @@ and is independently committable. Red-green TDD.
 
 ### Phase 0: Scaffolding + token access (the existential risk first)
 
-- cargo init, flake.nix (rust toolchain, treefmt), CI workflow
-- harmonia git deps resolve and build
-- clap skeleton: `hestia serve|hook|drain|gc`
-- **hestia-action prototype**: verify `ACTIONS_RUNTIME_TOKEN` +
-  `ACTIONS_RESULTS_URL` can be captured and used from a shell step
-- **Milestone: a CI run lists its own cache entries via Twirp using captured
-  tokens.** If this fails, the whole project needs rethinking — do it first.
+**Status: done** (except the CI milestone, which can only run once the repo
+is pushed to GitHub — the `token-probe` job in `.github/workflows/ci.yml`
+validates it on the first push). Deviations recorded under Open Questions
+(5–7).
+
+- [x] cargo init, flake.nix (rust toolchain, treefmt), CI workflow
+- [x] harmonia git deps resolve and build (all ten crates, pinned to rev
+      `3ef11b5b`; none had to be dropped)
+- [x] clap skeleton: `hestia serve|hook|drain|gc` (stubs exit 0 with a
+      "not implemented yet" notice; flag parsing unit-tested)
+- [x] **hestia-action prototype**: composite action captures
+      `ACTIONS_RUNTIME_TOKEN` + `ACTIONS_RESULTS_URL` via
+      `actions/github-script` and exports them to later shell steps
+- [x] bonus: `packages.default` (buildRustPackage with
+      `cargoLock.allowBuiltinFetchGit`) so `nix build`/`nix run` work
+- [ ] **Milestone: a CI run lists its own cache entries via Twirp using
+      captured tokens.** Pending first push to GitHub; `token-probe` asserts
+      token visibility and endpoint reachability. If this fails, the whole
+      project needs rethinking — do it first.
 
 ### Phase 1: GHA cache client
 
@@ -428,6 +440,27 @@ API gets faked, and only because GitHub gives no other choice locally.
    Budget for occasional `cargo update` breakage. If it hurts, ask harmonia
    to publish the leaf crates (file-nar, file-core, store-path,
    utils-hash/signature/base-encoding) to crates.io.
+5. **Composite actions cannot declare `post:`** (Phase 0 finding). The
+   action.yml sketch above showing a top-level `post:` is invalid for
+   composite actions; only JS (`using: nodeXX`) actions support post hooks.
+   Workaround shipped in Phase 0: a nested node20 action (`action/post`)
+   whose `post:` entry point will run `hestia drain`. Caveat: the nested
+   `uses: ./action/post` path resolves relative to the consumer's workspace,
+   which works for repo-local use (`./action`) but breaks when the action is
+   consumed from another repo. Before publishing (Phase 6), either convert
+   the wrapper to a single JS action (no `actions/github-script` dependency,
+   native `post:`) or use `${{ github.action_path }}`-based resolution.
+6. **reqwest 0.13 renamed the TLS feature**: `rustls-tls` → `rustls`
+   (Phase 0 finding; the dependency table said "reqwest (rustls)").
+   Also note: no certificate root store feature is enabled yet; Phase 1
+   must pick `rustls-platform-verifier` (current default pulled in) or
+   `webpki-roots` explicitly when real HTTPS calls are added.
+7. **Nix package uses `cargoLock.allowBuiltinFetchGit`** instead of
+   per-crate `outputHashes`. Works, but means the package build shells out
+   to builtins.fetchGit at eval time (needs network for uncached evals).
+   If that becomes a problem (e.g. pure-eval contexts), switch to explicit
+   `outputHashes` — every harmonia crate in Cargo.lock needs an entry, all
+   sharing the same hash.
 
 ## Mistakes Fixed from Earlier Draft
 
