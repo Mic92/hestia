@@ -42,12 +42,6 @@ bytes = "1"
 # JSON bodies for the Twirp / REST / Azure APIs
 serde_json = "1"
 
-[dev-dependencies]
-# Verifies the hardcoded cache version constant
-sha2 = "0.11"
-# Blob storage directory for the fake GHA backend
-tempfile = "3"
-
 # Harmonia crates (not on crates.io; pinned to a specific rev)
 harmonia-file-core = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
 harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
@@ -59,3 +53,9 @@ harmonia-utils-base-encoding = { git = "https://github.com/nix-community/harmoni
 harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
 harmonia-utils-io = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
 harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+
+[dev-dependencies]
+# Verifies the hardcoded cache version constant
+sha2 = "0.11"
+# Blob storage directory for the fake GHA backend
+tempfile = "3"
