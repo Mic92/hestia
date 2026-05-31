@@ -33,6 +33,9 @@ axum = "0.8"
 # Content-defined chunking
 fastcdc = "4"
 
+# Stream combinators for NAR event/byte streams
+futures-util = "0.3"
+
 # Errors
 thiserror = "2"
 

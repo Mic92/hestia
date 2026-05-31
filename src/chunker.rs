@@ -7,11 +7,17 @@
 //! stays independently extractable via `(offset, compressed_size)` Range
 //! reads against the pack.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use bytes::Bytes;
+use futures_util::StreamExt as _;
+use harmonia_file_nar::{NarByteStream, NarEvent};
 
-use crate::manifest::{ChunkHash, ChunkLocation, Hash32, PackHash};
+use crate::manifest::{
+    ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Hash32, PackHash,
+    Regular, Symlink,
+};
 
 /// FastCDC parameters. Pinned: changing them changes every chunk boundary
 /// and therefore invalidates all existing chunks in the cache.
@@ -28,8 +34,8 @@ const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("compression failed: {0}")]
-    Compression(#[from] std::io::Error),
+    #[error("I/O or compression error: {0}")]
+    Io(#[from] std::io::Error),
 
     #[error("chunk hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: Hash32, actual: Hash32 },
@@ -179,6 +185,198 @@ impl Pack {
             )
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// NAR integration: walk a store path, chunk every file, build the tree
+// ---------------------------------------------------------------------------
+
+/// A node of the manifest file tree (convenience alias).
+pub type TreeNode = FileSystemObject<ChunkList, Box<FileTree<ChunkList>>>;
+
+/// Result of walking and chunking one store path.
+#[derive(Debug)]
+pub struct ChunkedPath {
+    /// File tree with per-file chunk lists (goes into `PathEntry::tree`).
+    pub tree: FileTree<ChunkList>,
+    /// Unique chunks in first-seen order, which is `(file path, file offset)`
+    /// order because the NAR walk visits files in sorted order and chunks
+    /// each file front to back. This is the order chunks should enter packs.
+    pub chunks: Vec<Chunk>,
+}
+
+/// Directory entries under construction.
+type DirEntries = BTreeMap<String, Box<FileTree<ChunkList>>>;
+
+/// Builds a [`FileTree`] from the NAR event stream's
+/// StartDirectory/EndDirectory bracketing.
+struct TreeBuilder {
+    stack: Vec<(String, DirEntries)>,
+    root: Option<FileTree<ChunkList>>,
+}
+
+impl TreeBuilder {
+    fn new() -> Self {
+        Self {
+            stack: Vec::new(),
+            root: None,
+        }
+    }
+
+    fn place(&mut self, name: String, node: FileTree<ChunkList>) -> Result<(), Error> {
+        match self.stack.last_mut() {
+            Some((_, entries)) => {
+                if entries.insert(name.clone(), Box::new(node)).is_some() {
+                    return Err(Error::InvalidNar(format!("duplicate entry {name:?}")));
+                }
+            }
+            None => {
+                if self.root.is_some() {
+                    return Err(Error::InvalidNar("multiple root nodes".into()));
+                }
+                self.root = Some(node);
+            }
+        }
+        Ok(())
+    }
+
+    fn start_directory(&mut self, name: String) {
+        self.stack.push((name, DirEntries::new()));
+    }
+
+    fn end_directory(&mut self) -> Result<(), Error> {
+        let (name, entries) = self.stack.pop().ok_or_else(|| {
+            Error::InvalidNar("EndDirectory without matching StartDirectory".into())
+        })?;
+        self.place(
+            name,
+            FileTree(FileSystemObject::Directory(Directory { entries })),
+        )
+    }
+
+    fn finish(self) -> Result<FileTree<ChunkList>, Error> {
+        if !self.stack.is_empty() {
+            return Err(Error::InvalidNar(
+                "unclosed directory in event stream".into(),
+            ));
+        }
+        self.root
+            .ok_or_else(|| Error::InvalidNar("empty event stream".into()))
+    }
+}
+
+fn name_to_string(name: &[u8]) -> Result<String, Error> {
+    String::from_utf8(name.to_vec())
+        .map_err(|_| Error::InvalidNar(format!("non-UTF-8 entry name: {name:?}")))
+}
+
+/// Walk `path` with harmonia's NAR dumper, splitting every regular file into
+/// content-defined chunks.
+///
+/// Returns the file tree (for the manifest `PathEntry`) plus the unique
+/// chunks in pack order. Identical chunks appearing in multiple files are
+/// returned once.
+pub async fn chunk_path(path: impl Into<PathBuf>) -> Result<ChunkedPath, Error> {
+    let mut events = harmonia_file_nar::dump(path.into());
+    let mut builder = TreeBuilder::new();
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut seen: BTreeSet<ChunkHash> = BTreeSet::new();
+
+    while let Some(event) = events.next().await {
+        match event? {
+            NarEvent::StartDirectory { name } => {
+                builder.start_directory(name_to_string(&name)?);
+            }
+            NarEvent::EndDirectory => {
+                builder.end_directory()?;
+            }
+            NarEvent::Symlink { name, target } => {
+                builder.place(
+                    name_to_string(&name)?,
+                    FileTree(FileSystemObject::Symlink(Symlink {
+                        target: name_to_string(&target)?,
+                    })),
+                )?;
+            }
+            NarEvent::File {
+                name,
+                executable,
+                size: _,
+                reader,
+            } => {
+                let data = reader.into_bytes();
+                let file_chunks = chunk_data(&data);
+                let list = ChunkList {
+                    chunks: file_chunks.iter().map(|chunk| chunk.hash).collect(),
+                };
+                for chunk in file_chunks {
+                    if seen.insert(chunk.hash) {
+                        chunks.push(chunk);
+                    }
+                }
+                builder.place(
+                    name_to_string(&name)?,
+                    FileTree(FileSystemObject::Regular(Regular {
+                        executable,
+                        contents: list,
+                    })),
+                )?;
+            }
+        }
+    }
+
+    Ok(ChunkedPath {
+        tree: builder.finish()?,
+        chunks,
+    })
+}
+
+/// NAR hash and size of a path, computed by streaming harmonia's
+/// [`NarByteStream`] (the exact code path that will serve NARs in Phase 4)
+/// into SHA-256.
+///
+/// Using the same serializer for hashing and for serving is what guarantees
+/// hashes match by construction.
+pub async fn nar_hash_and_size(path: impl Into<PathBuf>) -> Result<(Hash32, u64), Error> {
+    let mut stream = NarByteStream::new(path.into());
+    let mut context = harmonia_utils_hash::Context::new(harmonia_utils_hash::Algorithm::SHA256);
+    let mut size: u64 = 0;
+    while let Some(bytes) = stream.next().await {
+        let bytes = bytes?;
+        context.update(&bytes);
+        size += bytes.len() as u64;
+    }
+    match context.finish() {
+        harmonia_utils_hash::Hash::SHA256(sha) => Ok((Hash32(*sha.digest_bytes()), size)),
+        other => Err(Error::InvalidNar(format!(
+            "hash context returned unexpected algorithm {other:?}"
+        ))),
+    }
+}
+
+/// Flatten a tree into `(relative path, node)` pairs, depth-first.
+/// The root node has the empty relative path.
+pub fn flatten_tree(tree: &FileTree<ChunkList>) -> Vec<(String, &TreeNode)> {
+    fn walk<'tree>(
+        prefix: &str,
+        tree: &'tree FileTree<ChunkList>,
+        out: &mut Vec<(String, &'tree TreeNode)>,
+    ) {
+        out.push((prefix.to_string(), &tree.0));
+        if let FileSystemObject::Directory(directory) = &tree.0 {
+            for (name, child) in &directory.entries {
+                let child_path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                walk(&child_path, child, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk("", tree, &mut out);
+    out
 }
 
 /// Decompress and verify one chunk extracted from pack bytes.

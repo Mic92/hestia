@@ -55,6 +55,15 @@ impl Hash32 {
     pub fn to_hex(self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
+
+    /// Parse a SHA-256 hash in any format Nix uses: SRI (`sha256-<base64>`),
+    /// prefixed (`sha256:<base16|base32|base64>`), or bare.
+    ///
+    /// Returns `None` for non-SHA-256 hashes or unparsable input.
+    pub fn parse_sha256(s: &str) -> Option<Self> {
+        let hash: harmonia_utils_hash::fmt::Any<harmonia_utils_hash::Sha256> = s.parse().ok()?;
+        Some(Self(*hash.into_hash().digest_bytes()))
+    }
 }
 
 impl std::fmt::Debug for Hash32 {
@@ -640,6 +649,48 @@ mod tests {
             "7a32118639289175533829e84c9aaa9fa781f6a5f1b18a9c8a6bd3642b39dd88"
         );
         assert_eq!(format!("{hash}"), hash.to_hex());
+    }
+
+    #[test]
+    fn hash32_parses_nix_hash_formats() {
+        let hash = Hash32::digest(b"hello world");
+        // SRI format (what `nix path-info --json` emits as narHash).
+        let sri = format!("sha256-{}", {
+            // Standard base64 of the digest.
+            const TABLE: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let bytes = hash.0;
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let b = [
+                    chunk[0],
+                    *chunk.get(1).unwrap_or(&0),
+                    *chunk.get(2).unwrap_or(&0),
+                ];
+                let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+                out.push(TABLE[(n >> 18) as usize & 63] as char);
+                out.push(TABLE[(n >> 12) as usize & 63] as char);
+                out.push(if chunk.len() > 1 {
+                    TABLE[(n >> 6) as usize & 63] as char
+                } else {
+                    '='
+                });
+                out.push(if chunk.len() > 2 {
+                    TABLE[n as usize & 63] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        });
+        assert_eq!(Hash32::parse_sha256(&sri), Some(hash));
+
+        // Prefixed base16.
+        let base16 = format!("sha256:{}", hash.to_hex());
+        assert_eq!(Hash32::parse_sha256(&base16), Some(hash));
+
+        // Garbage.
+        assert_eq!(Hash32::parse_sha256("not a hash"), None);
     }
 
     #[test]

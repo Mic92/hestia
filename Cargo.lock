@@ -1058,6 +1058,7 @@ dependencies = [
  "ciborium",
  "clap",
  "fastcdc",
+ "futures-util",
  "harmonia-file-core",
  "harmonia-file-nar",
  "harmonia-store-nar-info",
