@@ -8,11 +8,14 @@
 //! reads against the pack.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::Poll;
 
 use bytes::Bytes;
-use futures_util::StreamExt as _;
-use harmonia_file_nar::{NarByteStream, NarEvent};
+use futures_util::{SinkExt as _, StreamExt as _};
+use harmonia_file_nar::{NarByteStream, NarEvent, NarWriter};
 
 use crate::manifest::{
     ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Hash32, PackHash,
@@ -42,6 +45,9 @@ pub enum Error {
 
     #[error("invalid NAR event stream: {0}")]
     InvalidNar(String),
+
+    #[error("chunk {0} referenced by the file tree but not provided")]
+    MissingChunk(ChunkHash),
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +209,17 @@ pub struct ChunkedPath {
     /// order because the NAR walk visits files in sorted order and chunks
     /// each file front to back. This is the order chunks should enter packs.
     pub chunks: Vec<Chunk>,
+}
+
+impl ChunkedPath {
+    /// Chunk data indexed by hash (input for [`nar_hash_from_chunks`] and
+    /// pack assembly).
+    pub fn chunk_map(&self) -> BTreeMap<ChunkHash, Bytes> {
+        self.chunks
+            .iter()
+            .map(|chunk| (chunk.hash, chunk.data.clone()))
+            .collect()
+    }
 }
 
 /// Directory entries under construction.
@@ -377,6 +394,149 @@ pub fn flatten_tree(tree: &FileTree<ChunkList>) -> Vec<(String, &TreeNode)> {
     let mut out = Vec::new();
     walk("", tree, &mut out);
     out
+}
+
+// ---------------------------------------------------------------------------
+// NAR replay: tree + chunk data -> NAR bytes -> hash
+//
+// This is the read-side serialization path: the Phase 4 substituter rebuilds
+// NARs from the manifest tree + fetched chunks exactly like this. Using it on
+// the write side to compute nar_hash means a path's stored representation is
+// proven to reproduce the original NAR before anything is uploaded.
+// ---------------------------------------------------------------------------
+
+/// Tokio `AsyncWrite` sink that hashes and counts bytes instead of storing
+/// them.
+struct HashSink {
+    context: harmonia_utils_hash::Context,
+    size: u64,
+}
+
+impl HashSink {
+    fn new() -> Self {
+        Self {
+            context: harmonia_utils_hash::Context::new(harmonia_utils_hash::Algorithm::SHA256),
+            size: 0,
+        }
+    }
+
+    fn finish(self) -> Result<(Hash32, u64), Error> {
+        match self.context.finish() {
+            harmonia_utils_hash::Hash::SHA256(sha) => Ok((Hash32(*sha.digest_bytes()), self.size)),
+            other => Err(Error::InvalidNar(format!(
+                "hash context returned unexpected algorithm {other:?}"
+            ))),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for HashSink {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.context.update(buf);
+        this.size += buf.len() as u64;
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Synthesize the NAR event sequence for a tree node, depth-first.
+///
+/// Directory entries come out in `BTreeMap` order, which is the sorted order
+/// the NAR format requires (and the order `NarDumper` emits).
+fn collect_events(
+    name: Bytes,
+    node: &TreeNode,
+    chunks: &BTreeMap<ChunkHash, Bytes>,
+    out: &mut Vec<NarEvent<Cursor<Bytes>>>,
+) -> Result<(), Error> {
+    match node {
+        FileSystemObject::Regular(regular) => {
+            // Concatenate the file's chunks. Single-chunk files (the common
+            // case) reuse the chunk's Bytes without copying.
+            let data = match regular.contents.chunks.as_slice() {
+                [] => Bytes::new(),
+                [hash] => chunks.get(hash).ok_or(Error::MissingChunk(*hash))?.clone(),
+                hashes => {
+                    let mut data = Vec::new();
+                    for hash in hashes {
+                        let chunk = chunks.get(hash).ok_or(Error::MissingChunk(*hash))?;
+                        data.extend_from_slice(chunk);
+                    }
+                    Bytes::from(data)
+                }
+            };
+            out.push(NarEvent::File {
+                name,
+                executable: regular.executable,
+                size: data.len() as u64,
+                reader: Cursor::new(data),
+            });
+        }
+        FileSystemObject::Symlink(symlink) => {
+            out.push(NarEvent::Symlink {
+                name,
+                target: Bytes::copy_from_slice(symlink.target.as_bytes()),
+            });
+        }
+        FileSystemObject::Directory(directory) => {
+            out.push(NarEvent::StartDirectory { name });
+            for (child_name, child) in &directory.entries {
+                collect_events(
+                    Bytes::copy_from_slice(child_name.as_bytes()),
+                    &child.0,
+                    chunks,
+                    out,
+                )?;
+            }
+            out.push(NarEvent::EndDirectory);
+        }
+    }
+    Ok(())
+}
+
+/// NAR hash and size of a path, computed from its *stored representation*
+/// (file tree + chunk data) by replaying synthesized events through
+/// harmonia's [`NarWriter`].
+///
+/// The write pipeline compares this against the nar_hash recorded in the Nix
+/// database: equality proves the chunked representation reproduces the
+/// original NAR byte-identically, so it is safe to upload and serve.
+pub async fn nar_hash_from_chunks(
+    tree: &FileTree<ChunkList>,
+    chunks: &BTreeMap<ChunkHash, Bytes>,
+) -> Result<(Hash32, u64), Error> {
+    let mut events = Vec::new();
+    // The root node's name is ignored by the NAR format (only nested entries
+    // carry names), so any value works here.
+    collect_events(Bytes::new(), &tree.0, chunks, &mut events)?;
+
+    let mut sink = HashSink::new();
+    {
+        let mut writer = NarWriter::new(&mut sink);
+        for event in events {
+            writer.feed(event).await?;
+        }
+        writer.close().await?;
+    }
+    sink.finish()
 }
 
 /// Decompress and verify one chunk extracted from pack bytes.
@@ -560,6 +720,60 @@ mod tests {
         let middle = corrupted.len() / 2;
         corrupted[middle] ^= 0xff;
         assert!(extract_chunk(&corrupted, &chunks[0].hash).is_err());
+    }
+
+    #[tokio::test]
+    async fn nar_hash_from_chunks_matches_disk_walk() {
+        // Build a small tree on disk, chunk it, then verify that replaying
+        // the chunked representation produces the same NAR hash as hashing
+        // the disk walk directly (NarByteStream).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("fixture");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("small"), b"small file contents\n").unwrap();
+        std::fs::write(root.join("empty"), b"").unwrap();
+        std::fs::write(root.join("sub/large"), test_data(700_000, 11)).unwrap();
+        std::os::unix::fs::symlink("small", root.join("sub/link")).unwrap();
+
+        let chunked = chunk_path(&root).await.unwrap();
+        let from_disk = nar_hash_and_size(&root).await.unwrap();
+        let from_chunks = nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map())
+            .await
+            .unwrap();
+        assert_eq!(from_chunks, from_disk);
+    }
+
+    #[tokio::test]
+    async fn nar_hash_from_chunks_single_file_root() {
+        // Bare-file NARs (root node is a file, not a directory).
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("single");
+        std::fs::write(&file, test_data(200_000, 12)).unwrap();
+
+        let chunked = chunk_path(&file).await.unwrap();
+        let from_disk = nar_hash_and_size(&file).await.unwrap();
+        let from_chunks = nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map())
+            .await
+            .unwrap();
+        assert_eq!(from_chunks, from_disk);
+    }
+
+    #[tokio::test]
+    async fn nar_hash_from_chunks_fails_on_missing_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("fixture");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), test_data(100_000, 13)).unwrap();
+
+        let chunked = chunk_path(&root).await.unwrap();
+        let mut chunks = chunked.chunk_map();
+        let (missing_hash, _) = chunks.pop_first().unwrap();
+
+        let result = nar_hash_from_chunks(&chunked.tree, &chunks).await;
+        match result {
+            Err(Error::MissingChunk(hash)) => assert_eq!(hash, missing_hash),
+            other => panic!("expected MissingChunk error, got {other:?}"),
+        }
     }
 
     #[test]

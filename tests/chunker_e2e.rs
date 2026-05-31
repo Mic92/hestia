@@ -243,6 +243,31 @@ async fn nar_hash_matches_nix_path_info_for_real_store_path() {
 }
 
 #[tokio::test]
+async fn nar_hash_from_chunks_matches_nix_for_real_store_path() {
+    // The write-pipeline integrity check: the NAR hash computed from the
+    // chunked representation (tree + chunk data, no second disk walk) must
+    // equal what Nix records for the path. This is what proves a path's
+    // stored form is correct before it gets uploaded.
+    let Some(store_path) = find_real_store_path() else {
+        eprintln!("skipping: no real /nix/store path available");
+        return;
+    };
+    let Some((expected_hash, expected_size)) =
+        nix_path_info_hash(&store_path).or_else(|| nix_store_dump_hash(&store_path))
+    else {
+        eprintln!("skipping: no nix oracle available");
+        return;
+    };
+
+    let chunked = chunk_path(&store_path).await.unwrap();
+    let (hash, size) = chunker::nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map())
+        .await
+        .unwrap();
+    assert_eq!(size, expected_size, "NAR size mismatch");
+    assert_eq!(hash, expected_hash, "NAR hash mismatch");
+}
+
+#[tokio::test]
 async fn chunking_real_path_is_deterministic() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("fixture-0.1.0");
