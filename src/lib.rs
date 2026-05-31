@@ -4,3 +4,4 @@
 //! need to reach; the `hestia` binary in `main.rs` is a thin CLI on top.
 
 pub mod gha;
+pub mod manifest;
