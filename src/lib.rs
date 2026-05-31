@@ -11,3 +11,4 @@ pub mod gha;
 pub mod hook;
 pub mod manifest;
 pub mod serve;
+pub mod upstream;
