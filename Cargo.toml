@@ -55,6 +55,8 @@ harmonia-utils-io = { git = "https://github.com/nix-community/harmonia", rev = "
 harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
 
 [dev-dependencies]
+# Property-based tests for manifest merge laws
+proptest = "1"
 # Verifies the hardcoded cache version constant
 sha2 = "0.11"
 # Blob storage directory for the fake GHA backend
