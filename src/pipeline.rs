@@ -1,0 +1,431 @@
+//! The write pipeline: store paths → chunks → packs → manifest commit.
+//!
+//! Runs on drain (action post-step or idle-exit). Steps:
+//!
+//! 1. Query path info from the store database for every buffered path.
+//! 2. Filter: invalid paths, upstream-signed paths, paths already in the
+//!    manifest (those get their `last_pushed` clock bumped instead).
+//! 3. Chunk each new path (FastCDC over NAR events) and verify the chunked
+//!    representation reproduces the NAR hash recorded by Nix.
+//! 4. Pack new chunks, upload the pack (Twirp reserve → Azure PUT →
+//!    finalize; `already_exists` means an identical pack is already there).
+//! 5. Commit the manifest: new path entries, chunk locations, pack ref, and
+//!    the root for this branch+system = pushed ∪ accessed paths.
+//!    SaveMutable handles write conflicts by re-merging.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
+
+use crate::chunker::{self, PackBuilder, chunk_path, nar_hash_from_chunks};
+use crate::gha::savemutable::SaveMutable;
+use crate::gha::twirp::{Reservation, TwirpClient};
+use crate::gha::{Error as GhaError, blob};
+use crate::manifest::{Manifest, PackInfo, PathEntry, PathHash, Root};
+use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
+use crate::protocol::DrainStats;
+use crate::upstream::UpstreamFilter;
+
+/// SaveMutable family prefix for the manifest ("m" → keys `m#1`, `m#2`, …).
+pub const MANIFEST_PREFIX: &str = "m";
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("GHA cache error: {0}")]
+    Gha(#[from] GhaError),
+
+    #[error("chunking error: {0}")]
+    Chunker(#[from] chunker::Error),
+
+    #[error("manifest error: {0}")]
+    Manifest(#[from] crate::manifest::Error),
+
+    #[error("store database error: {0}")]
+    PathInfo(#[from] PathInfoError),
+}
+
+// ---------------------------------------------------------------------------
+// Access log (substituter integration point, populated from Phase 4 on)
+// ---------------------------------------------------------------------------
+
+/// Shared record of paths served through the substituter.
+///
+/// narinfo hits double as the liveness signal: an accessed path joins this
+/// run's root even though it was not rebuilt, which keeps it (and its
+/// closure) alive across GC. The substituter records hits; the pipeline
+/// reads a snapshot at drain time.
+///
+/// Cloning is cheap (shared state): the daemon hands one clone to the
+/// substituter and keeps one for drains.
+#[derive(Debug, Default, Clone)]
+pub struct AccessLog {
+    inner: Arc<Mutex<BTreeSet<PathHash>>>,
+}
+
+impl AccessLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that a path was served (or asked for and found).
+    pub fn record(&self, hash: PathHash) {
+        self.inner
+            .lock()
+            .expect("access log lock poisoned")
+            .insert(hash);
+    }
+
+    /// All paths accessed so far.
+    pub fn snapshot(&self) -> BTreeSet<PathHash> {
+        self.inner.lock().expect("access log lock poisoned").clone()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("access log lock poisoned")
+            .is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Environment detection
+// ---------------------------------------------------------------------------
+
+/// The Nix system string for the machine hestia runs on
+/// (`x86_64-linux`, `aarch64-darwin`, …).
+pub fn current_system() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        os => os,
+    };
+    format!("{}-{os}", std::env::consts::ARCH)
+}
+
+/// Manifest root key for a branch + system pair, e.g. `main-x86_64-linux`.
+pub fn root_key(branch: &str, system: &str) -> String {
+    format!("{branch}-{system}")
+}
+
+/// Current unix time in seconds.
+pub fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline
+// ---------------------------------------------------------------------------
+
+/// Everything the pipeline needs to talk to the world.
+pub struct PipelineContext {
+    pub twirp: TwirpClient,
+    pub http: reqwest::Client,
+    pub store: StoreDatabase,
+    pub upstream: UpstreamFilter,
+    /// Manifest root key, e.g. `main-x86_64-linux`.
+    pub root_key: String,
+    /// SaveMutable family prefix (always [`MANIFEST_PREFIX`] in production;
+    /// tests use distinct prefixes to isolate scenarios).
+    pub manifest_prefix: String,
+}
+
+/// One new path, fully prepared for upload.
+struct PreparedPath {
+    hash: PathHash,
+    entry: PathEntry,
+    /// This path's chunks that exist in neither the manifest nor an earlier
+    /// prepared path of the same batch.
+    new_chunks: Vec<chunker::Chunk>,
+}
+
+impl PipelineContext {
+    fn save_mutable(&self) -> SaveMutable<'_> {
+        SaveMutable::new(&self.twirp, &self.http, &self.manifest_prefix)
+    }
+
+    /// Load the current manifest, or an empty one if none exists yet.
+    pub async fn load_manifest(&self) -> Result<Manifest, Error> {
+        match self.save_mutable().load().await? {
+            Some(entry) => Ok(Manifest::decode(&entry.data)?),
+            None => Ok(Manifest::new()),
+        }
+    }
+
+    /// Run the write pipeline.
+    ///
+    /// `paths`: absolute store paths buffered from hooks.
+    /// `accessed`: path hashes recorded by the substituter ([`AccessLog`]).
+    /// `now`: unix timestamp for all clocks written by this run.
+    pub async fn run(
+        &self,
+        paths: BTreeSet<String>,
+        accessed: BTreeSet<PathHash>,
+        now: u64,
+    ) -> Result<DrainStats, Error> {
+        let mut stats = DrainStats {
+            paths_received: paths.len(),
+            ..DrainStats::default()
+        };
+
+        if paths.is_empty() && accessed.is_empty() {
+            return Ok(stats);
+        }
+
+        let current = self.load_manifest().await?;
+
+        // ---- query the store database (blocking sqlite I/O) -----------------
+        let store = self.store.clone();
+        let lookups = tokio::task::spawn_blocking(move || store.query_batch(paths))
+            .await
+            .expect("store database query task panicked")?;
+
+        // ---- classify paths -------------------------------------------------
+        let mut root_paths: BTreeSet<PathHash> = accessed;
+        // Existing entries whose last_pushed clock gets bumped (dedup-skips).
+        let mut bumped: BTreeMap<PathHash, PathEntry> = BTreeMap::new();
+        // Paths that need chunking + upload.
+        let mut to_push: Vec<(String, PathInfo)> = Vec::new();
+
+        for (path, lookup) in lookups {
+            let info = match lookup {
+                Lookup::Found(info) => *info,
+                Lookup::Unknown => {
+                    eprintln!("hestia: skipping {path}: not a valid path in the local store");
+                    stats.skipped_invalid += 1;
+                    continue;
+                }
+                Lookup::Malformed { reason } => {
+                    eprintln!("hestia: skipping {path}: {reason}");
+                    stats.skipped_invalid += 1;
+                    continue;
+                }
+            };
+
+            if self.upstream.is_upstream_signed(&info.signatures) {
+                stats.skipped_upstream += 1;
+                continue;
+            }
+
+            let hash = info.path_hash();
+            root_paths.insert(hash);
+
+            if let Some(existing) = current.paths.get(&hash) {
+                // Already stored: bump the push clock so PushTTL-based
+                // liveness keeps protecting it (PLAN.md liveness rule).
+                let mut entry = existing.clone();
+                entry.last_pushed = now;
+                bumped.insert(hash, entry);
+                stats.skipped_existing += 1;
+                continue;
+            }
+
+            to_push.push((path, info));
+        }
+
+        // ---- chunk + verify new paths ---------------------------------------
+        let mut prepared: Vec<PreparedPath> = Vec::new();
+        // Chunks of earlier prepared paths in this batch (cross-path dedup).
+        let mut batch_chunks: BTreeSet<crate::manifest::ChunkHash> = BTreeSet::new();
+
+        for (path, info) in to_push {
+            let chunked = chunk_path(&path).await?;
+            let chunk_map = chunked.chunk_map();
+
+            // Integrity gate: the chunked representation must reproduce the
+            // NAR hash Nix recorded for this path. A mismatch means hestia
+            // would serve corrupt data; never upload it.
+            let (nar_hash, nar_size) = nar_hash_from_chunks(&chunked.tree, &chunk_map).await?;
+            if nar_hash != info.nar_hash || nar_size != info.nar_size {
+                eprintln!(
+                    "hestia: NOT uploading {path}: chunked NAR hash {nar_hash} (size {nar_size}) \
+                     does not match the store's record {} (size {}); \
+                     this indicates a chunker bug or store corruption",
+                    info.nar_hash, info.nar_size
+                );
+                stats.failed_verification += 1;
+                continue;
+            }
+
+            let new_chunks: Vec<chunker::Chunk> = chunked
+                .chunks
+                .into_iter()
+                .filter(|chunk| {
+                    !current.chunks.contains_key(&chunk.hash) && batch_chunks.insert(chunk.hash)
+                })
+                .collect();
+
+            let hash = info.path_hash();
+            root_paths.insert(hash);
+            prepared.push(PreparedPath {
+                hash,
+                entry: PathEntry {
+                    nar_hash,
+                    nar_size,
+                    references: info.reference_hashes(),
+                    ca: info.ca,
+                    deriver: info.deriver,
+                    tree: chunked.tree,
+                    last_reachable: 0,
+                    last_pushed: now,
+                },
+                new_chunks,
+            });
+        }
+
+        // ---- build + upload the pack -----------------------------------------
+        let mut delta = Manifest::new();
+
+        let mut builder = PackBuilder::new();
+        for path in &prepared {
+            for chunk in &path.new_chunks {
+                builder.add(chunk)?;
+            }
+        }
+
+        if !builder.is_empty() {
+            let pack = builder.finish();
+            stats.new_chunks = pack.chunks.len();
+
+            let uploaded = self.upload_pack(&pack).await?;
+            if uploaded {
+                stats.packs_uploaded += 1;
+                stats.bytes_uploaded += pack.data.len() as u64;
+            }
+
+            for (chunk_hash, location) in pack.locations() {
+                delta.chunks.insert(chunk_hash, location);
+            }
+            delta.packs.insert(
+                pack.hash,
+                PackInfo {
+                    size: pack.data.len() as u64,
+                    created: now,
+                    tier: 0,
+                },
+            );
+        }
+
+        // ---- assemble the manifest delta -------------------------------------
+        for path in prepared {
+            stats.pushed += 1;
+            delta.paths.insert(path.hash, path.entry);
+        }
+        delta.paths.extend(bumped);
+
+        if delta.paths.is_empty() && root_paths.is_empty() {
+            // Everything was filtered out; nothing worth a manifest version.
+            return Ok(stats);
+        }
+
+        delta.roots.insert(
+            self.root_key.clone(),
+            Root {
+                paths: root_paths,
+                updated: now,
+            },
+        );
+
+        // ---- commit (re-merge on conflict) ------------------------------------
+        let version = self
+            .save_mutable()
+            .save(|existing| {
+                let base = match existing {
+                    Some(entry) => Manifest::decode(&entry.data)
+                        .map_err(|err| GhaError::InvalidResponse(err.to_string()))?,
+                    None => Manifest::new(),
+                };
+                let merged = base.merge(delta.clone());
+                merged
+                    .encode()
+                    .map_err(|err| GhaError::InvalidResponse(err.to_string()))
+            })
+            .await?;
+        stats.manifest_version = version;
+
+        Ok(stats)
+    }
+
+    /// Upload one pack blob. Returns false if the cache already has it
+    /// (content-addressed key, so identical content is guaranteed).
+    async fn upload_pack(&self, pack: &chunker::Pack) -> Result<bool, Error> {
+        let key = pack.cache_key();
+        let data = Bytes::from(pack.data.clone());
+
+        match self.twirp.create_cache_entry(&key).await? {
+            Reservation::AlreadyExists => Ok(false),
+            Reservation::Created { upload_url } => {
+                let twirp = &self.twirp;
+                let key_clone = key.clone();
+                blob::put_with_refresh(&self.http, &upload_url, data, async move || {
+                    // A pack upload outliving its SAS URL cannot be re-reserved
+                    // (PLAN.md Open Question 8); surface a clear error.
+                    match twirp.create_cache_entry(&key_clone).await? {
+                        Reservation::Created { upload_url } => Ok(upload_url),
+                        Reservation::AlreadyExists => Err(GhaError::InvalidResponse(format!(
+                            "upload URL for {key_clone} expired and cannot be refreshed"
+                        ))),
+                    }
+                })
+                .await?;
+                self.twirp
+                    .finalize_upload(&key, pack.data.len() as u64)
+                    .await?;
+                Ok(true)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_system_matches_nix_convention() {
+        let system = current_system();
+        // x86_64-linux, aarch64-linux, aarch64-darwin, x86_64-darwin
+        let (arch, os) = system.split_once('-').expect("system has arch-os form");
+        assert!(["x86_64", "aarch64"].contains(&arch), "arch: {arch}");
+        assert!(["linux", "darwin"].contains(&os), "os: {os}");
+    }
+
+    #[test]
+    fn root_key_layout() {
+        assert_eq!(root_key("main", "x86_64-linux"), "main-x86_64-linux");
+        assert_eq!(
+            root_key("feature/foo", "aarch64-darwin"),
+            "feature/foo-aarch64-darwin"
+        );
+    }
+
+    #[test]
+    fn access_log_is_shared_between_clones() {
+        let log = AccessLog::new();
+        let clone = log.clone();
+        assert!(log.is_empty());
+
+        let hash: PathHash = "00000000000000000000000000000000"
+            .parse()
+            .expect("valid path hash");
+        clone.record(hash);
+
+        assert!(!log.is_empty());
+        assert_eq!(log.snapshot(), BTreeSet::from([hash]));
+        // Recording the same hash twice is idempotent.
+        log.record(hash);
+        assert_eq!(log.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn now_unix_is_sane() {
+        let now = now_unix();
+        // After 2024-01-01, before 2100-01-01.
+        assert!(now > 1_704_067_200, "clock too early: {now}");
+        assert!(now < 4_102_444_800, "clock too late: {now}");
+    }
+}

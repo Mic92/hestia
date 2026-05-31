@@ -54,6 +54,11 @@ pub struct DrainStats {
     /// Paths skipped because the local store does not know them.
     #[serde(default)]
     pub skipped_invalid: usize,
+    /// Paths skipped because their chunked representation failed to
+    /// reproduce the NAR hash recorded in the Nix database (indicates a
+    /// chunker bug or store corruption; never uploaded).
+    #[serde(default)]
+    pub failed_verification: usize,
     /// Paths newly added to the manifest.
     #[serde(default)]
     pub pushed: usize,
