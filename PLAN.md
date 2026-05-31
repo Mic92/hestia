@@ -291,18 +291,30 @@ first push). Deviations recorded under Open Questions (8–9).
 
 ### Phase 2: Manifest + chunker
 
-- `manifest.rs`: serde structs above, CBOR+zstd encode/decode, merge rules
-  (paths/chunks union, root union-or-replace by timestamp, pack dedup),
-  reachability walk, liveness predicate
-- `chunker.rs`: fastcdc v2020 (16/64/256 KB), per-file chunking from
-  `NarEvent::File` data, pack assembly (chunks ordered by path+offset),
-  offset bookkeeping
-- Tests: chunk determinism, merge commutativity (A⊕B = B⊕A for concurrent
-  runs), reachability with upstream holes, CBOR round-trip + forward-compat
-  (unknown fields ignored)
-- **Milestone: chunk a real store path; reconstruct every file byte-identical
-  from the pack buffer; nar_hash from event replay matches
-  `nix path-info`.**
+**Status: done.** Milestone verified locally: bash-5.3 store path (43 files)
+reconstructed byte-identical from a pack; NAR hash matches both
+`nix-store --dump` and `nix path-info --json`. Schema deviations recorded
+under Open Questions (10).
+
+- [x] `manifest.rs`: serde structs, CBOR+zstd encode/decode (Hash32 as CBOR
+      byte strings, PathHash as base32 strings), merge rules (paths/chunks
+      union with deterministic winners, root union-or-replace by timestamp
+      with 10-min concurrency window, pack dedup by hash), reachability walk
+      (skips upstream holes, tolerates cycles), liveness predicate
+- [x] `chunker.rs`: fastcdc v2020 (16/64/256 KB), per-file chunking from
+      `NarEvent::File` data, pack assembly (chunks ordered by path+offset,
+      individually zstd-compressed, Range-extractable), offset bookkeeping,
+      hash-verified extraction
+- [x] NAR integration: `chunk_path()` (NarDumper → chunks + FileTree),
+      `nar_hash_and_size()` (NarByteStream → sha256, same code path that
+      will serve NARs in Phase 4)
+- [x] Tests: chunk determinism, CDC shift-resistance, merge laws via
+      proptest (commutativity, idempotence, identity, no-path-loss),
+      reachability with upstream holes, CBOR round-trip + forward-compat
+      (unknown fields ignored), pack offset tiling
+- [x] **Milestone: chunk a real store path; reconstruct every file
+      byte-identical from the pack buffer; nar_hash from event replay
+      matches `nix path-info`.**
 
 ### Phase 3: Write pipeline + hook
 
@@ -485,6 +497,19 @@ API gets faked, and only because GitHub gives no other choice locally.
    `not_found` error depending on path. The client treats both as a miss;
    the fake uses `ok=false` (matching go-actions-cache's expectation).
    Verify against the real service output once CI runs.
+10. **Manifest schema deviations from the PLAN sketch** (Phase 2):
+    `ChunkList` is a struct with a named `chunks` field (not a tuple
+    newtype) because harmonia's `Regular<C>` flattens its contents with
+    serde, which requires map-shaped serialization. `packs` is a
+    `BTreeMap<PackHash, PackInfo>` instead of `Vec<PackRef>` so dedup-by-
+    hash is the natural merge operation. Also: harmonia's `Hash::FromStr`
+    is commented out upstream; hash parsing goes through
+    `harmonia_utils_hash::fmt::Any<Sha256>`.
+11. **chunk_path walks the path twice** (Phase 2): once via NarDumper for
+    chunking and once via NarByteStream for the NAR hash. Phase 3 should
+    tee a single event stream into both consumers (PLAN's original design)
+    if profiling shows the double walk matters; for CI-sized paths it does
+    not.
 
 ## Mistakes Fixed from Earlier Draft
 
