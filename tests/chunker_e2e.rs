@@ -9,15 +9,17 @@
 //! Tests that need Nix tooling or /nix/store skip themselves (with a notice)
 //! when running where those are unavailable (e.g. the Nix build sandbox).
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use bytes::Bytes;
 
 use hestia::chunker::{self, PackBuilder, chunk_path, extract_chunk, flatten_tree};
-use hestia::manifest::{ChunkHash, ChunkLocation, FileSystemObject, Hash32};
+use hestia::manifest::{ChunkHash, ChunkLocation, FileSystemObject};
+use support::store::{find_real_store_path, nix_path_info_hash, nix_store_dump_hash};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -57,66 +59,6 @@ fn create_fixture(root: &Path) {
     // Symlinks: relative and dangling.
     std::os::unix::fs::symlink("../bin/hello", root.join("lib/hello-link")).unwrap();
     std::os::unix::fs::symlink("/nix/store/nonexistent", root.join("dangling")).unwrap();
-}
-
-/// Find a real store path by resolving the `sh` binary through symlinks.
-fn find_real_store_path() -> Option<PathBuf> {
-    let output = Command::new("sh")
-        .args(["-c", "command -v sh"])
-        .output()
-        .ok()?;
-    let sh = String::from_utf8(output.stdout).ok()?;
-    let resolved = std::fs::canonicalize(sh.trim()).ok()?;
-    // /nix/store/<hash>-<name>/bin/bash -> /nix/store/<hash>-<name>
-    let mut components = resolved.components();
-    let prefix: PathBuf = components.by_ref().take(4).collect();
-    if !prefix.starts_with("/nix/store") || prefix == Path::new("/nix/store") {
-        return None;
-    }
-    prefix.is_dir().then_some(prefix)
-}
-
-/// Reference NAR hash + size via `nix-store --dump` (works on arbitrary
-/// paths, no Nix database needed). None if nix-store is unavailable.
-fn nix_store_dump_hash(path: &Path) -> Option<(Hash32, u64)> {
-    let output = Command::new("nix-store")
-        .arg("--dump")
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some((Hash32::digest(&output.stdout), output.stdout.len() as u64))
-}
-
-/// Reference NAR hash + size via `nix path-info --json` (needs a valid store
-/// path registered in the Nix database). None if unavailable.
-fn nix_path_info_hash(path: &Path) -> Option<(Hash32, u64)> {
-    let output = Command::new("nix")
-        .args([
-            "--extra-experimental-features",
-            "nix-command",
-            "path-info",
-            "--json",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    // nix >= 2.19: {"/nix/store/...": {"narHash": ..., "narSize": ...}}
-    // older nix:   [{"path": ..., "narHash": ..., "narSize": ...}]
-    let info = match &value {
-        serde_json::Value::Object(map) => map.values().next()?,
-        serde_json::Value::Array(array) => array.first()?,
-        _ => return None,
-    };
-    let nar_hash = Hash32::parse_sha256(info.get("narHash")?.as_str()?)?;
-    let nar_size = info.get("narSize")?.as_u64()?;
-    Some((nar_hash, nar_size))
 }
 
 /// Chunk a path, pack all chunks, then rebuild every regular file purely

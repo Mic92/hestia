@@ -4,70 +4,11 @@
 //! These tests skip themselves (with a notice) when no nix-daemon is
 //! reachable — e.g. inside the Nix build sandbox, which has no store access.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+mod support;
 
 use hestia::manifest::Hash32;
-use hestia::pathinfo::{DEFAULT_DAEMON_SOCKET, NixDaemon};
 use hestia::upstream::UpstreamFilter;
-
-/// Connect to the local nix-daemon, or return None (test should skip).
-async fn daemon_or_skip() -> Option<NixDaemon> {
-    let socket = Path::new(DEFAULT_DAEMON_SOCKET);
-    if !socket.exists() {
-        eprintln!("skipping: no nix-daemon socket at {DEFAULT_DAEMON_SOCKET}");
-        return None;
-    }
-    let daemon = NixDaemon::new(socket);
-    match daemon.ping().await {
-        Ok(()) => Some(daemon),
-        Err(err) => {
-            eprintln!("skipping: nix-daemon not reachable: {err}");
-            None
-        }
-    }
-}
-
-/// Find a real store path by resolving the `sh` binary through symlinks.
-fn find_real_store_path() -> Option<PathBuf> {
-    let output = Command::new("sh")
-        .args(["-c", "command -v sh"])
-        .output()
-        .ok()?;
-    let sh = String::from_utf8(output.stdout).ok()?;
-    let resolved = std::fs::canonicalize(sh.trim()).ok()?;
-    // /nix/store/<hash>-<name>/bin/bash -> /nix/store/<hash>-<name>
-    let mut components = resolved.components();
-    let prefix: PathBuf = components.by_ref().take(4).collect();
-    if !prefix.starts_with("/nix/store") || prefix == Path::new("/nix/store") {
-        return None;
-    }
-    prefix.is_dir().then_some(prefix)
-}
-
-/// Reference data via `nix path-info --json` (the test oracle).
-fn nix_path_info_json(path: &Path) -> Option<serde_json::Value> {
-    let output = Command::new("nix")
-        .args([
-            "--extra-experimental-features",
-            "nix-command",
-            "path-info",
-            "--json",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    // nix >= 2.19: {"/nix/store/...": {...}}; older nix: [{"path": ..., ...}]
-    match value {
-        serde_json::Value::Object(map) => map.into_iter().next().map(|(_, info)| info),
-        serde_json::Value::Array(array) => array.into_iter().next(),
-        _ => None,
-    }
-}
+use support::store::{daemon_or_skip, find_real_store_path, nix_path_info_json};
 
 #[tokio::test]
 async fn daemon_path_info_matches_nix_path_info_json() {
