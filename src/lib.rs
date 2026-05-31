@@ -10,5 +10,6 @@ pub mod gc;
 pub mod gha;
 pub mod hook;
 pub mod manifest;
+pub mod pathinfo;
 pub mod serve;
 pub mod upstream;
