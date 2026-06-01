@@ -31,6 +31,7 @@ fn context(fake: &FakeGha, http: &reqwest::Client, store: StoreDatabase) -> Pipe
         upstream: UpstreamFilter::default(),
         root_key: TEST_ROOT_KEY.to_string(),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
+        publish: None,
     }
 }
 

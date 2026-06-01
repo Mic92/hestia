@@ -774,12 +774,19 @@ continues from / interleaves with the Open Questions section above.
     always detected. Consequences: (a) the real-API tests poll
     read-after-write assertions instead of asserting immediately; (b)
     SaveMutable's stale-skip window was widened to 60s (20 × 3s) so
-    propagation lag is never misdiagnosed as a crashed writer; (c)
-    everything else already tolerates lag by design — a stale read is a
-    cache miss (rebuild), never corruption, and packs referenced by a
-    manifest are always uploaded *before* the manifest commit. The fake
-    backend stays strongly consistent on purpose: simulating lag everywhere
-    would buy little coverage at a high test-complexity cost.
+    propagation lag is never misdiagnosed as a crashed writer; (c) the
+    daemon practices **read-your-writes**: the pipeline publishes the
+    manifest it committed directly into the substituter's `ManifestStore`
+    (instead of re-loading it from the cache, which returned a stale
+    version and made just-pushed paths 404 — caught by the action-test CI
+    job), folds that manifest into every later merge base, and passes its
+    version to `SaveMutable::save_with_floor` so a drain never fights its
+    own previous commit in the conflict loop; (d) everything else
+    tolerates lag by design — a stale read is a cache miss (rebuild),
+    never corruption, and packs referenced by a manifest are always
+    uploaded *before* the manifest commit. The fake backend simulates lag
+    only behind the `stale-lookups` injection endpoint; everything else
+    stays strongly consistent.
 
 ## Mistakes Fixed from Earlier Draft
 
