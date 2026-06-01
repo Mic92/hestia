@@ -336,10 +336,8 @@ impl PipelineContext {
                 })
                 .collect();
 
-            let hash = info.path_hash();
-            root_paths.insert(hash);
             prepared.push(PreparedPath {
-                hash,
+                hash: info.path_hash(),
                 entry: PathEntry {
                     references: info.references_without_self(),
                     store_path: info.store_path,

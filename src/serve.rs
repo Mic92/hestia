@@ -57,9 +57,6 @@ struct DaemonState {
     buffered: Mutex<BTreeSet<String>>,
     /// Paths served by the substituter (narinfo hits).
     access_log: AccessLog,
-    /// Manifest shared with the substituter; refreshed after every
-    /// successful drain so newly pushed paths become servable.
-    manifest_store: ManifestStore,
     /// The write pipeline.
     pipeline: PipelineContext,
     /// Serializes drains: concurrent drain requests run one at a time.
@@ -159,7 +156,7 @@ impl Daemon {
         // re-loading from the cache after a drain could return a stale
         // version (eventual consistency, PLAN.md Decision 28) and make
         // just-pushed paths unsubstitutable.
-        pipeline.publish = Some(manifest_store.clone());
+        pipeline.publish = Some(manifest_store);
 
         if let Some(parent) = socket.parent() {
             std::fs::create_dir_all(parent)?;
@@ -175,7 +172,6 @@ impl Daemon {
             state: Arc::new(DaemonState {
                 buffered: Mutex::new(BTreeSet::new()),
                 access_log,
-                manifest_store,
                 pipeline,
                 drain_lock: tokio::sync::Mutex::new(()),
                 last_activity: Mutex::new(Instant::now()),
@@ -188,11 +184,6 @@ impl Daemon {
     /// The daemon's access log (shared with the substituter).
     pub fn access_log(&self) -> AccessLog {
         self.state.access_log.clone()
-    }
-
-    /// The manifest shared with the substituter.
-    pub fn manifest_store(&self) -> ManifestStore {
-        self.state.manifest_store.clone()
     }
 
     /// An activity callback for the substituter: requests served over HTTP

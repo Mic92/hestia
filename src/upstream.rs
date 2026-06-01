@@ -36,19 +36,6 @@ impl UpstreamFilter {
         }
     }
 
-    /// Filter that trusts nothing: no path is ever skipped as upstream.
-    /// Used by tests that push paths which happen to be upstream-signed.
-    pub fn none() -> Self {
-        Self {
-            trusted_keys: Vec::new(),
-        }
-    }
-
-    /// The key names this filter trusts.
-    pub fn trusted_keys(&self) -> &[String] {
-        &self.trusted_keys
-    }
-
     /// True if `key_name` exactly matches a trusted upstream key.
     pub fn matches_key(&self, key_name: &str) -> bool {
         self.trusted_keys.iter().any(|key| key == key_name)
@@ -125,10 +112,9 @@ mod tests {
 
     #[test]
     fn empty_filter_skips_nothing() {
-        let filter = UpstreamFilter::none();
+        let filter = UpstreamFilter::new(vec![]);
         let signature = parse(REAL_UPSTREAM_SIG);
         assert!(!filter.is_upstream_signed([&signature]));
-        assert!(filter.trusted_keys().is_empty());
     }
 
     #[test]
