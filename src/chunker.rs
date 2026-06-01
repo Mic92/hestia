@@ -48,6 +48,12 @@ pub enum Error {
 
     #[error("chunk {0} referenced by the file tree but not provided")]
     MissingChunk(ChunkHash),
+
+    #[error(
+        "chunk decompresses past the {MAX_CHUNK_SIZE}-byte chunk size limit \
+         (corrupt or malicious pack data)"
+    )]
+    OversizedChunk,
 }
 
 /// One content-defined chunk of a file.
@@ -582,8 +588,23 @@ async fn write_nar<W: tokio::io::AsyncWrite + Unpin>(
 /// the pack blob — exactly what a Range request against the pack returns.
 /// The hash check is mandatory: the GHA cache is not trusted storage and a
 /// corrupt chunk must never be served onward.
+///
+/// Decompression is bounded at [`MAX_CHUNK_SIZE`]: no legitimate chunk can
+/// be larger (chunking splits at that bound), so anything bigger is corrupt
+/// or malicious pack data and gets rejected *before* its decompressed
+/// payload is buffered (zstd ratios above 1000:1 would otherwise let a tiny
+/// frame allocate gigabytes).
 pub fn extract_chunk(compressed: &[u8], expected: &ChunkHash) -> Result<Vec<u8>, Error> {
-    let data = zstd::decode_all(compressed)?;
+    use std::io::Read as _;
+    let mut data = Vec::new();
+    // Read at most one byte past the limit: enough to detect oversize
+    // without buffering the full payload.
+    zstd::Decoder::with_buffer(compressed)?
+        .take(u64::from(MAX_CHUNK_SIZE) + 1)
+        .read_to_end(&mut data)?;
+    if data.len() > MAX_CHUNK_SIZE as usize {
+        return Err(Error::OversizedChunk);
+    }
     let actual = Hash32::digest(&data);
     if actual != *expected {
         return Err(Error::HashMismatch {
@@ -766,6 +787,32 @@ mod tests {
         }
         let pack = builder.finish();
         assert_eq!(pack.chunks.len(), chunks.len());
+    }
+
+    #[test]
+    fn extract_chunk_rejects_frames_larger_than_max_chunk_size() {
+        // Pack bytes come from the GHA cache, which is not trusted storage.
+        // No legitimate chunk exceeds MAX_CHUNK_SIZE (chunk_data splits with
+        // that bound), but zstd compresses runs of zeros at ratios well above
+        // 1000:1, so a small corrupt or malicious frame can decompress to a
+        // huge payload. extract_chunk must reject such frames at the size
+        // limit instead of buffering the full decompressed payload in memory
+        // (memory amplification in the substituter and GC repack).
+        let bomb_payload = vec![0u8; 64 * 1024 * 1024];
+        let frame = zstd::encode_all(bomb_payload.as_slice(), 3).unwrap();
+        assert!(
+            frame.len() < 1024 * 1024,
+            "the bomb frame itself must be small, got {} bytes",
+            frame.len()
+        );
+
+        // Even with the "correct" hash of the oversized payload, extraction
+        // must fail: the size bound is enforced, not just integrity.
+        let expected = Hash32::digest(&bomb_payload);
+        assert!(matches!(
+            extract_chunk(&frame, &expected),
+            Err(Error::OversizedChunk)
+        ));
     }
 
     #[test]
