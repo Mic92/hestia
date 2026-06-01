@@ -221,8 +221,11 @@ async function main() {
 
   const listen = getInput('listen') || '127.0.0.1:37515';
   const socket = getInput('socket') || '/tmp/hestia/hook.sock';
-  const installDir = path.join(process.env.RUNNER_TEMP || '/tmp', 'hestia-cache');
-  fs.mkdirSync(installDir, { recursive: true });
+  // Unique per invocation: a job can run this action more than once, and a
+  // shared directory would overwrite the first daemon's binary and log.
+  const tempDir = process.env.RUNNER_TEMP || '/tmp';
+  fs.mkdirSync(tempDir, { recursive: true });
+  const installDir = fs.mkdtempSync(path.join(tempDir, 'hestia-cache-'));
   const logFile = path.join(installDir, 'serve.log');
 
   const hestiaBin = await installBinary(installDir);
