@@ -42,6 +42,7 @@ fn context(fake: &FakeGha, http: &reqwest::Client, store: &ScratchStore) -> Pipe
         upstream: UpstreamFilter::default(),
         root_key: TEST_ROOT_KEY.to_string(),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
+        publish: None,
     }
 }
 
@@ -483,6 +484,132 @@ async fn concurrent_serve_daemons_merge_without_losing_paths() {
         let manifest_store = hestia::substituter::ManifestStore::new();
         manifest_store.set(manifest);
         assert_eq!(manifest_store.path_count(), 2);
+    };
+    tokio::time::timeout(Duration::from_secs(120), test)
+        .await
+        .expect("test timed out: deadlock or hung server");
+}
+
+// ---------------------------------------------------------------------------
+// Eventual consistency (read-your-writes)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn drained_paths_are_substitutable_despite_lookup_lag() {
+    // The real cache service is eventually consistent (PLAN.md Decision
+    // 28): right after a drain commits manifest m#N, lookups may still
+    // return m#N-1 (or nothing). Three guarantees under that lag:
+    //
+    // 1. paths pushed by THIS daemon are substitutable immediately
+    //    (read-your-writes: the daemon publishes the manifest it
+    //    committed instead of re-loading it from the cache);
+    // 2. a second drain (the action's post step) commits the next version
+    //    promptly instead of fighting its own previous commit in the
+    //    SaveMutable conflict loop;
+    // 3. the second commit still contains the first one's paths (the
+    //    daemon's own manifest is part of every merge base).
+    //
+    // Regression test for the failure the action-test CI job hit: drain
+    // succeeded, but the narinfo request that followed got a 404.
+    let test = async {
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let fixture = store.add_fixture("lag", 257);
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+
+        // Start a daemon + substituter sharing a ManifestStore, exactly
+        // like `hestia serve` wires them.
+        let manifest_store = hestia::substituter::ManifestStore::new();
+        let access_log = AccessLog::new();
+        let socket: PathBuf = store.db_path().parent().unwrap().join("hestia-lag.sock");
+        let daemon = hestia::serve::Daemon::bind(
+            &socket,
+            None,
+            context(&fake, &http, &store),
+            access_log.clone(),
+            manifest_store.clone(),
+        )
+        .expect("daemon must bind");
+        let substituter = hestia::substituter::Substituter::new(
+            store.database().store_dir().clone(),
+            manifest_store.clone(),
+            access_log,
+            fake.twirp(&http),
+            http.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, substituter.into_router())
+                .await
+                .unwrap();
+        });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let daemon_handle = tokio::spawn(daemon.run(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        // All lookups lag one version behind from here on (the real
+        // service's observed behavior right after a commit).
+        fake.set_stale_lookups(&http, true).await;
+
+        // Hook + drain the path through the daemon (commits m#1; lookups
+        // now pretend m#1 does not exist yet).
+        hestia::protocol::roundtrip(
+            &socket,
+            &hestia::protocol::Request::Add {
+                paths: vec![fixture.to_string_lossy().into_owned()],
+            },
+        )
+        .await
+        .expect("add failed");
+        let response = hestia::protocol::roundtrip(&socket, &hestia::protocol::Request::Drain)
+            .await
+            .expect("drain failed");
+        let stats = response.stats.expect("drain stats");
+        assert_eq!(stats.pushed, 1);
+        assert_eq!(stats.manifest_version, 1);
+
+        // Guarantee 1: the just-pushed path is substitutable right away.
+        let hash = path_hash_of(&fixture);
+        let narinfo = http
+            .get(format!("{base_url}/{hash}.narinfo"))
+            .send()
+            .await
+            .expect("narinfo request failed");
+        assert_eq!(
+            narinfo.status(),
+            200,
+            "a path pushed by this daemon must be servable immediately \
+             (read-your-writes), regardless of lookup propagation lag"
+        );
+
+        // Guarantee 2: the shutdown drain (root update from the narinfo
+        // hit) commits m#2 promptly. Without the reservation floor it
+        // would spin in the conflict loop against its own m#1 until the
+        // stale-skip window (60s in production) expired — the whole test
+        // would blow its timeout.
+        drop(shutdown_tx);
+        let final_stats = daemon_handle.await.unwrap().expect("final drain failed");
+        assert_eq!(
+            final_stats.manifest_version, 2,
+            "the post-step drain must commit the next version"
+        );
+
+        // Guarantee 3: m#2 still contains the path pushed in m#1 — the
+        // stale merge base was healed with the daemon's own manifest.
+        server.abort();
+        fake.set_stale_lookups(&http, false).await;
+        let (version, manifest) = committed_manifest(&fake, &http).await.unwrap();
+        assert_eq!(version, 2);
+        assert!(
+            manifest.paths.contains_key(&hash),
+            "the second commit must not lose the first commit's paths"
+        );
+        assert!(manifest.roots[TEST_ROOT_KEY].paths.contains(&hash));
     };
     tokio::time::timeout(Duration::from_secs(120), test)
         .await

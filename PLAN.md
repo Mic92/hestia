@@ -292,7 +292,7 @@ Decisions (8–9).
       Range-read a slice of it; delete it via REST.** Passing in CI
       (`tests/gha_real.rs` in the `token-probe` job). The test uses 256 KB;
       bumping to 100 MB is still worthwhile once uploads get exercised by
-      the dogfood job.
+      dogfooding.
 
 ### Phase 2: Manifest + chunker
 
@@ -388,10 +388,12 @@ the merge to main. Deviations and findings recorded under Decisions
 - [x] **Milestone: substitution from the real GHA cache on a real runner.**
       The `action-test` CI job builds a run-unique derivation through the
       post-build-hook, drains, and `nix copy`s the path back out of the
-      cache into a fresh store. Full-CI dogfooding (the `dogfood` job:
-      hestia's CI caches its own devshell builds) remains gated behind the
-      repository variable `HESTIA_DOGFOOD` until enabled on main after
-      human review.
+      cache into a fresh store. Full dogfooding (the regular `build` CI
+      job runs `nix build .#` through hestia, so cache breakage breaks CI)
+      remains gated behind the `HESTIA_DOGFOOD` repository variables until
+      the first release exists — the daemon must be bootstrapped from a
+      released binary, since the build job cannot use the package it is
+      about to build.
 
 ### Phase 5: GC
 
@@ -452,10 +454,12 @@ Decisions (21–27).
 
 **Pending (needs merge to main / human decision):**
 
-- Enable the `dogfood` job on main (set repository variable
-  `HESTIA_DOGFOOD=true` after the merge)
 - Create the first release: tag `v0.1.0-alpha.1` on main, verify the
   release workflow, then update the sha256 in the README/action examples
+- Enable dogfooding (after the release): set the repository variables
+  `HESTIA_DOGFOOD=true`, `HESTIA_DOGFOOD_VERSION=<tag>`,
+  `HESTIA_DOGFOOD_SHA256=<sha256 of hestia-x86_64-linux>` so the regular
+  `build` job runs its `nix build .#` through hestia
 - nix-community migration (repository transfer + harmonia crates on
   crates.io would remove the git-dependency pin)
 
@@ -519,10 +523,12 @@ tokens:
 - **Crash safety**: kill the pipeline between every pair of steps →
   invariants hold (old packs referenced until manifest commit, orphans
   cleaned next run).
-- **Dogfooding**: from Phase 4 on, hestia's own CI uses hestia (the
-  `dogfood` job in ci.yml; disabled until the first push, marker
-  `enabled-after-first-push`). Cache misses, corruption, and eviction
-  handling show up as slow or failing builds immediately.
+- **Dogfooding**: hestia's own CI uses hestia. The regular `build` job in
+  ci.yml wraps `nix build .#` with the hestia action (gated on the
+  `HESTIA_DOGFOOD` repository variables; the step is skipped instantly
+  while they are unset). Once enabled, cache misses, corruption, and
+  eviction handling show up as slow or failing regular CI — the strongest
+  possible signal.
 
 No NixOS VM test: it cannot have real tokens (so it would test the fake
 backend — same coverage as layer 2/3, slower), and the "clean store"
@@ -759,6 +765,28 @@ continues from / interleaves with the Open Questions section above.
     Systems installer action increasingly diverges from upstream Nix (it
     installs Determinate Nix by default); the NixOS-org fork tracks
     upstream. It publishes no version tags yet, so it is pinned `@main`.
+
+28. **The real cache service is eventually consistent for lookups**
+    (Phase 6, real-API finding; surfaced as flaky token-probe runs).
+    GetCacheEntryDownloadURL may not return a just-finalized entry, and a
+    prefix lookup may return version N-1 shortly after N was committed.
+    Reservations (CreateCacheEntry) are strongly consistent — conflicts are
+    always detected. Consequences: (a) the real-API tests poll
+    read-after-write assertions instead of asserting immediately; (b)
+    SaveMutable's stale-skip window was widened to 60s (20 × 3s) so
+    propagation lag is never misdiagnosed as a crashed writer; (c) the
+    daemon practices **read-your-writes**: the pipeline publishes the
+    manifest it committed directly into the substituter's `ManifestStore`
+    (instead of re-loading it from the cache, which returned a stale
+    version and made just-pushed paths 404 — caught by the action-test CI
+    job), folds that manifest into every later merge base, and passes its
+    version to `SaveMutable::save_with_floor` so a drain never fights its
+    own previous commit in the conflict loop; (d) everything else
+    tolerates lag by design — a stale read is a cache miss (rebuild),
+    never corruption, and packs referenced by a manifest are always
+    uploaded *before* the manifest commit. The fake backend simulates lag
+    only behind the `stale-lookups` injection endpoint; everything else
+    stays strongly consistent.
 
 ## Mistakes Fixed from Earlier Draft
 

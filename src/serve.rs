@@ -98,17 +98,10 @@ impl DaemonState {
         match self.pipeline.run(paths.clone(), accessed, now_unix()).await {
             Ok(stats) => {
                 self.touch();
-                // Publish the new manifest to the substituter. Reload from
-                // the cache (instead of keeping the local merge result) so
-                // paths committed by concurrent jobs become servable too.
-                if stats.manifest_version > 0 {
-                    match self.pipeline.load_manifest().await {
-                        Ok(manifest) => self.manifest_store.set(manifest),
-                        Err(err) => eprintln!(
-                            "hestia serve: reloading the manifest after a drain failed: {err}"
-                        ),
-                    }
-                }
+                // The pipeline publishes the committed manifest into the
+                // shared ManifestStore itself (read-your-writes; reloading
+                // from the cache here could return a stale version, see
+                // PLAN.md Decision 28).
                 Ok(stats)
             }
             Err(err) => {
@@ -158,10 +151,16 @@ impl Daemon {
     pub fn bind(
         socket: &Path,
         idle_exit: Option<Duration>,
-        pipeline: PipelineContext,
+        mut pipeline: PipelineContext,
         access_log: AccessLog,
         manifest_store: ManifestStore,
     ) -> std::io::Result<Self> {
+        // Committed manifests go straight into the substituter's store:
+        // re-loading from the cache after a drain could return a stale
+        // version (eventual consistency, PLAN.md Decision 28) and make
+        // just-pushed paths unsubstitutable.
+        pipeline.publish = Some(manifest_store.clone());
+
         if let Some(parent) = socket.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -337,14 +336,18 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         upstream,
         root_key: pipeline::root_key(&branch, &system),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
+        // Replaced by Daemon::bind with the daemon's shared ManifestStore.
+        publish: None,
     };
 
     // Load the manifest committed by previous runs so the substituter can
     // serve those paths from the start. No manifest yet (first run) or a
     // load failure both mean "serve nothing until the first drain".
     let manifest_store = ManifestStore::new();
-    match pipeline.load_manifest().await {
-        Ok(manifest) => manifest_store.set(manifest),
+    match pipeline.load_manifest_versioned().await {
+        // Recording the version makes drains start their reservations
+        // above it even when cache lookups lag (PLAN.md Decision 28).
+        Ok((version, manifest)) => manifest_store.set_version(manifest, version),
         Err(err) => {
             eprintln!("hestia serve: cannot load the manifest, substituting nothing: {err}");
         }

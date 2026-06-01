@@ -11,13 +11,38 @@
 //! They exercise the same scenarios as `tests/gha_fake.rs` to catch drift
 //! between the fake and the real service.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
 use hestia::gha::blob;
 use hestia::gha::rest::RestClient;
 use hestia::gha::twirp::{DownloadUrl, Reservation, TwirpClient};
+
+/// The real service is eventually consistent: a just-finalized entry can
+/// take a while to become visible to GetCacheEntryDownloadURL (observed in
+/// CI: sometimes instant, sometimes several seconds). Hestia's design
+/// tolerates this (a lagging read is a cache miss, never corruption), but
+/// read-after-write assertions in these tests must poll.
+const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(120);
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Poll `lookup` until `accept` returns true for its result or the
+/// propagation timeout expires; returns the last result either way.
+async fn wait_for<F, Fut>(mut lookup: F, accept: impl Fn(&DownloadUrl) -> bool) -> DownloadUrl
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = DownloadUrl>,
+{
+    let deadline = std::time::Instant::now() + PROPAGATION_TIMEOUT;
+    loop {
+        let result = lookup().await;
+        if accept(&result) || std::time::Instant::now() >= deadline {
+            return result;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
 
 /// Unique key per test run so re-runs never collide with old entries
 /// (cache keys are write-once).
@@ -65,13 +90,20 @@ async fn real_blob_round_trip_range_read_and_delete() {
         .unwrap();
 
     // Reserving the same key again must report AlreadyExists (CAS dedup).
+    // Unlike lookups, reservations are strongly consistent: this is what
+    // SaveMutable's conflict detection relies on.
     let reservation = twirp.create_cache_entry(&key).await.unwrap();
     assert_eq!(reservation, Reservation::AlreadyExists);
 
-    // Full download.
-    let DownloadUrl::Hit { url, matched_key } = twirp.get_download_url(&key, &[]).await.unwrap()
-    else {
-        panic!("just-finalized entry not found");
+    // Full download. Lookups are eventually consistent: poll until the
+    // just-finalized entry becomes visible.
+    let lookup = wait_for(
+        || async { twirp.get_download_url(&key, &[]).await.unwrap() },
+        |result| matches!(result, DownloadUrl::Hit { .. }),
+    )
+    .await;
+    let DownloadUrl::Hit { url, matched_key } = lookup else {
+        panic!("just-finalized entry not found after {PROPAGATION_TIMEOUT:?}");
     };
     assert_eq!(matched_key, key);
     let downloaded = blob::get(&http, &url, None).await.unwrap();
@@ -96,16 +128,22 @@ async fn real_blob_round_trip_range_read_and_delete() {
         "uploaded entry missing from REST list: {listed:?}"
     );
 
-    // ...and REST delete removes it for real.
+    // ...and REST delete removes it for real (deletes propagate eventually,
+    // like lookups).
     let deleted = rest.delete_by_key(&key).await.unwrap();
     assert!(
         deleted.iter().any(|entry| entry.key == key),
         "delete did not report the entry: {deleted:?}"
     );
+    let lookup = wait_for(
+        || async { twirp.get_download_url(&key, &[]).await.unwrap() },
+        |result| matches!(result, DownloadUrl::Miss),
+    )
+    .await;
     assert_eq!(
-        twirp.get_download_url(&key, &[]).await.unwrap(),
+        lookup,
         DownloadUrl::Miss,
-        "entry still downloadable after REST delete"
+        "entry still downloadable after REST delete + propagation timeout"
     );
 }
 
@@ -142,15 +180,26 @@ async fn real_miss_and_restore_key_prefix() {
             .unwrap();
     }
 
+    // Newest-wins is also subject to propagation lag: right after
+    // finalizing #2, the lookup may still return #1 (or nothing). This is
+    // exactly why SaveMutable detects conflicts at reservation time (which
+    // is strongly consistent) instead of trusting load() to be fresh.
     let prefix = format!("{family}#");
-    let DownloadUrl::Hit { url, matched_key } = twirp
-        .get_download_url(&prefix, &[prefix.as_str()])
-        .await
-        .unwrap()
-    else {
-        panic!("prefix restore lookup missed");
+    let expected_key = format!("{family}#2");
+    let lookup = wait_for(
+        || async {
+            twirp
+                .get_download_url(&prefix, &[prefix.as_str()])
+                .await
+                .unwrap()
+        },
+        |result| matches!(result, DownloadUrl::Hit { matched_key, .. } if *matched_key == expected_key),
+    )
+    .await;
+    let DownloadUrl::Hit { url, matched_key } = lookup else {
+        panic!("prefix restore lookup missed after {PROPAGATION_TIMEOUT:?}");
     };
-    assert_eq!(matched_key, format!("{family}#2"), "newest entry must win");
+    assert_eq!(matched_key, expected_key, "newest entry must win");
     let data = blob::get(&http, &url, None).await.unwrap();
     assert_eq!(data.as_ref(), b"payload v2");
 

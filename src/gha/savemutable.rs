@@ -16,6 +16,16 @@
 //! crashes between reserve and finalize would deadlock the sequence. After
 //! `stale_skip_after` consecutive conflicts on the same index the writer
 //! assumes a crashed peer and skips over that index.
+//!
+//! Consistency model (verified against the real service, PLAN.md Decision
+//! 28): **reservations are strongly consistent** (two writers can never both
+//! reserve the same key) but **lookups are eventually consistent** (a
+//! just-finalized entry may not be returned by load() for a while). The
+//! conflict-retry loop therefore re-loads until it sees the version that
+//! blocked it; the stale-skip window must be comfortably larger than the
+//! observed propagation lag, otherwise lag would be misdiagnosed as a
+//! crashed writer and the lagging version's changes dropped (benign for a
+//! lossy cache — those paths get rebuilt — but wasteful).
 
 use std::time::Duration;
 
@@ -82,9 +92,12 @@ impl<'a> SaveMutable<'a> {
             twirp,
             http,
             prefix: prefix.into(),
-            retry_delay: Duration::from_secs(2),
+            retry_delay: Duration::from_secs(3),
             max_attempts: 60,
-            stale_skip_after: 5,
+            // 20 conflicts x 3s = 60s before an index is judged abandoned:
+            // far above the lookup propagation lag observed in CI, so a
+            // finalized-but-not-yet-visible version is never skipped over.
+            stale_skip_after: 20,
         }
     }
 
@@ -156,13 +169,27 @@ impl<'a> SaveMutable<'a> {
     /// contents. It may be called multiple times: every conflict with a
     /// concurrent writer triggers a re-load and re-merge so no writer's
     /// changes get lost. Returns the index of the newly written version.
-    pub async fn save<F>(&self, mut merge: F) -> Result<u64, Error>
+    pub async fn save<F>(&self, merge: F) -> Result<u64, Error>
+    where
+        F: FnMut(Option<&MutableEntry>) -> Result<Vec<u8>, Error>,
+    {
+        self.save_with_floor(0, merge).await
+    }
+
+    /// Like [`Self::save`], but never reserves an index at or below `floor`.
+    ///
+    /// Callers that know a version `floor` exists (because they committed
+    /// it themselves) pass it here so that an eventually-consistent load
+    /// (PLAN.md Decision 28) — which may still return an older version —
+    /// does not make the writer reserve an index that is already taken and
+    /// spin in the conflict loop until the lookup catches up.
+    pub async fn save_with_floor<F>(&self, floor: u64, mut merge: F) -> Result<u64, Error>
     where
         F: FnMut(Option<&MutableEntry>) -> Result<Vec<u8>, Error>,
     {
         let mut attempts: u32 = 0;
         // Indexes at or below this are blocked by (presumably crashed) writers.
-        let mut skip_through: u64 = 0;
+        let mut skip_through: u64 = floor;
         let mut last_conflict: Option<u64> = None;
         let mut conflict_streak: u32 = 0;
 
