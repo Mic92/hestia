@@ -409,16 +409,6 @@ pub fn plan(
         repack_sources.extend(volatile);
     }
 
-    // CAS no-op trap: repacking a single fully-live pack would produce
-    // byte-identical content → same content-addressed key → already_exists →
-    // the LRU clock is NOT reset. Such packs must be touched, never repacked.
-    if repack_sources.len() == 1 {
-        let only = *repack_sources.first().expect("len checked");
-        if stats[&only].fully_live() {
-            repack_sources.clear();
-        }
-    }
-
     // ④b Repack jobs, split by output tier
     let mut copies: Vec<ChunkCopy> = repack_sources
         .iter()
@@ -440,6 +430,27 @@ pub fn plan(
             copies: volatile,
         });
     }
+
+    // CAS no-op trap: a job whose copies reproduce a single fully-live source
+    // pack byte-identically (frames are copied verbatim, in offset order)
+    // would produce the same content-addressed key → already_exists → the
+    // upload is skipped and the LRU clock is NOT reset. Since repack sources
+    // are also excluded from touching, such a pack would idle into GitHub's
+    // 7-day eviction while still referenced. Drop the job and let the pack
+    // be touched instead. This covers both the trivial single-source case
+    // and the tier-split case where consolidation isolates one pack's chunks
+    // into their own job.
+    plan.repack_jobs.retain(|job| {
+        let sources: BTreeSet<PackHash> = job.copies.iter().map(|copy| copy.from.pack).collect();
+        if sources.len() == 1 {
+            let only = *sources.first().expect("len checked");
+            if stats[&only].fully_live() && job.download_bytes() == stats[&only].total_bytes {
+                repack_sources.remove(&only);
+                return false;
+            }
+        }
+        true
+    });
 
     plan.delete_packs = dead_packs
         .iter()
@@ -1462,6 +1473,52 @@ mod tests {
             .expect("volatile job");
         assert_eq!(stable.copies[0].chunk, chunk_hash(1));
         assert_eq!(volatile.copies[0].chunk, chunk_hash(2));
+    }
+
+    #[test]
+    fn consolidation_never_repacks_a_pack_into_itself() {
+        // CAS no-op trap, general form. Volatile consolidation pulls in five
+        // fully-live packs; pack 1's chunk already survived one repack, so
+        // the tier partition puts it alone into a stable-tier job. Copying
+        // pack 1's frames in offset order reproduces pack 1 byte-identically:
+        // the upload would hit `already_exists` (content-addressed key), the
+        // LRU clock would NOT reset, and -- because repack sources are
+        // excluded from touching -- the pack would never be touched either.
+        // A live, referenced pack would idle its way into GitHub's 7-day
+        // eviction. Such no-op jobs must be dropped and the pack touched
+        // instead.
+        let old = NOW - 30 * SECS_PER_DAY;
+        let mut builder = ManifestBuilder::new()
+            .pack(1, TIER_VOLATILE, old)
+            .chunk(1, 1, 100, 1) // survived 1 -> stable tier on next repack
+            .path(1, &[1], &[], old, NOW);
+        for seed in 2..=5u8 {
+            builder = builder
+                .pack(seed, TIER_VOLATILE, old)
+                .chunk(seed, seed, 100, 0)
+                .path(seed, &[seed], &[], old, NOW);
+        }
+        let manifest = builder.root("main", &[1, 2, 3, 4, 5], NOW).build();
+
+        // Every pack has been idle past TouchAge.
+        let observations = observe_all(&manifest, NOW - 5 * SECS_PER_DAY);
+        let plan = plan(&manifest, &observations, NOW, &policy());
+
+        // The genuine consolidation (packs 2-5 -> one new pack) goes ahead.
+        assert_eq!(plan.repack_jobs.len(), 1, "{}", plan.summary());
+        assert_eq!(plan.repack_jobs[0].tier, TIER_VOLATILE);
+        assert_eq!(plan.repack_jobs[0].copies.len(), 4);
+        // Pack 1 is left alone: not deleted, not repacked, but touched so
+        // its LRU clock keeps it safe from idle eviction.
+        assert!(
+            !plan.delete_packs.contains(&pack_hash(1)),
+            "a byte-identical repack output must not schedule its source for deletion"
+        );
+        assert!(
+            plan.touch_packs.contains(&pack_hash(1)),
+            "the pack skipped by the CAS guard must be touched instead: {:?}",
+            plan.touch_packs
+        );
     }
 
     #[test]
