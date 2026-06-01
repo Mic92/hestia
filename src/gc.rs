@@ -230,10 +230,11 @@ fn referenced_chunks(manifest: &Manifest) -> BTreeSet<ChunkHash> {
         .values()
         .flat_map(|entry| flatten_tree(&entry.tree))
         .filter_map(|(_, node)| match node {
-            FileSystemObject::Regular(regular) => Some(regular.contents.chunks.clone()),
+            FileSystemObject::Regular(regular) => Some(&regular.contents.chunks),
             _ => None,
         })
         .flatten()
+        .copied()
         .collect()
 }
 
@@ -412,7 +413,7 @@ pub fn plan(
     // byte-identical content → same content-addressed key → already_exists →
     // the LRU clock is NOT reset. Such packs must be touched, never repacked.
     if repack_sources.len() == 1 {
-        let only = *repack_sources.iter().next().expect("len checked");
+        let only = *repack_sources.first().expect("len checked");
         if stats[&only].fully_live() {
             repack_sources.clear();
         }
@@ -688,20 +689,17 @@ impl GcContext {
         range: std::ops::Range<u64>,
     ) -> Result<bytes::Bytes, Error> {
         let pack = *pack;
-        let data = blob::get_with_refresh(&self.http, url, Some(range), async move || {
-            match self
-                .twirp
-                .get_download_url(&pack_cache_key(&pack), &[])
-                .await?
-            {
-                DownloadUrl::Hit { url, .. } => Ok(url),
-                DownloadUrl::Miss => Err(GhaError::InvalidResponse(format!(
-                    "pack {pack} disappeared while repacking"
-                ))),
-            }
-        })
-        .await?;
-        Ok(data)
+        let refresh = async move || match self
+            .twirp
+            .get_download_url(&pack_cache_key(&pack), &[])
+            .await?
+        {
+            DownloadUrl::Hit { url, .. } => Ok(url),
+            DownloadUrl::Miss => Err(GhaError::InvalidResponse(format!(
+                "pack {pack} disappeared while repacking"
+            ))),
+        };
+        Ok(blob::get_with_refresh(&self.http, url, Some(range), refresh).await?)
     }
 
     /// Execute step 1 of 6: run all repack jobs (download, verify, upload).
@@ -844,7 +842,6 @@ impl GcContext {
         }
 
         let mut committed: Option<(Vec<PackHash>, Vec<String>)> = None;
-        let policy = &self.policy;
         let version = self
             .save_mutable()
             .save(|existing| {
@@ -854,7 +851,7 @@ impl GcContext {
                     None => Manifest::new(),
                 };
                 // Re-plan against the latest manifest (concurrent pushes).
-                let fresh = plan(&latest, observations, now, policy);
+                let fresh = plan(&latest, observations, now, &self.policy);
                 let (next, deletable) = apply(latest, &fresh, repacks);
                 let encoded = next
                     .encode()
