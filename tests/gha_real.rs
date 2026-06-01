@@ -29,10 +29,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Poll `lookup` until `accept` returns true for its result or the
 /// propagation timeout expires; returns the last result either way.
-async fn wait_for<F, Fut>(mut lookup: F, accept: impl Fn(&DownloadUrl) -> bool) -> DownloadUrl
+async fn wait_for<T, F, Fut>(mut lookup: F, accept: impl Fn(&T) -> bool) -> T
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = DownloadUrl>,
+    Fut: Future<Output = T>,
 {
     let deadline = std::time::Instant::now() + PROPAGATION_TIMEOUT;
     loop {
@@ -121,11 +121,16 @@ async fn real_blob_round_trip_range_read_and_delete() {
     let touch = blob::get(&http, &url, Some(0..1)).await.unwrap();
     assert_eq!(touch.len(), 1);
 
-    // REST: the entry shows up in a prefix list...
-    let listed = rest.list_caches("hestia-test-roundtrip-").await.unwrap();
+    // REST: the entry shows up in a prefix list. The REST view lags behind
+    // uploads just like Twirp lookups do, so this must poll too.
+    let listed = wait_for(
+        || async { rest.list_caches("hestia-test-roundtrip-").await.unwrap() },
+        |entries| entries.iter().any(|entry| entry.key == key),
+    )
+    .await;
     assert!(
         listed.iter().any(|entry| entry.key == key),
-        "uploaded entry missing from REST list: {listed:?}"
+        "uploaded entry missing from REST list after {PROPAGATION_TIMEOUT:?}: {listed:?}"
     );
 
     // ...and REST delete removes it for real (deletes propagate eventually,
