@@ -254,6 +254,12 @@ impl RestClient {
             }
             let response = request.send().await?;
             let list: CacheList = Self::check(&url, response).await?;
+            // Termination must not depend on `total_count` ever becoming
+            // consistent with the returned pages: an empty page means there
+            // is nothing more to fetch, whatever the server claims.
+            if list.actions_caches.is_empty() {
+                return Ok(entries);
+            }
             entries.extend(list.actions_caches);
             if entries.len() as u64 >= list.total_count {
                 return Ok(entries);

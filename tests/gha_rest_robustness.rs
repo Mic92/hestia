@@ -7,6 +7,8 @@
 //!   entry's `last_accessed_at` and reorders the listing between page
 //!   fetches. Page-numbered pagination over a reordering collection skips
 //!   and duplicates entries.
+//! * `total_count` is server-controlled data; pagination termination must
+//!   not depend on it ever being consistent with the returned pages.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -118,6 +120,16 @@ async fn list_handler(
     }))
 }
 
+/// A pathological listing endpoint: claims entries exist (`total_count`)
+/// but never returns any. Server-controlled data must not be able to make
+/// the client loop forever.
+async fn empty_pages_handler() -> Json<serde_json::Value> {
+    Json(json!({
+        "total_count": 5,
+        "actions_caches": [],
+    }))
+}
+
 async fn start_server(router: Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -174,6 +186,29 @@ async fn pagination_returns_every_entry_despite_concurrent_lru_reordering() {
             expected.len(),
             "pagination duplicated entries"
         );
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn pagination_terminates_when_server_returns_empty_pages() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let router = Router::new().route(
+            "/repos/{owner}/{repo}/actions/caches",
+            get(empty_pages_handler),
+        );
+        let url = start_server(router).await;
+        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token");
+
+        // The inner timeout is the actual assertion: a server that reports
+        // total_count > 0 but returns no entries must not be able to make
+        // list_caches spin forever (hammering the API in a tight loop).
+        let listed = tokio::time::timeout(Duration::from_secs(10), rest.list_caches(""))
+            .await
+            .expect("list_caches must terminate on inconsistent server data")
+            .unwrap();
+        assert!(listed.is_empty());
     })
     .await
     .expect("test timed out");
