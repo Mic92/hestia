@@ -30,7 +30,7 @@ use axum::routing::{get, post, put};
 use serde::Deserialize;
 use serde_json::json;
 
-use hestia::gha::rest::RestClient;
+use hestia::gha::rest::{RestClient, format_timestamp};
 use hestia::gha::twirp::{
     CreateCacheEntryRequest, FinalizeCacheEntryUploadRequest, GetCacheEntryDownloadUrlRequest,
     TwirpClient,
@@ -71,6 +71,9 @@ struct Inner {
 }
 
 impl Inner {
+    /// Advance the clock by one second and return it. The clock counts unix
+    /// seconds; tests control its absolute value via [`FakeGha::set_clock`]
+    /// to simulate days passing between operations.
     fn tick(&mut self) -> u64 {
         self.clock += 1;
         self.clock
@@ -347,8 +350,9 @@ fn rest_entry_json(entry: &Entry) -> serde_json::Value {
         "ref": "refs/heads/main",
         "key": entry.key,
         "version": entry.version,
-        "last_accessed_at": entry.last_accessed_at.to_string(),
-        "created_at": entry.created_at.to_string(),
+        // The real REST API reports RFC 3339 UTC timestamps.
+        "last_accessed_at": format_timestamp(entry.last_accessed_at),
+        "created_at": format_timestamp(entry.created_at),
         "size_in_bytes": entry.size,
     })
 }
@@ -491,6 +495,13 @@ impl FakeGha {
     /// All blob downloads served so far, in order.
     pub fn blob_requests(&self) -> Vec<BlobRequest> {
         self.inner.lock().unwrap().blob_requests.clone()
+    }
+
+    /// Set the fake's clock (unix seconds). Subsequent operations record
+    /// `created_at` / `last_accessed_at` values just after this instant,
+    /// which lets GC tests simulate days passing.
+    pub fn set_clock(&self, unix_seconds: u64) {
+        self.inner.lock().unwrap().clock = unix_seconds;
     }
 
     /// Twirp client pointed at this fake.

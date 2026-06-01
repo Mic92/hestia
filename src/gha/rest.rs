@@ -33,6 +33,100 @@ fn caches_url(api_url: &str, repo: &str) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Timestamps
+//
+// The REST API reports `created_at` / `last_accessed_at` as RFC 3339 UTC
+// strings ("2019-01-24T22:45:36.000Z"). GC compares them against unix-second
+// clocks, so both directions of the conversion live here (the fake GHA
+// backend uses the formatter so tests exercise the same parser as
+// production). Calendar math follows Howard Hinnant's civil-date algorithms;
+// no chrono/time dependency needed for one fixed format.
+// ---------------------------------------------------------------------------
+
+/// Days since 1970-01-01 for a proleptic Gregorian calendar date.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = (year - era * 400) as u64;
+    let month_shifted = (month + 9) % 12;
+    let day_of_year = (153 * month_shifted + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year as u64;
+    era * 146_097 + day_of_era as i64 - 719_468
+}
+
+/// Inverse of [`days_from_civil`].
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = (days - era * 146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_shifted = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_shifted + 2) / 5 + 1) as u32;
+    let month = if month_shifted < 10 {
+        month_shifted + 3
+    } else {
+        month_shifted - 9
+    } as u32;
+    let year = year_of_era as i64 + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// Parse an RFC 3339 UTC timestamp (the format the GitHub REST API emits)
+/// into unix seconds. Fractional seconds are accepted and ignored. Returns
+/// `None` for non-UTC offsets or malformed input.
+pub fn parse_timestamp(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || (bytes[10] != b'T' && bytes[10] != b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u64 = s.get(11..13)?.parse().ok()?;
+    let minute: u64 = s.get(14..16)?.parse().ok()?;
+    let second: u64 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    // Optional fractional seconds, then a UTC marker.
+    let mut rest = &s[19..];
+    if let Some(stripped) = rest.strip_prefix('.') {
+        rest = stripped.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    if rest != "Z" && rest != "z" && rest != "+00:00" {
+        return None;
+    }
+    // Leap seconds (second == 60) clamp to 59.
+    let second = second.min(59);
+    let days = days_from_civil(year, month, day);
+    let seconds = days.checked_mul(86_400)? + (hour * 3600 + minute * 60 + second) as i64;
+    u64::try_from(seconds).ok()
+}
+
+/// Format unix seconds as an RFC 3339 UTC timestamp
+/// (`YYYY-MM-DDTHH:MM:SSZ`), the inverse of [`parse_timestamp`].
+pub fn format_timestamp(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let in_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        in_day / 3600,
+        (in_day % 3600) / 60,
+        in_day % 60
+    )
+}
+
 /// One cache entry as reported by the REST API.
 ///
 /// `last_accessed_at` is the LRU clock: downloads through the Twirp/Azure
@@ -51,6 +145,18 @@ pub struct CacheEntry {
     pub created_at: String,
     #[serde(default)]
     pub size_in_bytes: u64,
+}
+
+impl CacheEntry {
+    /// `created_at` as unix seconds (`None` if unparsable).
+    pub fn created_unix(&self) -> Option<u64> {
+        parse_timestamp(&self.created_at)
+    }
+
+    /// `last_accessed_at` as unix seconds (`None` if unparsable).
+    pub fn last_accessed_unix(&self) -> Option<u64> {
+        parse_timestamp(&self.last_accessed_at)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +305,51 @@ impl RestClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_parses_github_rest_format() {
+        // Example straight from the GitHub REST API documentation.
+        assert_eq!(
+            parse_timestamp("2019-01-24T22:45:36.000Z"),
+            Some(1_548_369_936)
+        );
+        // Without fractional seconds.
+        assert_eq!(parse_timestamp("2019-01-24T22:45:36Z"), Some(1_548_369_936));
+        // Explicit UTC offset.
+        assert_eq!(
+            parse_timestamp("2019-01-24T22:45:36+00:00"),
+            Some(1_548_369_936)
+        );
+        // Epoch and a leap-year date.
+        assert_eq!(parse_timestamp("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_timestamp("2024-02-29T12:00:00Z"), Some(1_709_208_000));
+        // Garbage.
+        assert_eq!(parse_timestamp(""), None);
+        assert_eq!(parse_timestamp("not a timestamp"), None);
+        assert_eq!(parse_timestamp("2019-13-24T22:45:36Z"), None);
+        assert_eq!(parse_timestamp("2019-01-24T22:45:36+02:00"), None);
+    }
+
+    #[test]
+    fn timestamp_format_parse_round_trip() {
+        for seconds in [
+            0u64,
+            1,
+            86_399,
+            86_400,
+            1_548_369_936,
+            1_709_208_000,
+            4_102_444_799,
+        ] {
+            let formatted = format_timestamp(seconds);
+            assert_eq!(
+                parse_timestamp(&formatted),
+                Some(seconds),
+                "round trip failed for {seconds} ({formatted})"
+            );
+        }
+        assert_eq!(format_timestamp(1_548_369_936), "2019-01-24T22:45:36Z");
+    }
 
     #[test]
     fn caches_url_layout() {
