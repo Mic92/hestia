@@ -55,6 +55,8 @@
         { pkgs, ... }:
         {
           default = (craneFor pkgs).package;
+          # Real-API test binary; CI's token-probe job substitutes it.
+          gha-real-tests = (craneFor pkgs).ghaRealTests;
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # Statically linked (musl) build for release binaries: nix-built
@@ -75,6 +77,7 @@
           package = self.packages.${system}.default;
           clippy = (craneFor pkgs).clippy;
           tests = (craneFor pkgs).tests;
+          gha-real-tests = self.packages.${system}.gha-real-tests;
         }
       );
     };

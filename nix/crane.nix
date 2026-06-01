@@ -44,6 +44,40 @@ in
     }
   );
 
+  # The gha_real integration test binary as an installable package, so CI
+  # can substitute it instead of recompiling the workspace. Build only:
+  # the tests need real GHA credentials.
+  ghaRealTests = craneLib.mkCargoDerivation (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+      pname = "gha-real-tests";
+      doInstallCargoArtifacts = false;
+      nativeBuildInputs = [
+        pkgs.jq
+        pkgs.makeWrapper
+      ];
+      # The test executable lands in target/.../deps/ with a hash suffix;
+      # --message-format json reports its exact path.
+      buildPhaseCargoCommand = ''
+        cargoWithProfile test --test gha_real --no-run --message-format json > cargo-test-build.json
+      '';
+      installPhaseCommand = ''
+        bin=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "gha_real" and .executable != null) | .executable' cargo-test-build.json | tail -n1)
+        if [ -z "$bin" ]; then
+          echo "error: could not locate the gha_real test executable" >&2
+          exit 1
+        fi
+        install -D -m755 "$bin" "$out/bin/gha-real-tests"
+        # rustls-platform-verifier needs CA certs to construct any reqwest
+        # client; set-default keeps the runner's own SSL_CERT_FILE if set.
+        wrapProgram "$out/bin/gha-real-tests" \
+          --set-default SSL_CERT_FILE ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+      '';
+      meta.mainProgram = "gha-real-tests";
+    }
+  );
+
   tests = craneLib.cargoTest (
     commonArgs
     // {
