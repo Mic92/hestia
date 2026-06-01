@@ -250,10 +250,32 @@ impl PathEntry {
 
     /// Merge two entries describing the same store path.
     fn merge(a: Self, b: Self) -> Self {
-        // Deterministic winner: newer push wins, nar_hash as tie-break.
-        // (Two entries for the same path hash normally have the same
-        // content; the tie-break only matters for pathological inputs.)
-        let (mut winner, loser) = if (a.last_pushed, a.nar_hash) >= (b.last_pushed, b.nar_hash) {
+        // Deterministic winner: newer push wins, nar_hash as tie-break, the
+        // CBOR encoding of the remaining content as the final tie-break.
+        //
+        // The final tie-break must be a *total* order over the entry
+        // content: two entries can tie on (last_pushed, nar_hash) while
+        // differing in metadata (the same output path can be produced by
+        // different derivations, so deriver/ca/references may differ, and
+        // concurrent jobs push within the same second routinely). Without a
+        // total order the merge would not be commutative, and the surviving
+        // entry would depend on which concurrent writer wins the
+        // SaveMutable race.
+        fn order_key(entry: &PathEntry) -> (u64, NarHash, Vec<u8>) {
+            // The clocks are folded with max() below; exclude them from the
+            // content tie-break so that folding never changes an entry's
+            // ordering (this keeps the merge associative as well).
+            let mut content = entry.clone();
+            content.last_reachable = 0;
+            content.last_pushed = 0;
+            let mut encoded = Vec::new();
+            // Serializing to a Vec cannot fail for manifest types (it is
+            // the same code path Manifest::encode uses); a failure would
+            // only weaken the tie-break, never panic.
+            let _ = ciborium::into_writer(&content, &mut encoded);
+            (entry.last_pushed, entry.nar_hash, encoded)
+        }
+        let (mut winner, loser) = if order_key(&a) >= order_key(&b) {
             (a, b)
         } else {
             (b, a)
@@ -682,6 +704,36 @@ mod tests {
     }
 
     #[test]
+    fn merge_is_commutative_when_push_clock_and_nar_hash_tie() {
+        // Two concurrent CI jobs can push the same store path within the
+        // same second (last_pushed has 1-second granularity) with identical
+        // content (same nar_hash) but different metadata: the same output
+        // path can be produced by different derivations, so deriver (and in
+        // principle ca/references) can differ between the two pushes.
+        //
+        // SaveMutable conflict resolution re-merges in whatever order the
+        // race produces; if the merge result depends on argument order, the
+        // surviving manifest depends on who wins that race -- exactly the
+        // non-determinism the merge rules promise to rule out.
+        let mut a = sample_path_entry(1);
+        let mut b = sample_path_entry(1);
+        a.deriver = Some(format!("{}-alpha.drv", path_hash(10)).parse().unwrap());
+        b.deriver = Some(format!("{}-beta.drv", path_hash(11)).parse().unwrap());
+        // Same push second, same content hash: the tie case.
+        assert_eq!(a.last_pushed, b.last_pushed);
+        assert_eq!(a.nar_hash, b.nar_hash);
+
+        let mut manifest_a = Manifest::new();
+        manifest_a.paths.insert(path_hash(1), a);
+        let mut manifest_b = Manifest::new();
+        manifest_b.paths.insert(path_hash(1), b);
+
+        let ab = manifest_a.clone().merge(manifest_b.clone());
+        let ba = manifest_b.merge(manifest_a);
+        assert_eq!(ab, ba, "merge must not depend on argument order");
+    }
+
+    #[test]
     fn merge_dedups_packs_and_chunks() {
         let pack = Hash32::digest(b"pack");
         let chunk = Hash32::digest(b"chunk");
@@ -871,7 +923,10 @@ mod tests {
                 proptest::option::of(arb_store_path()),
                 arb_chunk_list(),
                 0u64..10_000,
-                0u64..10_000,
+                // Deliberately tiny range: concurrent pushes of the same path
+                // land in the same second all the time, so merge conflicts
+                // with tied push clocks must be exercised, not avoided.
+                0u64..3,
             )
                 .prop_map(
                     |(
@@ -947,12 +1002,34 @@ mod tests {
                 })
         }
 
+        /// Manifest without roots: `Root::merge`'s concurrency window makes
+        /// root merging inherently order-dependent for 3+ way merges (a
+        /// documented limitation), so the associativity law is stated for
+        /// the path/chunk/pack maps only.
+        fn arb_rootless_manifest() -> impl Strategy<Value = Manifest> {
+            arb_manifest().prop_map(|mut manifest| {
+                manifest.roots.clear();
+                manifest
+            })
+        }
+
         proptest! {
             #[test]
             fn merge_is_commutative(a in arb_manifest(), b in arb_manifest()) {
                 let ab = a.clone().merge(b.clone());
                 let ba = b.merge(a);
                 prop_assert_eq!(ab, ba);
+            }
+
+            #[test]
+            fn merge_of_paths_chunks_and_packs_is_associative(
+                a in arb_rootless_manifest(),
+                b in arb_rootless_manifest(),
+                c in arb_rootless_manifest(),
+            ) {
+                let ab_c = a.clone().merge(b.clone()).merge(c.clone());
+                let a_bc = a.merge(b.merge(c));
+                prop_assert_eq!(ab_c, a_bc);
             }
 
             #[test]
