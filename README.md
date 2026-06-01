@@ -83,7 +83,8 @@ nix build ◀─cached paths── hestia ◀─download─ GitHub Actions cache
 
 Nix reports every path it builds to the daemon, and asks it for paths before
 building them — to Nix it looks like a regular binary cache. At the end of
-the job, new build results are split into content-defined chunks, packed
+the job, new build results and their runtime dependencies (the full closure,
+nixpkgs packages included) are split into content-defined chunks, packed
 into a few large blobs, and uploaded. Chunks already in the cache are never
 uploaded again, and every download is hash-verified before Nix gets to see
 it. Corrupt or evicted cache data simply means a rebuild — never wrong build
@@ -122,7 +123,9 @@ The action covers the common case. Direct CLI use:
 | `--idle-exit <SECONDS>` | — | Drain and exit after this much inactivity (fallback for setups without post steps). |
 | `--branch <NAME>` | `$GITHUB_REF_NAME`, else `local` | Branch part of the manifest root key. |
 | `--system <SYSTEM>` | detected | Nix system part of the root key (e.g. `x86_64-linux`). |
-| `--upstream-key <KEY_NAME>` | `cache.nixos.org-1` | Trusted upstream signature names; paths signed by these are never uploaded. Repeatable. |
+| `--upstream-cache-filter` | off | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
+| `--upstream-cache-key-name <KEY_NAME>` | `cache.nixos.org-1` | Key names treated as upstream caches by the filter. Repeatable. |
+| `--no-closure` | off | Cache built paths only, without their runtime closure. |
 | `--db-path <PATH>` | `/nix/var/nix/db/db.sqlite` | Nix store database to read path metadata from. |
 
 ### `hestia hook` — post-build-hook client

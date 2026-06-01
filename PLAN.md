@@ -24,8 +24,10 @@ superseded by this plan).
   touch fully-live packs, delete garbage via GitHub REST API.
 - `hestia-action` — **required** GitHub Action wrapper (see Auth below;
   shell steps cannot see the cache tokens).
-- Only locally-built paths are stored. Anything signed by cache.nixos.org (or
-  other configured upstreams) is filtered out.
+- By default the full runtime closure of built paths is stored, including
+  upstream-served dependencies (Decision 30). The opt-in upstream cache
+  filter (`--upstream-cache-filter`, attic naming) restores the old
+  locally-built-only behavior; `--no-closure` disables closure expansion.
 
 Storage model on the GHA cache:
 
@@ -138,7 +140,8 @@ hestia serve                       (one process per CI job)
 │     /{hash}.narinfo    → manifest lookup → build_narinfo() → record access
 │     /nar/{hash}.nar    → chunks → NarEvents → NarByteStream → stream
 └── on drain (action post-step) or idle-exit:
-      paths → store-db query_path_info → filter upstream-signed
+      paths → closure expansion → store-db query_path_info
+      → filter upstream-signed (opt-in)
       → NarDumper events → FastCDC chunks (skip known) + nar_hash
         recomputed from the chunked representation (integrity gate)
       → pack new chunks → Twirp reserve → Azure PUT → finalize
@@ -798,6 +801,19 @@ continues from / interleaves with the Open Questions section above.
     tests run there (only the two system-store oracle tests skip, covered
     by the action-test job). The static release build stays on
     buildRustPackage (nix/package.nix).
+30. **Closure expansion by default; the upstream filter is opt-in**
+    (post-Phase 6 feature). The original design stored only locally-built
+    paths and filtered upstream-signed ones. Two problems: substituted
+    dependencies never trigger the post-build-hook, so every fresh runner
+    re-downloaded them from cache.nixos.org; and the filter never matched
+    anything in practice (freshly built paths carry no signatures — the
+    "skipping" came from the hook-only architecture, not the filter).
+    Drains now expand hooked paths to their runtime closure (store-db
+    references walk) and cache everything: for small projects the whole
+    nixpkgs closure fits the 10 GB quota easily, and the co-located GHA
+    cache beats upstream round-trips. Flags follow attic conventions:
+    `--upstream-cache-filter` (opt-in skip), `--upstream-cache-key-name`
+    (repeatable), `--no-closure` (hooked paths only).
 
 ## Mistakes Fixed from Earlier Draft
 
