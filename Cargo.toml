@@ -1,6 +1,6 @@
 [package]
 name = "hestia"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 license = "MIT"
 description = "Nix binary cache backed by the GitHub Actions cache (v2 API)"
