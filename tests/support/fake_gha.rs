@@ -16,6 +16,11 @@
 //! * `POST /test/evict/{key}`: LRU eviction of an entry.
 //! * `POST /test/expire-urls`: invalidate all previously issued signed URLs
 //!   (subsequent transfers get 403, like an expired SAS URL).
+//! * `POST /test/expire-token-after/{n}`: the next `n` Twirp calls succeed,
+//!   every later one gets HTTP 401 (expired `ACTIONS_RUNTIME_TOKEN`).
+//! * `POST /test/exhaust-quota-after/{n}`: the next `n` CreateCacheEntry
+//!   calls succeed, every later one gets a `resource_exhausted` Twirp error
+//!   (the 10 GB repository cache quota is full).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -68,6 +73,10 @@ struct Inner {
     valid_sigs: HashSet<String>,
     clock: u64,
     blob_requests: Vec<BlobRequest>,
+    /// `Some(n)`: n more Twirp calls succeed, then everything gets 401.
+    twirp_calls_until_401: Option<u64>,
+    /// `Some(n)`: n more CreateCacheEntry calls succeed, then quota errors.
+    creates_until_quota: Option<u64>,
 }
 
 impl Inner {
@@ -126,6 +135,18 @@ async fn twirp_create(State(state): State<AppState>, body: Bytes) -> Response {
         return twirp_error(StatusCode::BAD_REQUEST, "malformed", "bad json");
     };
     let mut inner = state.inner.lock().unwrap();
+    // Quota injection: reservations are what the real service rejects when
+    // the repository cache is full.
+    if let Some(remaining) = &mut inner.creates_until_quota {
+        if *remaining == 0 {
+            return twirp_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "resource_exhausted",
+                "cache storage quota has been exceeded",
+            );
+        }
+        *remaining -= 1;
+    }
     if inner.find(&request.key, &request.version).is_some() {
         return twirp_error(
             StatusCode::CONFLICT,
@@ -230,6 +251,21 @@ async fn twirp_dispatch(
     Path(method): Path<String>,
     body: Bytes,
 ) -> Response {
+    // Token-expiry injection: the real service rejects every Twirp call with
+    // HTTP 401 once the runtime JWT has expired (~6h lifetime).
+    {
+        let mut inner = state.inner.lock().unwrap();
+        if let Some(remaining) = &mut inner.twirp_calls_until_401 {
+            if *remaining == 0 {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "code": "unauthenticated", "msg": "token expired" })),
+                )
+                    .into_response();
+            }
+            *remaining -= 1;
+        }
+    }
     match method.as_str() {
         "CreateCacheEntry" => twirp_create(State(state), body).await,
         "FinalizeCacheEntryUpload" => twirp_finalize(State(state), body).await,
@@ -429,6 +465,22 @@ async fn test_expire_urls(State(state): State<AppState>) -> Response {
     Json(json!({ "expired": count })).into_response()
 }
 
+async fn test_expire_token_after(
+    State(state): State<AppState>,
+    Path(calls): Path<u64>,
+) -> Response {
+    state.inner.lock().unwrap().twirp_calls_until_401 = Some(calls);
+    Json(json!({ "calls_until_401": calls })).into_response()
+}
+
+async fn test_exhaust_quota_after(
+    State(state): State<AppState>,
+    Path(creates): Path<u64>,
+) -> Response {
+    state.inner.lock().unwrap().creates_until_quota = Some(creates);
+    Json(json!({ "creates_until_quota": creates })).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Server wiring
 // ---------------------------------------------------------------------------
@@ -461,6 +513,8 @@ impl FakeGha {
             valid_sigs: HashSet::new(),
             clock: 0,
             blob_requests: Vec::new(),
+            twirp_calls_until_401: None,
+            creates_until_quota: None,
         }));
         let state = AppState {
             inner: Arc::clone(&inner),
@@ -477,6 +531,14 @@ impl FakeGha {
             .route("/repos/{owner}/{repo}/actions/cache/usage", get(rest_usage))
             .route("/test/evict/{key}", post(test_evict))
             .route("/test/expire-urls", post(test_expire_urls))
+            .route(
+                "/test/expire-token-after/{calls}",
+                post(test_expire_token_after),
+            )
+            .route(
+                "/test/exhaust-quota-after/{creates}",
+                post(test_exhaust_quota_after),
+            )
             .with_state(state);
 
         let task = tokio::spawn(async move {
@@ -530,6 +592,23 @@ impl FakeGha {
     pub async fn expire_urls(&self, http: &reqwest::Client) {
         let url = format!("{}/test/expire-urls", self.base_url);
         let response = http.post(&url).send().await.expect("expire request");
+        assert!(response.status().is_success());
+    }
+
+    /// Let `calls` more Twirp requests succeed, then reject everything with
+    /// HTTP 401 (simulates the ~6h runtime-token expiry).
+    pub async fn expire_token_after(&self, http: &reqwest::Client, calls: u64) {
+        let url = format!("{}/test/expire-token-after/{calls}", self.base_url);
+        let response = http.post(&url).send().await.expect("expire-token request");
+        assert!(response.status().is_success());
+    }
+
+    /// Let `creates` more CreateCacheEntry calls succeed, then reject new
+    /// reservations with `resource_exhausted` (simulates the full 10 GB
+    /// repository quota).
+    pub async fn exhaust_quota_after(&self, http: &reqwest::Client, creates: u64) {
+        let url = format!("{}/test/exhaust-quota-after/{creates}", self.base_url);
+        let response = http.post(&url).send().await.expect("exhaust-quota request");
         assert!(response.status().is_success());
     }
 }

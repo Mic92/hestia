@@ -81,6 +81,111 @@ fn to_path_set(paths: &[&Path]) -> BTreeSet<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Token expiry
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn token_expiry_mid_upload_fails_cleanly_without_partial_commit() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let fixture = store.add_fixture("token-expiry", 233);
+
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let ctx = context(&fake, &http, &store);
+
+    // Twirp call budget: ① GetCacheEntryDownloadURL (manifest load),
+    // ② CreateCacheEntry (pack reserve). The third call — the pack's
+    // FinalizeCacheEntryUpload — hits the expired token: failure lands
+    // mid-upload, after the blob PUT already went through.
+    fake.expire_token_after(&http, 2).await;
+
+    let error = ctx
+        .run(to_path_set(&[&fixture]), BTreeSet::new(), now_unix())
+        .await
+        .expect_err("pipeline must fail when the token expires mid-upload");
+
+    // The error tells the workflow author what happened and what to do.
+    let message = error.to_string();
+    assert!(
+        message.contains("token") && message.contains("expired"),
+        "error must explain the token expiry, got: {message}"
+    );
+    assert!(
+        message.contains("re-run"),
+        "error must tell the user to re-run the job, got: {message}"
+    );
+
+    // No partial manifest commit: a later job (fresh token) sees no
+    // manifest at all — the failed run left nothing half-finished behind.
+    fake.expire_token_after(&http, u64::MAX).await;
+    assert!(
+        committed_manifest(&fake, &http).await.is_none(),
+        "a failed upload must not leave a partial manifest behind"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Quota exhaustion
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn quota_exhaustion_fails_gracefully_and_gc_cleans_orphaned_packs() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let fixture = store.add_fixture("quota", 239);
+
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let ctx = context(&fake, &http, &store);
+
+    // Reservation budget: ① the pack's CreateCacheEntry succeeds (the pack
+    // uploads fine), ② the manifest's CreateCacheEntry hits the quota error.
+    // This is the worst case: data uploaded, nothing referencing it.
+    fake.exhaust_quota_after(&http, 1).await;
+
+    let error = ctx
+        .run(to_path_set(&[&fixture]), BTreeSet::new(), now_unix())
+        .await
+        .expect_err("pipeline must fail when the quota is exhausted");
+    assert!(
+        error.to_string().contains("resource_exhausted"),
+        "error must surface the quota problem, got: {error}"
+    );
+
+    // No manifest was committed, but the pack blob is now an orphan in the
+    // cache.
+    assert!(committed_manifest(&fake, &http).await.is_none());
+    let packs = fake.rest(&http).list_caches("pack-").await.unwrap();
+    assert_eq!(packs.len(), 1, "the uploaded pack is orphaned");
+
+    // The orphan is not stuck forever: the next GC run (with quota pressure
+    // gone) deletes it once it is older than the safety age. The fake's
+    // clock is in small tick units; pretend an hour+ passed since upload.
+    fake.exhaust_quota_after(&http, u64::MAX).await;
+    let gc = GcContext {
+        twirp: fake.twirp(&http),
+        rest: fake.rest(&http),
+        http: http.clone(),
+        manifest_prefix: MANIFEST_PREFIX.to_string(),
+        policy: GcPolicy::default(),
+    };
+    let pack_created = packs[0].created_unix().unwrap_or(0);
+    let gc_now = pack_created + 2 * 3600;
+
+    let report = gc.run(false, gc_now).await.expect("GC must succeed");
+    assert_eq!(
+        report.orphans_deleted, 1,
+        "GC must delete the orphaned pack"
+    );
+
+    let packs = fake.rest(&http).list_caches("pack-").await.unwrap();
+    assert!(packs.is_empty(), "orphaned pack must be gone after GC");
+}
+
+// ---------------------------------------------------------------------------
 // Manifest corruption
 // ---------------------------------------------------------------------------
 

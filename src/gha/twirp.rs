@@ -172,6 +172,15 @@ impl TwirpClient {
             return Ok(response.json().await?);
         }
 
+        // 401 means the runtime token was rejected (JWTs expire after ~6h).
+        // This deserves a dedicated, actionable error: it is the one failure
+        // a workflow author can do nothing about except re-run the job.
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(Error::TokenExpired {
+                method: method.to_string(),
+            });
+        }
+
         let body = response.text().await.unwrap_or_default();
         // Twirp errors are JSON {"code", "msg"}; anything else is unexpected.
         match serde_json::from_str::<TwirpErrorBody>(&body) {

@@ -27,6 +27,13 @@ pub enum Error {
     #[error("http request failed: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error(
+        "GitHub Actions rejected the runtime token during {method} (HTTP 401): the token has \
+         expired (runtime tokens are only valid for ~6 hours) or is invalid; nothing was \
+         committed; re-run the job to get a fresh token"
+    )]
+    TokenExpired { method: String },
+
     #[error("twirp call {method} failed: {code}: {msg}")]
     Twirp {
         method: String,
