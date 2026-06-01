@@ -89,6 +89,24 @@ uploaded again, and every download is hash-verified before Nix gets to see
 it. Corrupt or evicted cache data simply means a rebuild — never wrong build
 inputs.
 
+### Roots: what keeps cache data alive
+
+Every job records the paths it pushed and the paths it downloaded under a
+*root* named `<branch>-<system>`, e.g. `main-x86_64-linux`. The branch part
+comes from `$GITHUB_REF_NAME` (override with `--branch`), the system part is
+detected (override with `--system`). Anything reachable from a root survives
+garbage collection; everything else is deleted once it falls out of the push
+grace period.
+
+Pull requests get their own roots (`123/merge-x86_64-linux`), so a PR cannot
+evict paths the default branch still needs. Roots that stop being updated —
+merged PRs, deleted branches — expire after `--root-ttl` (14 days by
+default) and their paths become collectable.
+
+This is hestia's liveness tracking inside the manifest. It is separate from
+GitHub's own cache access scoping (who may read/write entries, see
+[Security](#security)); both apply.
+
 The full architecture and design rationale live in [PLAN.md](PLAN.md).
 
 ## Configuration reference
