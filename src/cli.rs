@@ -50,10 +50,23 @@ pub struct ServeArgs {
     #[arg(long)]
     pub system: Option<String>,
 
-    /// Trusted upstream signature key names; paths signed by any of these
-    /// are never uploaded. Repeatable [default: cache.nixos.org-1].
-    #[arg(long = "upstream-key", value_name = "KEY_NAME")]
-    pub upstream_keys: Vec<String>,
+    /// Skip paths signed by an upstream cache (see
+    /// --upstream-cache-key-name) instead of caching them.
+    #[arg(long)]
+    pub upstream_cache_filter: bool,
+
+    /// Signing key names treated as upstream caches by
+    /// --upstream-cache-filter. Repeatable.
+    #[arg(
+        long = "upstream-cache-key-name",
+        value_name = "KEY_NAME",
+        default_value = "cache.nixos.org-1"
+    )]
+    pub upstream_cache_key_names: Vec<String>,
+
+    /// Push built paths only; do not expand them to their runtime closure.
+    #[arg(long)]
+    pub no_closure: bool,
 
     /// Nix store database to read path metadata from.
     #[arg(long, default_value = "/nix/var/nix/db/db.sqlite")]
@@ -125,7 +138,9 @@ mod tests {
 
         assert_eq!(args.branch, None);
         assert_eq!(args.system, None);
-        assert!(args.upstream_keys.is_empty());
+        assert!(!args.upstream_cache_filter);
+        assert!(!args.no_closure);
+        assert_eq!(args.upstream_cache_key_names, vec!["cache.nixos.org-1"]);
         assert_eq!(args.db_path, PathBuf::from("/nix/var/nix/db/db.sqlite"));
 
         let cli = parse(&[
@@ -141,10 +156,12 @@ mod tests {
             "main",
             "--system",
             "riscv64-linux",
-            "--upstream-key",
+            "--upstream-cache-filter",
+            "--upstream-cache-key-name",
             "cache.nixos.org-1",
-            "--upstream-key",
+            "--upstream-cache-key-name",
             "company-cache-1",
+            "--no-closure",
             "--db-path",
             "/custom/db.sqlite",
         ]);
@@ -156,8 +173,10 @@ mod tests {
         assert_eq!(args.idle_exit, Some(120));
         assert_eq!(args.branch.as_deref(), Some("main"));
         assert_eq!(args.system.as_deref(), Some("riscv64-linux"));
+        assert!(args.upstream_cache_filter);
+        assert!(args.no_closure);
         assert_eq!(
-            args.upstream_keys,
+            args.upstream_cache_key_names,
             vec![
                 "cache.nixos.org-1".to_string(),
                 "company-cache-1".to_string()

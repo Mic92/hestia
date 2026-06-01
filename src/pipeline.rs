@@ -2,9 +2,11 @@
 //!
 //! Runs on drain (action post-step or idle-exit). Steps:
 //!
-//! 1. Query path info from the store database for every buffered path.
-//! 2. Filter: invalid paths, upstream-signed paths, paths already in the
-//!    manifest (those get their `last_pushed` clock bumped instead).
+//! 1. Query path info from the store database for every buffered path,
+//!    expanded to its runtime closure unless disabled.
+//! 2. Filter: invalid paths, upstream-signed paths (when the upstream
+//!    cache filter is enabled), paths already in the manifest (those get
+//!    their `last_pushed` clock bumped instead).
 //! 3. Chunk each new path (FastCDC over NAR events) and verify the chunked
 //!    representation reproduces the NAR hash recorded by Nix.
 //! 4. Pack new chunks, upload the pack (Twirp reserve → Azure PUT →
@@ -164,6 +166,10 @@ pub struct PipelineContext {
     pub http: reqwest::Client,
     pub store: StoreDatabase,
     pub upstream: UpstreamFilter,
+    /// Expand hooked paths to their runtime closure before pushing.
+    /// Substituted dependencies never trigger the post-build-hook, so
+    /// without expansion they are never cached.
+    pub expand_closure: bool,
     /// Manifest root key, e.g. `main-x86_64-linux`.
     pub root_key: String,
     /// SaveMutable family prefix (always [`MANIFEST_PREFIX`] in production;
@@ -247,9 +253,16 @@ impl PipelineContext {
 
         // Blocking sqlite I/O happens off the async runtime.
         let store = self.store.clone();
-        let lookups = tokio::task::spawn_blocking(move || store.query_batch(paths))
-            .await
-            .expect("store database query task panicked")?;
+        let expand_closure = self.expand_closure;
+        let lookups = tokio::task::spawn_blocking(move || {
+            if expand_closure {
+                store.query_closure(paths)
+            } else {
+                store.query_batch(paths)
+            }
+        })
+        .await
+        .expect("store database query task panicked")?;
 
         let mut root_paths: BTreeSet<PathHash> = accessed;
         // Existing entries whose last_pushed clock gets bumped (dedup-skips).

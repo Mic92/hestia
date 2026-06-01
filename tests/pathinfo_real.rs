@@ -83,6 +83,62 @@ fn scratch_store_references_are_recorded() {
 }
 
 #[test]
+fn scratch_store_closure_query_walks_references() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let (top, dep) = store.add_paths_with_reference("closure");
+    let standalone = store.add_fixture("standalone", 7);
+    let database = store.database();
+
+    // The closure of `top` is {top, dep}.
+    let results = database
+        .query_closure([top.to_str().unwrap().to_string()])
+        .expect("closure query failed");
+    let found: Vec<&str> = results
+        .iter()
+        .filter(|(_, lookup)| matches!(lookup, Lookup::Found(_)))
+        .map(|(path, _)| path.as_str())
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(found.contains(&top.to_str().unwrap()));
+    assert!(found.contains(&dep.to_str().unwrap()));
+
+    // A path without references is its own closure.
+    let results = database
+        .query_closure([standalone.to_str().unwrap().to_string()])
+        .expect("closure query failed");
+    assert_eq!(results.len(), 1);
+
+    // Duplicate roots are deduplicated; unknown paths are reported, not fatal.
+    let unknown = format!(
+        "{}/00000000000000000000000000000000-missing",
+        database.store_dir()
+    );
+    let results = database
+        .query_closure([
+            top.to_str().unwrap().to_string(),
+            top.to_str().unwrap().to_string(),
+            unknown.clone(),
+        ])
+        .expect("closure query failed");
+    assert_eq!(results.len(), 3, "top + dep + unknown");
+    assert!(
+        results
+            .iter()
+            .any(|(path, lookup)| *path == unknown && matches!(lookup, Lookup::Unknown))
+    );
+
+    // Empty input needs no database at all.
+    assert!(
+        database
+            .query_closure(Vec::new())
+            .expect("empty query")
+            .is_empty()
+    );
+}
+
+#[test]
 fn scratch_store_fake_upstream_signature_is_filtered() {
     // Hermetic version of the upstream-filter requirement: sign a path with
     // a key named exactly like the cache.nixos.org key and verify the

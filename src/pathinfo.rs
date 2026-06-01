@@ -12,6 +12,7 @@
 //! `nix-store --store 'local?store=…' --add` is queryable without spawning
 //! a daemon process.
 
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use harmonia_store_db::StoreDb;
@@ -181,6 +182,43 @@ impl StoreDatabase {
                 Ok((path, lookup))
             })
             .collect()
+    }
+
+    /// Look up `roots` and everything they transitively reference (their
+    /// runtime closure), over a single database connection.
+    ///
+    /// Per-path problems are reported as [`Lookup`] variants, exactly like
+    /// [`Self::query_batch`].
+    pub fn query_closure(
+        &self,
+        roots: impl IntoIterator<Item = String>,
+    ) -> Result<Vec<(String, Lookup)>, Error> {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        for root in roots {
+            if seen.insert(root.clone()) {
+                queue.push_back(root);
+            }
+        }
+        if queue.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let db = self.open()?;
+        let mut results = Vec::new();
+        while let Some(path) = queue.pop_front() {
+            let lookup = self.lookup_one(&db, &path)?;
+            if let Lookup::Found(info) = &lookup {
+                for reference in &info.references {
+                    let reference_path = format!("{}/{reference}", self.store_dir);
+                    if seen.insert(reference_path.clone()) {
+                        queue.push_back(reference_path);
+                    }
+                }
+            }
+            results.push((path, lookup));
+        }
+        Ok(results)
     }
 
     fn lookup_one(&self, db: &StoreDb, store_path: &str) -> Result<Lookup, Error> {

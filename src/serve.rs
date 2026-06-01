@@ -332,10 +332,12 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let upstream = if args.upstream_keys.is_empty() {
-        UpstreamFilter::default()
+    // The filter is opt-in: by default everything is cached, upstream-served
+    // paths included. An empty filter skips nothing.
+    let upstream = if args.upstream_cache_filter {
+        UpstreamFilter::new(args.upstream_cache_key_names.iter().cloned())
     } else {
-        UpstreamFilter::new(args.upstream_keys.iter().cloned())
+        UpstreamFilter::new(Vec::new())
     };
 
     let branch = args
@@ -352,6 +354,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         http: http.clone(),
         store,
         upstream,
+        expand_closure: !args.no_closure,
         root_key: pipeline::root_key(&branch, &system),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.

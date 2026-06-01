@@ -36,6 +36,7 @@ fn pipeline_context(
         http: http.clone(),
         store,
         upstream: UpstreamFilter::default(),
+        expand_closure: true,
         root_key: TEST_ROOT_KEY.to_string(),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         publish: None,

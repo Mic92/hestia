@@ -29,6 +29,7 @@ fn context(fake: &FakeGha, http: &reqwest::Client, store: StoreDatabase) -> Pipe
         // would skip cache.nixos.org-signed paths) lets them through --
         // exactly like locally built paths in production.
         upstream: UpstreamFilter::default(),
+        expand_closure: true,
         root_key: TEST_ROOT_KEY.to_string(),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         publish: None,
@@ -174,6 +175,98 @@ async fn pushes_paths_end_to_end() {
 
     // Exactly one pack blob landed in the (fake) GHA cache.
     assert_eq!(pack_count(&fake, &http).await, 1);
+}
+
+#[tokio::test]
+async fn closure_expansion_pushes_dependencies() {
+    // Hooking only `top` must push `dep` too: dependencies never trigger
+    // the post-build-hook themselves.
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let (top, dep) = store.add_paths_with_reference("closure");
+
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let ctx = context(&fake, &http, store.database());
+
+    let now = now_unix();
+    let stats = ctx
+        .run(to_path_set(&[&top]), BTreeSet::new(), now)
+        .await
+        .expect("pipeline run failed");
+
+    assert_eq!(stats.paths_received, 1, "only top was hooked");
+    assert_eq!(stats.pushed, 2, "top and its dependency must be pushed");
+
+    let (_, manifest) = committed_manifest(&ctx).await.expect("manifest committed");
+    assert!(manifest.paths.contains_key(&path_hash_of(&top)));
+    assert!(
+        manifest.paths.contains_key(&path_hash_of(&dep)),
+        "dependency must be cached even though it was never hooked"
+    );
+    assert_all_chunks_locatable(&manifest);
+
+    let root = &manifest.roots[TEST_ROOT_KEY];
+    assert!(root.paths.contains(&path_hash_of(&top)));
+    assert!(root.paths.contains(&path_hash_of(&dep)));
+}
+
+#[tokio::test]
+async fn no_closure_pushes_only_hooked_paths() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let (top, dep) = store.add_paths_with_reference("no-closure");
+
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let ctx = PipelineContext {
+        expand_closure: false,
+        ..context(&fake, &http, store.database())
+    };
+
+    let stats = ctx
+        .run(to_path_set(&[&top]), BTreeSet::new(), now_unix())
+        .await
+        .expect("pipeline run failed");
+
+    assert_eq!(stats.pushed, 1, "only the hooked path must be pushed");
+
+    let (_, manifest) = committed_manifest(&ctx).await.expect("manifest committed");
+    assert!(manifest.paths.contains_key(&path_hash_of(&top)));
+    assert!(
+        !manifest.paths.contains_key(&path_hash_of(&dep)),
+        "dependency must not be pushed with --no-closure"
+    );
+}
+
+#[tokio::test]
+async fn disabled_upstream_filter_caches_signed_paths() {
+    // Production default: no filter, upstream-signed paths are cached too.
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let signed = store.add_fixture("signed-cached", 41);
+    store.sign_path(&signed, "cache.nixos.org-1");
+
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let ctx = PipelineContext {
+        upstream: UpstreamFilter::new(Vec::new()),
+        ..context(&fake, &http, store.database())
+    };
+
+    let stats = ctx
+        .run(to_path_set(&[&signed]), BTreeSet::new(), now_unix())
+        .await
+        .expect("pipeline run failed");
+
+    assert_eq!(stats.skipped_upstream, 0);
+    assert_eq!(stats.pushed, 1, "signed path must be cached");
+
+    let (_, manifest) = committed_manifest(&ctx).await.expect("manifest committed");
+    assert!(manifest.paths.contains_key(&path_hash_of(&signed)));
 }
 
 #[tokio::test]
