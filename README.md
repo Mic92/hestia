@@ -3,35 +3,27 @@
 > ⚠️ **Alpha software**: APIs, cache format, and behavior may change without
 > notice. Not yet recommended for production CI.
 
-A Nix binary cache backed by the **GitHub Actions cache** (v2 API).
+Speed up your Nix builds on GitHub Actions — for free, with zero setup.
 
-Hestia is the successor to [magic-nix-cache], which died in February 2025
-when GitHub shut down the v1 cache API. It gives every GitHub repository a
-free, zero-configuration Nix binary cache: store paths built in one CI run
-are served back to later runs instead of being rebuilt.
+Hestia caches everything your CI builds in the **GitHub Actions cache**, so
+later runs download results instead of rebuilding them. No accounts, no
+secrets, no servers to run: add one action to your workflow and you have a
+binary cache.
+
+Compared to [magic-nix-cache], hestia is built for speed and efficiency:
+
+- **Faster cache transfers.** Build results are bundled into a few large
+  uploads/downloads instead of one cache entry per store path.
+- **Only changes are uploaded.** Data is deduplicated in small chunks, so a
+  nixpkgs bump re-uploads only what actually changed — not every rebuilt
+  package.
+- **No rate-limit errors.** Far fewer GitHub API calls means no more
+  `429 Too Many Requests` failures on large builds.
+- **The cache cleans itself.** A scheduled garbage-collection workflow keeps
+  your repository inside GitHub's 10 GB cache quota, keeping what your
+  branches still use and dropping the rest.
 
 [magic-nix-cache]: https://github.com/DeterminateSystems/magic-nix-cache
-
-## How it works
-
-One `hestia serve` daemon runs per CI job. Nix's `post-build-hook` reports
-every locally-built store path to the daemon over a unix socket; at the end
-of the job the daemon **chunks** those paths (FastCDC content-defined
-chunking over the NAR stream), packs new chunks into content-addressed
-**pack** blobs, uploads them to the GHA cache over its Twirp/Azure API, and
-commits a **manifest** (CBOR+zstd, versioned via monotonically numbered
-cache keys) that maps store paths → file trees → chunks → packs. The same
-daemon doubles as a localhost **substituter** speaking the Nix binary cache
-protocol: narinfo lookups come straight from the manifest, NARs are
-reassembled from Range-read chunks and hash-verified before a single byte is
-served. Chunk-level deduplication means a nixpkgs bump re-uploads only what
-actually changed, and a mark/sweep garbage collector (run as a cron workflow)
-keeps the whole thing inside GitHub's 10 GB cache quota.
-
-```
-nix build ──post-build-hook──▶ hestia serve ──drain──▶ GHA cache
-nix build ◀──substituter───── hestia serve ◀──chunks── (packs + manifest)
-```
 
 ## Quick start
 
@@ -58,22 +50,46 @@ Plus a daily GC workflow on the default branch — copy
 
 See [`action/README.md`](action/README.md) for all action inputs.
 
+That's it. Everything built in your workflow is cached; later runs (and PRs)
+pull from the cache instead of rebuilding.
+
 ## Comparison
 
 |  | **hestia** | **magic-nix-cache** | **cachix** | **attic** |
 |---|---|---|---|---|
-| Status | alpha | **dead** (cache API v1 shutdown, Feb 2025) | commercial service | self-hosted |
-| Storage | GHA cache (free, 10 GB/repo) | GHA cache v1 | cachix.org | your S3/disk |
+| Status | alpha | maintained | commercial service | self-hosted |
+| Storage | GHA cache (free, 10 GB/repo) | GHA cache (free, 10 GB/repo) | cachix.org | your S3/disk |
 | Accounts / secrets needed | none | none | auth token | server + token |
 | Infrastructure to run | none | none | none | server, database, storage |
-| Chunk-level dedup | ✅ (FastCDC) | ❌ (whole NARs) | ❌ | ✅ |
-| Garbage collection | mark/sweep cron workflow | LRU only | retention rules | policies |
+| Uploads only what changed (dedup) | ✅ | ❌ (whole store paths) | ❌ | ✅ |
+| Rate-limit errors on big builds | no | yes (`429`) | no | no |
+| Garbage collection | automatic (scheduled workflow) | none (LRU eviction only) | retention rules | policies |
 | Cache shared beyond CI | ❌ (CI-only by design) | ❌ | ✅ (any machine) | ✅ |
 | Signing | not needed (`?trusted=true`, localhost) | not needed | ✅ | ✅ |
+| Telemetry | none | reports usage to Determinate Systems (opt-out) | — | none |
 
 Use cachix or attic when developer machines should hit the cache too.
 Use hestia when you want CI caching with zero accounts, zero secrets, and
 zero infrastructure.
+
+## How it works
+
+A small daemon (`hestia serve`) runs alongside your CI job:
+
+```
+nix build ──built paths──▶ hestia ──upload──▶ GitHub Actions cache
+nix build ◀─cached paths── hestia ◀─download─ GitHub Actions cache
+```
+
+Nix reports every path it builds to the daemon, and asks it for paths before
+building them — to Nix it looks like a regular binary cache. At the end of
+the job, new build results are split into content-defined chunks, packed
+into a few large blobs, and uploaded. Chunks already in the cache are never
+uploaded again, and every download is hash-verified before Nix gets to see
+it. Corrupt or evicted cache data simply means a rebuild — never wrong build
+inputs.
+
+The full architecture and design rationale live in [PLAN.md](PLAN.md).
 
 ## Configuration reference
 

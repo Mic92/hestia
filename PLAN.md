@@ -1,7 +1,8 @@
 # Hestia — Implementation Plan
 
-Nix binary cache backed by the GitHub Actions cache (v2 API). Successor to the
-abandoned magic-nix-cache (killed Feb 2025 with the cache API v1 shutdown).
+Nix binary cache backed by the GitHub Actions cache (v2 API). Alternative to
+magic-nix-cache, adding chunk-level deduplication, packed storage (faster
+transfers, far fewer GHA API calls) and mark/sweep garbage collection.
 Written in Rust, reusing harmonia crates.
 
 Background design document: `~/.claude/outputs/gha-cache-handoff.md`
