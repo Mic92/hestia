@@ -39,6 +39,10 @@ jobs:
           sha256: ${{ vars.HESTIA_DOGFOOD_SHA256 }}
       - name: Run flake checks
         run: nix flake check --print-build-logs
+      # No-op after the flake checks; asserts the closures the dependent
+      # jobs substitute are complete and pushed.
+      - name: Assert package closures are complete
+        run: nix build .# .#gha-real-tests --no-link
       - name: Show daemon log
         if: ${{ always() && vars.HESTIA_DOGFOOD == 'true' }}
         run: cat "$HESTIA_SERVE_LOG"
@@ -53,6 +57,8 @@ jobs:
   # GET) and manage entries via the REST API.
   token-probe:
     runs-on: ubuntu-latest
+    # The build job pushes the gha-real-tests closure to the cache.
+    needs: build
     permissions:
       # actions:write is needed by the REST delete test
       actions: write
@@ -60,7 +66,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
-      # No binary/version input: token-capture-only mode.
+      # Dogfood substituter, so the nix build below substitutes instead of
+      # compiling. Must run before the token-only invocation below.
+      - name: Start hestia cache (dogfood)
+        if: vars.HESTIA_DOGFOOD == 'true'
+        uses: ./action
+        with:
+          version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
+          sha256: ${{ vars.HESTIA_DOGFOOD_SHA256 }}
+      # No binary/version input: token-capture-only mode (must stay tested).
       - uses: ./action
       - name: Assert cache tokens are visible to shell steps
         run: |
@@ -86,7 +100,10 @@ jobs:
             exit 1
           fi
       - name: Run real-API integration tests
-        run: nix develop -c cargo test --test gha_real -- --ignored --nocapture
+        run: |
+          set -euo pipefail
+          nix build .#gha-real-tests -o gha-real-tests
+          ./gha-real-tests/bin/gha-real-tests --ignored --nocapture
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
@@ -95,17 +112,31 @@ jobs:
   # capture, manifest commit, and substitution back out of the cache.
   action-test:
     runs-on: ubuntu-latest
+    # The build job pushes the package closure to the cache.
+    needs: build
     permissions:
       actions: write
       contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
+      # Dogfood substituter, so the nix build below substitutes instead of
+      # compiling (forks without the variables build from source).
+      - name: Start hestia cache (dogfood)
+        if: vars.HESTIA_DOGFOOD == 'true'
+        uses: ./action
+        with:
+          version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
+          sha256: ${{ vars.HESTIA_DOGFOOD_SHA256 }}
       - name: Build hestia
         run: nix build .# -o hestia-bin
+      # Instance under test on its own port/socket, started last: the
+      # HESTIA_* variables and the post-build-hook then point at it.
       - uses: ./action
         with:
           binary: ./hestia-bin/bin/hestia
+          listen: 127.0.0.1:37516
+          socket: /tmp/hestia-test/hook.sock
       - name: Build a run-unique derivation through the post-build-hook
         run: |
           set -euo pipefail
