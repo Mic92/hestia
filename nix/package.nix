@@ -5,7 +5,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "hestia";
-  version = "0.1.0";
+  version = "0.1.0-alpha.1";
 
   src = lib.fileset.toSource {
     root = ../.;
@@ -30,8 +30,8 @@ rustPlatform.buildRustPackage {
   env.SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
 
   meta = {
-    description = "Nix binary cache backed by the GitHub Actions cache";
-    homepage = "https://github.com/nix-community/hestia";
+    description = "Nix binary cache backed by the GitHub Actions cache (v2 API)";
+    homepage = "https://github.com/Mic92/hestia";
     license = lib.licenses.mit;
     mainProgram = "hestia";
   };
