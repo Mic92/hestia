@@ -393,15 +393,30 @@ below). Deviations and findings recorded under Open Questions (13–16).
 
 ### Phase 5: GC
 
-- `gc.rs`: plan (REST reconcile, mark, sweep, schedule repack/touch) +
-  execute (verified Range-copy, upload, manifest commit, REST delete)
-- Stability tiers (repacks_survived → volatile/stable packs)
-- Tests: simulated histories (nixpkgs bumps, branch deletion, quota
-  eviction mid-run), plan idempotence, crash-ordering (kill between any two
-  steps → no data loss), GC vs concurrent push (SaveMutable conflict →
-  re-plan)
-- **Milestone: simulated 30-day history (daily pushes, weekly bumps)
-  converges to ≈ live-set storage; no pack older than TouchAge.**
+**Status: done.** Milestone verified: the 30-day simulation (daily pushes,
+weekly nixpkgs bumps, one branch deletion, one quota eviction) converges to
+live-set storage within 20%, no referenced pack idles past TouchAge, and
+every live path stays readable through the substituter. Deviations and
+findings recorded under Open Questions (17–20).
+
+- [x] `gc.rs`: plan (REST reconcile, mark, sweep, schedule repack/touch) +
+      execute (verified Range-copy, upload, manifest commit, REST delete),
+      split into individually resumable steps (repack → touch → commit →
+      delete packs → delete orphans → cleanup old manifest versions)
+- [x] Stability tiers (repacks_survived → volatile/stable packs); CAS
+      no-op trap guarded (fully live packs are touched, never repacked)
+- [x] GC policy defaults from the design: PathGrace 72h, PushTTL 14d,
+      RootTTL 14d, TouchAge 4d, MinLiveness 0.5, MaxVolatilePacks 4,
+      StableThreshold 2 (CLI flags: --grace, --push-ttl, --root-ttl,
+      --touch-age, --dry-run)
+- [x] Tests: mark/sweep unit tests (root expiry, grace, PushTTL fallback),
+      repack with verification, stability-tier promotion, touch/LRU reset,
+      eviction healing + re-push, plan idempotence, crash-ordering (stop
+      after every execute step → no live path references a deleted pack →
+      next run converges), GC vs concurrent push (SaveMutable conflict →
+      re-plan inside the merge closure)
+- [x] **Milestone: simulated 30-day history (daily pushes, weekly bumps)
+      converges to ≈ live-set storage; no pack older than TouchAge.**
 
 ### Phase 6: Hardening + release
 
@@ -612,6 +627,44 @@ API gets faked, and only because GitHub gives no other choice locally.
     tests: subprocesses go through `tokio::process`, and every test body
     is wrapped in `tokio::time::timeout` so a future regression fails
     instead of hanging the suite.
+17. **GC integration tests fabricate store paths instead of using a Nix
+    store** (Phase 5). GC operates purely on manifests and pack blobs, so
+    `tests/support/sim.rs` drives the *real* chunker, pack uploads, and
+    SaveMutable commits with synthetic path contents — no nix tooling
+    needed. This keeps the 30-day simulation in the low seconds, makes the
+    tests runnable inside the Nix build sandbox, and gives precise control
+    over content sizes (liveness ratios) and timestamps. Readability
+    assertions still go through the real substituter (narinfo + NAR hash
+    check), so "path is alive" means "Nix could substitute it".
+
+18. **Old manifest versions must be garbage-collected too** (Phase 5
+    addition). Every drain and every GC commit creates a new `m#N` entry;
+    the older versions are dead weight that would accumulate forever (one
+    per CI run). `hestia gc` deletes all but the newest `m#` entry as its
+    final execute step (entries must also be older than the safety age so
+    in-flight readers keep working). The 30-day simulation asserts the
+    manifest entry count stays bounded.
+
+19. **Orphan deletion must be filtered against the committed manifest**
+    (Phase 5 correctness finding). The orphan sweep ("in GitHub but in no
+    manifest, older than 1h") can race with GC's own recovery: when a
+    previous GC run crashed after uploading repack packs but before
+    committing, the next run sees those packs as orphans *and* re-uses them
+    as repack output (CAS: same content, same key). Deleting the planned
+    orphans after the commit would then delete a pack the just-committed
+    manifest references. Fix: orphan keys are re-filtered against the
+    committed manifest inside the commit step. The crash-safety test (stop
+    after every execute step, then recover) covers exactly this sequence.
+
+20. **Eviction and orphan judgments need a minimum-age grace** (Phase 5).
+    A pack missing from the REST listing is normally "evicted by GitHub",
+    and a listed pack absent from the manifest is normally an orphan — but
+    both can also be a concurrent push that has uploaded its pack and not
+    yet committed its manifest (or committed it after GC listed the cache).
+    Packs younger than `min_age` (1h) are therefore never judged evicted or
+    orphaned. Timestamps come from the REST API's RFC 3339 strings; the
+    parser/formatter is hand-rolled in `gha::rest` (no chrono dependency)
+    and the fake backend emits the same format production does.
 
 ## Mistakes Fixed from Earlier Draft
 
