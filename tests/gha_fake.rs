@@ -435,3 +435,51 @@ async fn rest_pagination_with_small_pages() {
     let entries = rest.list_caches("pack-page-").await.unwrap();
     assert_eq!(entries[0].key, "pack-page-0");
 }
+
+#[tokio::test]
+async fn download_lookup_only_consults_restore_keys() {
+    // Fidelity test for a production-API behavior discovered by
+    // tests/gha_real.rs in CI: GetCacheEntryDownloadURL ignores the `key`
+    // field for matching and only prefix-matches `restore_keys`. The
+    // TwirpClient compensates by always sending the key as the first
+    // restore key; this test pins the raw wire behavior of the fake so it
+    // cannot silently drift back to exact-key matching.
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let twirp = fake.twirp(&http);
+
+    store_entry(&twirp, &http, "pack-restore-only", b"data").await;
+
+    // Raw request (bypassing TwirpClient): exact key, no restore keys.
+    let url = format!(
+        "{}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL",
+        fake.base_url
+    );
+    let response: serde_json::Value = http
+        .post(&url)
+        .json(&serde_json::json!({
+            "key": "pack-restore-only",
+            "restore_keys": [],
+            "version": hestia::gha::twirp::CACHE_VERSION,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        response["ok"], false,
+        "key-only lookup must miss, like the real service: {response}"
+    );
+
+    // Through the client (which adds the key as a restore key): hit.
+    let lookup = twirp
+        .get_download_url("pack-restore-only", &[])
+        .await
+        .unwrap();
+    assert!(
+        matches!(lookup, DownloadUrl::Hit { .. }),
+        "client lookup must hit: {lookup:?}"
+    );
+}

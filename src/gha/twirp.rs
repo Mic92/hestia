@@ -240,14 +240,27 @@ impl TwirpClient {
     ///
     /// `restore_keys` are prefix-matched in order; the newest entry matching
     /// a prefix wins (this is how `m#` finds the highest manifest version).
+    ///
+    /// The key itself is always sent as the first restore key: the real
+    /// service ignores the `key` field for matching and only consults
+    /// `restore_keys` (verified against the production API — an exact-key
+    /// request with empty restore keys misses even for entries that exist;
+    /// go-actions-cache sends `RestoreKeys: keys` for the same reason).
     pub async fn get_download_url(
         &self,
         key: &str,
         restore_keys: &[&str],
     ) -> Result<DownloadUrl, Error> {
+        let mut all_restore_keys = vec![key.to_string()];
+        all_restore_keys.extend(
+            restore_keys
+                .iter()
+                .filter(|restore_key| **restore_key != key)
+                .map(|restore_key| restore_key.to_string()),
+        );
         let request = GetCacheEntryDownloadUrlRequest {
             key: key.to_string(),
-            restore_keys: restore_keys.iter().map(|k| k.to_string()).collect(),
+            restore_keys: all_restore_keys,
             version: CACHE_VERSION.to_string(),
         };
         match self

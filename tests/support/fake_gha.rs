@@ -216,23 +216,19 @@ async fn twirp_download_url(State(state): State<AppState>, body: Bytes) -> Respo
     };
     let mut inner = state.inner.lock().unwrap();
 
-    // Exact key match first, then restore keys as prefixes (newest wins).
-    let exact = inner
-        .entries
-        .iter()
-        .find(|e| e.finalized && e.version == request.version && e.key == request.key)
-        .cloned();
-    let matched = exact.or_else(|| {
-        request.restore_keys.iter().find_map(|prefix| {
-            inner
-                .entries
-                .iter()
-                .filter(|e| {
-                    e.finalized && e.version == request.version && e.key.starts_with(prefix)
-                })
-                .max_by_key(|e| e.created_at)
-                .cloned()
-        })
+    // Fidelity note (verified against the production service): only
+    // `restore_keys` are consulted, as ordered prefix matches with the
+    // newest entry winning per prefix. The `key` field alone matches
+    // nothing — a request with empty restore keys always misses, even for
+    // entries that exist. Clients must send the key as a restore key
+    // (go-actions-cache does the same).
+    let matched = request.restore_keys.iter().find_map(|prefix| {
+        inner
+            .entries
+            .iter()
+            .filter(|e| e.finalized && e.version == request.version && e.key.starts_with(prefix))
+            .max_by_key(|e| e.created_at)
+            .cloned()
     });
 
     match matched {
