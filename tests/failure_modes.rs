@@ -366,3 +366,125 @@ async fn daemon_starts_and_drains_over_a_corrupt_manifest() {
         .await
         .expect("test timed out: deadlock or hung server");
 }
+
+// ---------------------------------------------------------------------------
+// Concurrent serve daemons (matrix jobs)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_serve_daemons_merge_without_losing_paths() {
+    // Matrix builds: two jobs run two independent hestia daemons against
+    // the same repository cache and drain at the same time. SaveMutable
+    // conflict handling must merge both manifests; neither job's paths,
+    // packs, or root pins may be lost.
+    let test = async {
+        let Some(store_a) = ScratchStore::create() else {
+            return;
+        };
+        let Some(store_b) = ScratchStore::create() else {
+            return;
+        };
+        let path_a = store_a.add_fixture("matrix-a", 241);
+        let path_b = store_b.add_fixture("matrix-b", 251);
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+
+        let start_daemon = |store: &ScratchStore, label: &str| {
+            let socket: PathBuf = store
+                .db_path()
+                .parent()
+                .unwrap()
+                .join(format!("hook-{label}.sock"));
+            let ctx = context(&fake, &http, store);
+            let daemon = hestia::serve::Daemon::bind(
+                &socket,
+                None,
+                ctx,
+                AccessLog::new(),
+                hestia::substituter::ManifestStore::new(),
+            )
+            .expect("daemon must bind");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::spawn(daemon.run(async {
+                let _ = shutdown_rx.await;
+            }));
+            (socket, shutdown_tx, handle)
+        };
+
+        let (socket_a, shutdown_a, handle_a) = start_daemon(&store_a, "a");
+        let (socket_b, shutdown_b, handle_b) = start_daemon(&store_b, "b");
+
+        // Each job's post-build-hook registers its own path...
+        for (socket, path) in [(&socket_a, &path_a), (&socket_b, &path_b)] {
+            hestia::protocol::roundtrip(
+                socket,
+                &hestia::protocol::Request::Add {
+                    paths: vec![path.to_string_lossy().into_owned()],
+                },
+            )
+            .await
+            .expect("add failed");
+        }
+
+        // ...and both post-steps drain at the same time.
+        let (response_a, response_b) = tokio::join!(
+            hestia::protocol::roundtrip(&socket_a, &hestia::protocol::Request::Drain),
+            hestia::protocol::roundtrip(&socket_b, &hestia::protocol::Request::Drain),
+        );
+        let stats_a = response_a.expect("drain A failed").stats.unwrap();
+        let stats_b = response_b.expect("drain B failed").stats.unwrap();
+        assert_eq!(stats_a.pushed, 1);
+        assert_eq!(stats_b.pushed, 1);
+
+        // One daemon won version 1, the other re-merged onto version 2.
+        let mut versions = [stats_a.manifest_version, stats_b.manifest_version];
+        versions.sort();
+        assert_eq!(versions, [1, 2], "drains must land on distinct versions");
+
+        // Shut both daemons down (their final drains are no-ops).
+        drop(shutdown_a);
+        drop(shutdown_b);
+        handle_a
+            .await
+            .unwrap()
+            .expect("daemon A final drain failed");
+        handle_b
+            .await
+            .unwrap()
+            .expect("daemon B final drain failed");
+
+        // The final manifest holds both jobs' work.
+        let (version, manifest) = committed_manifest(&fake, &http).await.unwrap();
+        assert!(version >= 2);
+        let hash_a = path_hash_of(&path_a);
+        let hash_b = path_hash_of(&path_b);
+        assert!(manifest.paths.contains_key(&hash_a), "path A lost in merge");
+        assert!(manifest.paths.contains_key(&hash_b), "path B lost in merge");
+        assert_eq!(manifest.packs.len(), 2, "both packs referenced");
+
+        // Every chunk of both paths is locatable in a known pack.
+        for entry in manifest.paths.values() {
+            for (_, node) in hestia::chunker::flatten_tree(&entry.tree) {
+                if let hestia::manifest::FileSystemObject::Regular(regular) = node {
+                    for chunk in &regular.contents.chunks {
+                        let location = manifest.chunks.get(chunk).expect("chunk has a location");
+                        assert!(manifest.packs.contains_key(&location.pack));
+                    }
+                }
+            }
+        }
+
+        // The shared root pins both paths (concurrent updates union).
+        let root = &manifest.roots[TEST_ROOT_KEY];
+        assert!(root.paths.contains(&hash_a) && root.paths.contains(&hash_b));
+
+        // Both paths remain substitutable from the merged manifest.
+        let manifest_store = hestia::substituter::ManifestStore::new();
+        manifest_store.set(manifest);
+        assert_eq!(manifest_store.path_count(), 2);
+    };
+    tokio::time::timeout(Duration::from_secs(120), test)
+        .await
+        .expect("test timed out: deadlock or hung server");
+}
