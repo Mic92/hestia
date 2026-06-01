@@ -166,15 +166,6 @@ pub struct CacheList {
     pub actions_caches: Vec<CacheEntry>,
 }
 
-/// Repository cache usage (quota pressure signal for GC).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheUsage {
-    #[serde(default)]
-    pub full_name: String,
-    pub active_caches_count: u64,
-    pub active_caches_size_in_bytes: u64,
-}
-
 #[derive(Debug, Clone)]
 pub struct RestClient {
     http: reqwest::Client,
@@ -270,17 +261,6 @@ impl RestClient {
             }
             page += 1;
         }
-    }
-
-    /// Repository-wide cache usage (quota pressure).
-    pub async fn usage(&self) -> Result<CacheUsage, Error> {
-        let url = format!(
-            "{}/repos/{}/actions/cache/usage",
-            self.api_url.trim_end_matches('/'),
-            self.repo
-        );
-        let response = self.request(reqwest::Method::GET, &url).send().await?;
-        Self::check(&url, response).await
     }
 
     /// Delete all cache entries with exactly this key (across versions/refs).
@@ -380,17 +360,5 @@ mod tests {
         assert_eq!(list.actions_caches[0].key, "pack-abc123");
         assert_eq!(list.actions_caches[0].git_ref, "refs/heads/main");
         assert_eq!(list.actions_caches[0].size_in_bytes, 1024);
-    }
-
-    #[test]
-    fn usage_deserializes_github_response() {
-        let json = r#"{
-            "full_name": "nix-community/hestia",
-            "active_caches_size_in_bytes": 312329,
-            "active_caches_count": 5
-        }"#;
-        let usage: CacheUsage = serde_json::from_str(json).unwrap();
-        assert_eq!(usage.active_caches_count, 5);
-        assert_eq!(usage.active_caches_size_in_bytes, 312329);
     }
 }

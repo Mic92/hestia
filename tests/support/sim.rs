@@ -57,7 +57,6 @@ pub fn test_data(len: usize, seed: u64) -> Bytes {
 pub struct SimPath {
     pub name: String,
     pub files: Vec<(String, Bytes)>,
-    pub references: Vec<StorePath>,
 }
 
 impl SimPath {
@@ -66,14 +65,7 @@ impl SimPath {
         Self {
             name: name.to_string(),
             files: vec![("blob".to_string(), test_data(size, seed))],
-            references: vec![],
         }
-    }
-
-    /// Record a runtime reference to another path (closure edge).
-    pub fn with_reference(mut self, other: &SimPath) -> Self {
-        self.references.push(other.store_path());
-        self
     }
 
     pub fn path_hash(&self) -> PathHash {
@@ -203,7 +195,7 @@ impl SimCache {
                     store_path: path.store_path(),
                     nar_hash,
                     nar_size,
-                    references: path.references.clone(),
+                    references: vec![],
                     ca: None,
                     deriver: None,
                     tree,

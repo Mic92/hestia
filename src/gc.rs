@@ -218,19 +218,6 @@ impl GcPlan {
         self.repack_jobs.iter().map(RepackJob::upload_bytes).sum()
     }
 
-    /// True when executing this plan would perform no cache operation.
-    /// (The manifest may still be committed to record mark-phase clocks.)
-    pub fn is_noop(&self) -> bool {
-        self.evicted_packs.is_empty()
-            && self.heal_paths.is_empty()
-            && self.drop_roots.is_empty()
-            && self.drop_paths.is_empty()
-            && self.touch_packs.is_empty()
-            && self.repack_jobs.is_empty()
-            && self.delete_packs.is_empty()
-            && self.orphan_keys.is_empty()
-    }
-
     /// One-line human summary for logs and `--dry-run`.
     pub fn summary(&self) -> String {
         format!(
@@ -1576,7 +1563,11 @@ mod tests {
             .build();
 
         let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
-        assert!(plan.is_noop(), "{}", plan.summary());
+        let noop = GcPlan {
+            now: NOW,
+            ..GcPlan::default()
+        };
+        assert_eq!(plan, noop, "{}", plan.summary());
     }
 
     // -----------------------------------------------------------------------
@@ -1741,6 +1732,10 @@ mod tests {
         let (committed, _) = apply(manifest, &first, &repacks);
 
         let second = plan(&committed, &observe_all(&committed, NOW), NOW, &policy());
-        assert!(second.is_noop(), "second plan: {}", second.summary());
+        let noop = GcPlan {
+            now: NOW,
+            ..GcPlan::default()
+        };
+        assert_eq!(second, noop, "second plan: {}", second.summary());
     }
 }

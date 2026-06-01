@@ -208,18 +208,3 @@ async fn real_miss_and_restore_key_prefix() {
         let _ = rest.delete_by_key(&format!("{family}#{version}")).await;
     }
 }
-
-#[tokio::test]
-#[ignore = "requires real GHA cache tokens (run in CI)"]
-async fn real_rest_usage() {
-    let http = reqwest::Client::new();
-    let rest = rest_client(&http);
-
-    // Just verify the endpoint answers and the shape parses; actual values
-    // depend on whatever else the repository has cached.
-    let usage = rest.usage().await.unwrap();
-    assert!(
-        !usage.full_name.is_empty(),
-        "usage response missing repository name"
-    );
-}

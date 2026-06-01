@@ -420,29 +420,6 @@ impl Manifest {
             }
         }
     }
-
-    /// Liveness predicate (PLAN.md):
-    ///
-    /// ```text
-    /// live(path) := reachable from any root via references
-    ///            OR now - last_pushed < push_ttl
-    /// ```
-    ///
-    /// `reachable` is passed in so GC computes it once per run.
-    pub fn is_live(
-        &self,
-        path: &PathHash,
-        reachable: &BTreeSet<PathHash>,
-        now: u64,
-        push_ttl_secs: u64,
-    ) -> bool {
-        if reachable.contains(path) {
-            return true;
-        }
-        self.paths
-            .get(path)
-            .is_some_and(|entry| now.saturating_sub(entry.last_pushed) < push_ttl_secs)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -907,36 +884,6 @@ mod tests {
             },
         );
         assert_eq!(manifest.reachable().len(), 2);
-    }
-
-    #[test]
-    fn liveness_is_reachable_or_recently_pushed() {
-        let mut manifest = Manifest::new();
-        manifest
-            .paths
-            .insert(path_hash(1), entry_with_refs(1, vec![], 1000)); // reachable
-        manifest
-            .paths
-            .insert(path_hash(2), entry_with_refs(2, vec![], 1000)); // recently pushed
-        manifest
-            .paths
-            .insert(path_hash(3), entry_with_refs(3, vec![], 10)); // neither
-        manifest.roots.insert(
-            "main".into(),
-            Root {
-                paths: BTreeSet::from([path_hash(1)]),
-                updated: 0,
-            },
-        );
-
-        let reachable = manifest.reachable();
-        let now = 2000;
-        let push_ttl = 1500;
-        assert!(manifest.is_live(&path_hash(1), &reachable, now, push_ttl));
-        assert!(manifest.is_live(&path_hash(2), &reachable, now, push_ttl));
-        assert!(!manifest.is_live(&path_hash(3), &reachable, now, push_ttl));
-        // Unknown path: not live.
-        assert!(!manifest.is_live(&path_hash(42), &reachable, now, push_ttl));
     }
 
     #[test]
