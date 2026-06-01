@@ -437,9 +437,8 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     match result {
         Ok(stats) => {
             eprintln!(
-                "hestia serve: final drain pushed {} path(s), {} pack(s), {} bytes \
-                 (manifest version {})",
-                stats.pushed, stats.packs_uploaded, stats.bytes_uploaded, stats.manifest_version
+                "hestia serve: final drain: {}",
+                crate::drain::summarize(&stats)
             );
             ExitCode::SUCCESS
         }

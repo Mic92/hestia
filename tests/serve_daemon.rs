@@ -455,7 +455,7 @@ async fn drain_cli_binary_reports_stats_and_exits_zero() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("1 path(s) pushed"),
+        stderr.contains("pushed 1 path ("),
         "summary must mention the pushed path, got: {stderr}"
     );
 
