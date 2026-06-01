@@ -73,10 +73,13 @@ struct ManifestView {
     /// NAR hash → manifest path key, for `/nar/{narhash}.nar` requests that
     /// arrive without the `?hash=` parameter.
     by_nar_hash: BTreeMap<Hash32, PathHash>,
+    /// SaveMutable index this manifest was loaded from / committed as
+    /// (0 = unknown or no manifest yet).
+    version: u64,
 }
 
 impl ManifestView {
-    fn new(manifest: Manifest) -> Self {
+    fn new(manifest: Manifest, version: u64) -> Self {
         let by_nar_hash = manifest
             .paths
             .iter()
@@ -85,6 +88,7 @@ impl ManifestView {
         Self {
             manifest,
             by_nar_hash,
+            version,
         }
     }
 }
@@ -103,10 +107,24 @@ impl ManifestStore {
         Self::default()
     }
 
-    /// Replace the served manifest.
+    /// Replace the served manifest (version unknown).
     pub fn set(&self, manifest: Manifest) {
+        self.set_version(manifest, 0);
+    }
+
+    /// Replace the served manifest, recording the SaveMutable index it came
+    /// from. The version is what the pipeline uses for read-your-writes
+    /// (PLAN.md Decision 28): it merges this manifest into every commit
+    /// base and never reserves an index at or below it.
+    pub fn set_version(&self, manifest: Manifest, version: u64) {
         *self.inner.write().expect("manifest lock poisoned") =
-            Arc::new(ManifestView::new(manifest));
+            Arc::new(ManifestView::new(manifest, version));
+    }
+
+    /// The served manifest and its version (clone; manifests are small).
+    pub fn versioned(&self) -> (u64, Manifest) {
+        let view = self.view();
+        (view.version, view.manifest.clone())
     }
 
     fn view(&self) -> Arc<ManifestView> {

@@ -26,6 +26,7 @@ use crate::gha::{Error as GhaError, blob};
 use crate::manifest::{Manifest, PackInfo, PathEntry, PathHash, Root};
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
+use crate::substituter::ManifestStore;
 use crate::upstream::UpstreamFilter;
 
 /// SaveMutable family prefix for the manifest ("m" → keys `m#1`, `m#2`, …).
@@ -190,6 +191,14 @@ pub struct PipelineContext {
     /// SaveMutable family prefix (always [`MANIFEST_PREFIX`] in production;
     /// tests use distinct prefixes to isolate scenarios).
     pub manifest_prefix: String,
+    /// Where committed manifests are published for the substituter.
+    ///
+    /// Read-your-writes: the cache service's lookups are eventually
+    /// consistent (PLAN.md Decision 28), so re-loading the manifest right
+    /// after a commit can return a stale version that misses the paths
+    /// this very drain just pushed. Publishing the committed manifest
+    /// directly guarantees the substituter can serve them immediately.
+    pub publish: Option<ManifestStore>,
 }
 
 /// One new path, fully prepared for upload.
@@ -209,9 +218,15 @@ impl PipelineContext {
     /// Load the current manifest, or an empty one if none exists yet or
     /// the stored blob is corrupt (see [`decode_manifest_or_empty`]).
     pub async fn load_manifest(&self) -> Result<Manifest, Error> {
+        Ok(self.load_manifest_versioned().await?.1)
+    }
+
+    /// Like [`Self::load_manifest`], but also returns the SaveMutable index
+    /// the manifest was loaded from (0 when none exists yet).
+    pub async fn load_manifest_versioned(&self) -> Result<(u64, Manifest), Error> {
         match self.save_mutable().load().await? {
-            Some(entry) => Ok(decode_manifest_or_empty(&entry.data)),
-            None => Ok(Manifest::new()),
+            Some(entry) => Ok((entry.index, decode_manifest_or_empty(&entry.data))),
+            None => Ok((0, Manifest::new())),
         }
     }
 
@@ -236,6 +251,16 @@ impl PipelineContext {
         }
 
         let current = self.load_manifest().await?;
+
+        // Read-your-writes (PLAN.md Decision 28): cache lookups may lag
+        // behind this daemon's own commits, so fold in the manifest we are
+        // currently serving (it is at least as new as anything we wrote)
+        // and remember its version as the reservation floor.
+        let (known_version, known) = match &self.publish {
+            Some(store) => store.versioned(),
+            None => (0, Manifest::new()),
+        };
+        let current = current.merge(known.clone());
 
         // ---- query the store database (blocking sqlite I/O) -----------------
         let store = self.store.clone();
@@ -391,22 +416,34 @@ impl PipelineContext {
         );
 
         // ---- commit (re-merge on conflict) ------------------------------------
+        // The merge closure keeps the manifest it encoded so the committed
+        // version can be published without re-loading it from the cache.
+        let mut committed: Option<Manifest> = None;
         let version = self
             .save_mutable()
-            .save(|existing| {
+            .save_with_floor(known_version, |existing| {
                 // A corrupt base manifest is replaced, not merged with: the
                 // commit must not fail because of it (never crash CI).
                 let base = match existing {
                     Some(entry) => decode_manifest_or_empty(&entry.data),
                     None => Manifest::new(),
                 };
-                let merged = base.merge(delta.clone());
-                merged
+                // `known` covers the gap when `existing` is a stale read.
+                let merged = base.merge(known.clone()).merge(delta.clone());
+                let encoded = merged
                     .encode()
-                    .map_err(|err| GhaError::InvalidResponse(err.to_string()))
+                    .map_err(|err| GhaError::InvalidResponse(err.to_string()))?;
+                committed = Some(merged);
+                Ok(encoded)
             })
             .await?;
         stats.manifest_version = version;
+
+        // Publish exactly what was committed (includes concurrent writers'
+        // paths, since the merge ran against the latest visible version).
+        if let (Some(store), Some(manifest)) = (&self.publish, committed) {
+            store.set_version(manifest, version);
+        }
 
         Ok(stats)
     }

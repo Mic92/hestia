@@ -169,13 +169,27 @@ impl<'a> SaveMutable<'a> {
     /// contents. It may be called multiple times: every conflict with a
     /// concurrent writer triggers a re-load and re-merge so no writer's
     /// changes get lost. Returns the index of the newly written version.
-    pub async fn save<F>(&self, mut merge: F) -> Result<u64, Error>
+    pub async fn save<F>(&self, merge: F) -> Result<u64, Error>
+    where
+        F: FnMut(Option<&MutableEntry>) -> Result<Vec<u8>, Error>,
+    {
+        self.save_with_floor(0, merge).await
+    }
+
+    /// Like [`Self::save`], but never reserves an index at or below `floor`.
+    ///
+    /// Callers that know a version `floor` exists (because they committed
+    /// it themselves) pass it here so that an eventually-consistent load
+    /// (PLAN.md Decision 28) — which may still return an older version —
+    /// does not make the writer reserve an index that is already taken and
+    /// spin in the conflict loop until the lookup catches up.
+    pub async fn save_with_floor<F>(&self, floor: u64, mut merge: F) -> Result<u64, Error>
     where
         F: FnMut(Option<&MutableEntry>) -> Result<Vec<u8>, Error>,
     {
         let mut attempts: u32 = 0;
         // Indexes at or below this are blocked by (presumably crashed) writers.
-        let mut skip_through: u64 = 0;
+        let mut skip_through: u64 = floor;
         let mut last_conflict: Option<u64> = None;
         let mut conflict_streak: u32 = 0;
 

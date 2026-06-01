@@ -20,6 +20,9 @@
 //!   every later one gets HTTP 401 (expired `ACTIONS_RUNTIME_TOKEN`).
 //! * `POST /test/fail-blob-reads/{n}`: the next `n` blob downloads get their
 //!   connection dropped mid-body (Azure timeout / connection reset).
+//! * `POST /test/stale-lookups/{0|1}`: download lookups hide the newest
+//!   matching entry (eventual consistency: a just-finalized entry is not
+//!   visible yet).
 //! * `POST /test/exhaust-quota-after/{n}`: the next `n` CreateCacheEntry
 //!   calls succeed, every later one gets a `resource_exhausted` Twirp error
 //!   (the 10 GB repository cache quota is full).
@@ -81,6 +84,9 @@ struct Inner {
     creates_until_quota: Option<u64>,
     /// Number of upcoming blob GETs whose connection gets dropped mid-body.
     blob_read_failures: u64,
+    /// When set, download lookups pretend the newest matching entry does
+    /// not exist yet (simulates the real service's eventual consistency).
+    stale_lookups: bool,
 }
 
 impl Inner {
@@ -223,12 +229,16 @@ async fn twirp_download_url(State(state): State<AppState>, body: Bytes) -> Respo
     // entries that exist. Clients must send the key as a restore key
     // (go-actions-cache does the same).
     let matched = request.restore_keys.iter().find_map(|prefix| {
-        inner
+        let mut matching: Vec<&Entry> = inner
             .entries
             .iter()
             .filter(|e| e.finalized && e.version == request.version && e.key.starts_with(prefix))
-            .max_by_key(|e| e.created_at)
-            .cloned()
+            .collect();
+        matching.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+        // Eventual-consistency injection: the newest entry is not visible
+        // yet, so the lookup returns the previous one (or misses).
+        let skip = usize::from(inner.stale_lookups);
+        matching.get(skip).copied().cloned()
     });
 
     match matched {
@@ -518,6 +528,11 @@ async fn test_fail_blob_reads(State(state): State<AppState>, Path(reads): Path<u
     Json(json!({ "blob_read_failures": reads })).into_response()
 }
 
+async fn test_stale_lookups(State(state): State<AppState>, Path(on): Path<u8>) -> Response {
+    state.inner.lock().unwrap().stale_lookups = on != 0;
+    Json(json!({ "stale_lookups": on != 0 })).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Server wiring
 // ---------------------------------------------------------------------------
@@ -553,6 +568,7 @@ impl FakeGha {
             twirp_calls_until_401: None,
             creates_until_quota: None,
             blob_read_failures: 0,
+            stale_lookups: false,
         }));
         let state = AppState {
             inner: Arc::clone(&inner),
@@ -578,6 +594,7 @@ impl FakeGha {
                 post(test_exhaust_quota_after),
             )
             .route("/test/fail-blob-reads/{reads}", post(test_fail_blob_reads))
+            .route("/test/stale-lookups/{on}", post(test_stale_lookups))
             .with_state(state);
 
         let task = tokio::spawn(async move {
@@ -661,6 +678,15 @@ impl FakeGha {
             .send()
             .await
             .expect("fail-blob-reads request");
+        assert!(response.status().is_success());
+    }
+
+    /// Toggle eventual-consistency simulation: while on, download lookups
+    /// hide the newest matching entry (a just-finalized entry is "not
+    /// visible yet").
+    pub async fn set_stale_lookups(&self, http: &reqwest::Client, on: bool) {
+        let url = format!("{}/test/stale-lookups/{}", self.base_url, u8::from(on));
+        let response = http.post(&url).send().await.expect("stale-lookups request");
         assert!(response.status().is_success());
     }
 }
