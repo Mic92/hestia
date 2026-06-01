@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: NixOS/nix-installer-action@main
       - name: Check formatting
         run: nix fmt -- --ci
       - name: Clippy
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: NixOS/nix-installer-action@main
       - name: Run tests
         run: nix develop -c cargo test
 
@@ -43,7 +43,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: NixOS/nix-installer-action@main
       - uses: ./action
       - name: Assert cache tokens are visible to shell steps
         run: |
@@ -86,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: NixOS/nix-installer-action@main
       # Capture ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL for the daemon.
       - uses: ./action
       - name: Build hestia
