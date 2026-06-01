@@ -43,6 +43,25 @@ inputs:
       (chunking, pack upload, manifest commit).
     required: false
     default: "300"
+  upstream-cache-filter:
+    description: >
+      Skip paths signed by an upstream cache (cache.nixos.org by default)
+      instead of caching them. Saves GHA cache quota for projects with big
+      nixpkgs closures.
+    required: false
+    default: "false"
+  upstream-cache-key-names:
+    description: >
+      Space-separated signing key names treated as upstream caches by
+      `upstream-cache-filter`.
+    required: false
+    default: ""
+  no-closure:
+    description: >
+      Cache built paths only, without their runtime closure (dependencies
+      stay on upstream caches).
+    required: false
+    default: "false"
 
 # If neither `binary` nor `version` is set, the action only captures and
 # exports the cache tokens (ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL).
