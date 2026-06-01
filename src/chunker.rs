@@ -170,15 +170,6 @@ impl PackBuilder {
         self.chunks.is_empty()
     }
 
-    /// Current compressed size of the pack under construction.
-    pub fn size(&self) -> u64 {
-        self.buffer.len() as u64
-    }
-
-    pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
-    }
-
     /// Finalize: the pack hash is the SHA-256 of the complete blob, which
     /// makes packs content-addressed (`pack-{hash}` cache keys).
     pub fn finish(self) -> Pack {

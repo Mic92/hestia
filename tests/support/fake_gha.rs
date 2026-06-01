@@ -8,7 +8,7 @@
 //!   GetCacheEntryDownloadURL, with real reservation semantics
 //!   (`already_exists` blocks reserved-but-unfinalized keys too).
 //! * Azure blob: PUT BlockBlob / GET with Range, gated on signed URLs.
-//! * GitHub REST: list (prefix + pagination) / usage / delete by key.
+//! * GitHub REST: list (prefix + pagination) / delete by key.
 //!
 //! Test-only injection endpoints simulate the failure modes GitHub will
 //! throw at us in production:
@@ -461,17 +461,6 @@ async fn rest_list(State(state): State<AppState>, Query(query): Query<ListQuery>
     .into_response()
 }
 
-async fn rest_usage(State(state): State<AppState>) -> Response {
-    let inner = state.inner.lock().unwrap();
-    let finalized: Vec<&Entry> = inner.entries.iter().filter(|e| e.finalized).collect();
-    Json(json!({
-        "full_name": "fake/repo",
-        "active_caches_count": finalized.len(),
-        "active_caches_size_in_bytes": finalized.iter().map(|e| e.size).sum::<u64>(),
-    }))
-    .into_response()
-}
-
 async fn rest_delete(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
     let mut inner = state.inner.lock().unwrap();
     let removed = inner.remove_by_key(&query.key);
@@ -582,7 +571,6 @@ impl FakeGha {
                 "/repos/{owner}/{repo}/actions/caches",
                 get(rest_list).delete(rest_delete),
             )
-            .route("/repos/{owner}/{repo}/actions/cache/usage", get(rest_usage))
             .route("/test/evict/{key}", post(test_evict))
             .route("/test/expire-urls", post(test_expire_urls))
             .route(

@@ -289,7 +289,7 @@ async fn narinfo_miss_is_404() {
             .await;
         assert_eq!(response.status(), 404);
         // Misses are not liveness signals.
-        assert!(substituter.access_log.is_empty());
+        assert!(substituter.access_log.snapshot().is_empty());
 
         // Malformed requests are 404 too (never 500).
         for path in ["zzz.narinfo", "x", "nar/zzz.nar", "nar/x"] {

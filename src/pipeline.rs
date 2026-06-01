@@ -82,13 +82,6 @@ impl AccessLog {
     pub fn snapshot(&self) -> BTreeSet<PathHash> {
         self.inner.lock().expect("access log lock poisoned").clone()
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("access log lock poisoned")
-            .is_empty()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,14 +468,13 @@ mod tests {
     fn access_log_is_shared_between_clones() {
         let log = AccessLog::new();
         let clone = log.clone();
-        assert!(log.is_empty());
+        assert!(log.snapshot().is_empty());
 
         let hash: PathHash = "00000000000000000000000000000000"
             .parse()
             .expect("valid path hash");
         clone.record(hash);
 
-        assert!(!log.is_empty());
         assert_eq!(log.snapshot(), BTreeSet::from([hash]));
         // Recording the same hash twice is idempotent.
         log.record(hash);

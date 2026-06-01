@@ -326,7 +326,7 @@ async fn savemutable_conflict_gives_up_eventually() {
 }
 
 #[tokio::test]
-async fn rest_list_pagination_usage_and_delete() {
+async fn rest_list_pagination_and_delete() {
     let fake = FakeGha::start().await;
     let http = reqwest::Client::new();
     let twirp = fake.twirp(&http);
@@ -347,11 +347,6 @@ async fn rest_list_pagination_usage_and_delete() {
 
     let everything = rest.list_caches("").await.unwrap();
     assert_eq!(everything.len(), 6);
-
-    // Usage reflects all finalized entries.
-    let usage = rest.usage().await.unwrap();
-    assert_eq!(usage.active_caches_count, 6);
-    assert_eq!(usage.active_caches_size_in_bytes, 5 * 100 + 8);
 
     // Delete one pack; it disappears from list and Twirp lookups.
     let deleted = rest.delete_by_key("pack-03").await.unwrap();
