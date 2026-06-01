@@ -16,6 +16,16 @@
 //! crashes between reserve and finalize would deadlock the sequence. After
 //! `stale_skip_after` consecutive conflicts on the same index the writer
 //! assumes a crashed peer and skips over that index.
+//!
+//! Consistency model (verified against the real service, PLAN.md Decision
+//! 28): **reservations are strongly consistent** (two writers can never both
+//! reserve the same key) but **lookups are eventually consistent** (a
+//! just-finalized entry may not be returned by load() for a while). The
+//! conflict-retry loop therefore re-loads until it sees the version that
+//! blocked it; the stale-skip window must be comfortably larger than the
+//! observed propagation lag, otherwise lag would be misdiagnosed as a
+//! crashed writer and the lagging version's changes dropped (benign for a
+//! lossy cache — those paths get rebuilt — but wasteful).
 
 use std::time::Duration;
 
@@ -82,9 +92,12 @@ impl<'a> SaveMutable<'a> {
             twirp,
             http,
             prefix: prefix.into(),
-            retry_delay: Duration::from_secs(2),
+            retry_delay: Duration::from_secs(3),
             max_attempts: 60,
-            stale_skip_after: 5,
+            // 20 conflicts x 3s = 60s before an index is judged abandoned:
+            // far above the lookup propagation lag observed in CI, so a
+            // finalized-but-not-yet-visible version is never skipped over.
+            stale_skip_after: 20,
         }
     }
 

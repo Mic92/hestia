@@ -760,6 +760,21 @@ continues from / interleaves with the Open Questions section above.
     installs Determinate Nix by default); the NixOS-org fork tracks
     upstream. It publishes no version tags yet, so it is pinned `@main`.
 
+28. **The real cache service is eventually consistent for lookups**
+    (Phase 6, real-API finding; surfaced as flaky token-probe runs).
+    GetCacheEntryDownloadURL may not return a just-finalized entry, and a
+    prefix lookup may return version N-1 shortly after N was committed.
+    Reservations (CreateCacheEntry) are strongly consistent — conflicts are
+    always detected. Consequences: (a) the real-API tests poll
+    read-after-write assertions instead of asserting immediately; (b)
+    SaveMutable's stale-skip window was widened to 60s (20 × 3s) so
+    propagation lag is never misdiagnosed as a crashed writer; (c)
+    everything else already tolerates lag by design — a stale read is a
+    cache miss (rebuild), never corruption, and packs referenced by a
+    manifest are always uploaded *before* the manifest commit. The fake
+    backend stays strongly consistent on purpose: simulating lag everywhere
+    would buy little coverage at a high test-complexity cost.
+
 ## Mistakes Fixed from Earlier Draft
 
 | Was | Now | Why |
