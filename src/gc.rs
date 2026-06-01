@@ -188,8 +188,10 @@ pub struct GcPlan {
     /// Manifest packs that become garbage once the commit lands
     /// (fully dead packs + repack sources).
     pub delete_packs: Vec<PackHash>,
-    /// Cache keys present in GitHub but referenced by no manifest, old
-    /// enough to be sure no in-flight push still wants them.
+    /// Cache keys of hestia packs (`pack-<sha256>`) present in GitHub but
+    /// referenced by no manifest, old enough to be sure no in-flight push
+    /// still wants them. Keys that merely share the `pack-` prefix belong
+    /// to other workflows and are never touched.
     pub orphan_keys: Vec<String>,
 }
 
@@ -481,11 +483,16 @@ pub fn plan(
     plan.orphan_keys = observations
         .iter()
         .filter(|observation| {
-            let unreferenced = match observation.pack {
-                Some(pack) => !manifest.packs.contains_key(&pack),
-                None => true, // not a hestia pack key shape
+            // Only keys hestia itself creates (pack-<64 hex>) can be hestia
+            // orphans. The REST listing is prefix-based and ignores the cache
+            // version namespace, so entries created by other workflows (e.g.
+            // actions/cache with a "pack-..." key) show up here too -- those
+            // are not ours to delete.
+            let Some(pack) = observation.pack else {
+                return false;
             };
-            unreferenced && now.saturating_sub(observation.created) > policy.min_age
+            !manifest.packs.contains_key(&pack)
+                && now.saturating_sub(observation.created) > policy.min_age
         })
         .map(|observation| observation.key.clone())
         .collect();
@@ -1559,7 +1566,7 @@ mod tests {
             created: NOW - 60,
             last_accessed: NOW,
         });
-        // A key that merely shares the prefix → orphan once old.
+        // A key that merely shares the prefix → foreign entry, never touched.
         observations.push(PackObservation {
             key: "pack-not-a-hash".to_string(),
             pack: None,
@@ -1568,9 +1575,37 @@ mod tests {
         });
 
         let plan = plan(&manifest, &observations, NOW, &policy());
-        assert_eq!(
-            plan.orphan_keys,
-            vec![pack_cache_key(&pack_hash(9)), "pack-not-a-hash".to_string()]
+        assert_eq!(plan.orphan_keys, vec![pack_cache_key(&pack_hash(9))]);
+    }
+
+    #[test]
+    fn foreign_keys_sharing_the_pack_prefix_are_never_orphans() {
+        // Other workflows in the same repository may use actions/cache with
+        // keys that happen to start with "pack-" (e.g. "pack-deps-v1"). The
+        // REST listing is prefix-based and ignores the cache version
+        // namespace, so those entries show up in GC's observations -- but
+        // they are not hestia's to delete. Hestia itself only ever creates
+        // pack-<64 hex> keys, so anything else is foreign by definition.
+        let manifest = ManifestBuilder::new()
+            .pack(1, TIER_VOLATILE, NOW - SECS_PER_DAY)
+            .chunk(1, 1, 100, 0)
+            .path(1, &[1], &[], NOW, NOW)
+            .root("main", &[1], NOW)
+            .build();
+
+        let mut observations = observe_all(&manifest, NOW);
+        observations.push(PackObservation {
+            key: "pack-deps-v1-linux".to_string(),
+            pack: None,
+            created: NOW - 30 * SECS_PER_DAY,
+            last_accessed: NOW - 30 * SECS_PER_DAY,
+        });
+
+        let plan = plan(&manifest, &observations, NOW, &policy());
+        assert!(
+            plan.orphan_keys.is_empty(),
+            "foreign cache entries must never be deleted: {:?}",
+            plan.orphan_keys
         );
     }
 
