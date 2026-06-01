@@ -9,40 +9,13 @@ permissions:
   contents: read
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: NixOS/nix-installer-action@main
-      - name: Check formatting
-        run: nix fmt -- --ci
-      - name: Clippy
-        run: nix develop -c cargo clippy --all-targets -- -D warnings
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: NixOS/nix-installer-action@main
-      - name: Run tests
-        run: nix develop -c cargo test
-
-  # Build the hestia package. This is also the dogfooding job (Phase 4
-  # milestone): when the repository variables below are set, the package
-  # build runs through hestia itself — cache miss -> local build -> the
-  # post-build-hook pushes it; cache hit -> the build step is a pure
-  # substitution out of the GHA cache. Cache breakage then shows up as a
-  # slow or failing regular CI job, which is the strongest possible signal.
+  # Formatting, clippy, tests, and the package build, all as flake checks.
   #
-  # lint/test are NOT wrapped: they run cargo inside nix develop, and the
-  # devshell closure is upstream-signed (cache.nixos.org) which hestia
-  # deliberately skips. The package derivation built here (plus its vendor
-  # deps) is the only locally-built output of this CI.
-  #
-  # The daemon is bootstrapped from a *released* hestia binary, because this
-  # job cannot use the package it is about to build. Required repository
-  # variables (unset = the dogfood step is skipped instantly and the build
-  # runs without caching):
+  # Also the dogfood job: with the repository variables below set, these
+  # derivations are cached through hestia itself, so cache breakage shows
+  # up as slow or failing CI. The daemon is bootstrapped from a released
+  # binary (this job cannot use the package it is about to build); with
+  # the variables unset the dogfood step is skipped.
   #   HESTIA_DOGFOOD          "true"
   #   HESTIA_DOGFOOD_VERSION  release tag, e.g. "v0.1.0-alpha.1"
   #   HESTIA_DOGFOOD_SHA256   sha256 of that release's hestia-x86_64-linux
@@ -61,8 +34,8 @@ jobs:
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
           sha256: ${{ vars.HESTIA_DOGFOOD_SHA256 }}
-      - name: Build the hestia package
-        run: nix build .# --print-build-logs
+      - name: Run flake checks
+        run: nix flake check --print-build-logs
       - name: Show daemon log
         if: ${{ always() && vars.HESTIA_DOGFOOD == 'true' }}
         run: cat "$HESTIA_SERVE_LOG"
