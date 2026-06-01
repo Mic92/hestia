@@ -149,16 +149,12 @@ impl TwirpClient {
         Ok(Self::new(http, url, token))
     }
 
-    fn rpc_url(&self, method: &str) -> String {
-        rpc_url(&self.base_url, method)
-    }
-
     async fn call<Req, Resp>(&self, method: &str, request: &Req) -> Result<Resp, Error>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let url = self.rpc_url(method);
+        let url = rpc_url(&self.base_url, method);
         let response = self
             .http
             .post(&url)
@@ -251,16 +247,12 @@ impl TwirpClient {
         key: &str,
         restore_keys: &[&str],
     ) -> Result<DownloadUrl, Error> {
-        let mut all_restore_keys = vec![key.to_string()];
-        all_restore_keys.extend(
-            restore_keys
-                .iter()
-                .filter(|restore_key| **restore_key != key)
-                .map(|restore_key| restore_key.to_string()),
-        );
         let request = GetCacheEntryDownloadUrlRequest {
             key: key.to_string(),
-            restore_keys: all_restore_keys,
+            restore_keys: std::iter::once(key)
+                .chain(restore_keys.iter().copied().filter(|&k| k != key))
+                .map(String::from)
+                .collect(),
             version: CACHE_VERSION.to_string(),
         };
         match self

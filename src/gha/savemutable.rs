@@ -114,21 +114,9 @@ impl<'a> SaveMutable<'a> {
         self
     }
 
-    fn key_for(&self, index: u64) -> String {
-        key_for(&self.prefix, index)
-    }
-
-    fn search_prefix(&self) -> String {
-        search_prefix(&self.prefix)
-    }
-
-    fn parse_index(&self, key: &str) -> Result<u64, Error> {
-        parse_index(&self.prefix, key)
-    }
-
     /// Load the newest entry of this family, or `None` if there is none yet.
     pub async fn load(&self) -> Result<Option<MutableEntry>, Error> {
-        let prefix = self.search_prefix();
+        let prefix = search_prefix(&self.prefix);
         let lookup = self
             .twirp
             .get_download_url(&prefix, &[prefix.as_str()])
@@ -137,20 +125,16 @@ impl<'a> SaveMutable<'a> {
             DownloadUrl::Miss => return Ok(None),
             DownloadUrl::Hit { url, matched_key } => (url, matched_key),
         };
-        let index = self.parse_index(&matched_key)?;
+        let index = parse_index(&self.prefix, &matched_key)?;
 
         // The signed URL was just issued, but refresh anyway if it raced
         // with an expiry.
         let twirp = self.twirp;
-        let prefix_clone = prefix.clone();
         let data = blob::get_with_refresh(self.http, &url, None, async move || {
-            match twirp
-                .get_download_url(&prefix_clone, &[prefix_clone.as_str()])
-                .await?
-            {
+            match twirp.get_download_url(&prefix, &[prefix.as_str()]).await? {
                 DownloadUrl::Hit { url, .. } => Ok(url),
                 DownloadUrl::Miss => Err(Error::InvalidResponse(format!(
-                    "entry {prefix_clone:?} disappeared while downloading"
+                    "entry {prefix:?} disappeared while downloading"
                 ))),
             }
         })
@@ -199,7 +183,7 @@ impl<'a> SaveMutable<'a> {
 
             let base = current.as_ref().map(|entry| entry.index).unwrap_or(0);
             let index = base.max(skip_through) + 1;
-            let key = self.key_for(index);
+            let key = key_for(&self.prefix, index);
 
             match self.twirp.create_cache_entry(&key).await? {
                 Reservation::Created { upload_url } => {
