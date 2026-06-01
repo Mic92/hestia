@@ -12,6 +12,6 @@ async fn main() -> ExitCode {
         Command::Serve(args) => serve::run(&args).await,
         Command::Hook(args) => hook::run(&args).await,
         Command::Drain(args) => drain::run(&args).await,
-        Command::Gc(args) => gc::run(&args),
+        Command::Gc(args) => gc::run(&args).await,
     }
 }
