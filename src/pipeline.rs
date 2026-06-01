@@ -117,6 +117,28 @@ pub fn now_unix() -> u64 {
         .as_secs()
 }
 
+/// Decode a stored manifest blob, falling back to an empty manifest when
+/// the blob is corrupt (truncated upload, garbage data, eviction race).
+///
+/// A corrupt manifest must never make the daemon fail: every drain and
+/// every substituter lookup goes through it, so failing here would break
+/// caching for the repository until someone deletes the entry by hand.
+/// Starting from an empty manifest instead means cache misses (paths get
+/// rebuilt and re-pushed) and the next commit overwrites the corrupt
+/// version — self-healing, never CI-breaking.
+pub fn decode_manifest_or_empty(data: &[u8]) -> Manifest {
+    match Manifest::decode(data) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            eprintln!(
+                "hestia: stored manifest is corrupt ({err}); starting from an empty manifest \
+                 (previously cached paths will be rebuilt and re-pushed)"
+            );
+            Manifest::new()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pack upload (shared by the write pipeline and GC repack)
 // ---------------------------------------------------------------------------
@@ -184,10 +206,11 @@ impl PipelineContext {
         SaveMutable::new(&self.twirp, &self.http, &self.manifest_prefix)
     }
 
-    /// Load the current manifest, or an empty one if none exists yet.
+    /// Load the current manifest, or an empty one if none exists yet or
+    /// the stored blob is corrupt (see [`decode_manifest_or_empty`]).
     pub async fn load_manifest(&self) -> Result<Manifest, Error> {
         match self.save_mutable().load().await? {
-            Some(entry) => Ok(Manifest::decode(&entry.data)?),
+            Some(entry) => Ok(decode_manifest_or_empty(&entry.data)),
             None => Ok(Manifest::new()),
         }
     }
@@ -371,9 +394,10 @@ impl PipelineContext {
         let version = self
             .save_mutable()
             .save(|existing| {
+                // A corrupt base manifest is replaced, not merged with: the
+                // commit must not fail because of it (never crash CI).
                 let base = match existing {
-                    Some(entry) => Manifest::decode(&entry.data)
-                        .map_err(|err| GhaError::InvalidResponse(err.to_string()))?,
+                    Some(entry) => decode_manifest_or_empty(&entry.data),
                     None => Manifest::new(),
                 };
                 let merged = base.merge(delta.clone());
