@@ -61,15 +61,15 @@ serde_json = "1"
 #                                    database reads (harmonia-store-db),
 #                                    which works without a running daemon
 #   harmonia-utils-base-encoding -> nothing needs raw base32 yet
-harmonia-file-core = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
-harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
-harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
-harmonia-store-nar-info = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
-harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
-harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
-harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
-harmonia-utils-io = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
-harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-file-core = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-store-nar-info = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-utils-io = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
 
 [dev-dependencies]
 # Property-based tests for manifest merge laws
