@@ -171,10 +171,30 @@ function restartNixDaemon() {
   }
 }
 
+/**
+ * Extra `hestia serve` flags from optional inputs. Only emitted when set,
+ * so older release binaries (which lack these flags) keep working with the
+ * default inputs.
+ */
+function serveFlags() {
+  const flags = [];
+  if (getInput('upstream-cache-filter') === 'true') {
+    flags.push('--upstream-cache-filter');
+  }
+  for (const name of getInput('upstream-cache-key-names').split(/\s+/).filter(Boolean)) {
+    flags.push('--upstream-cache-key-name', name);
+  }
+  if (getInput('no-closure') === 'true') {
+    flags.push('--no-closure');
+  }
+  return flags;
+}
+
 /** Start `hestia serve` detached so it outlives this action step. */
 function startDaemon(hestiaBin, listen, socket, logFile) {
   const log = fs.openSync(logFile, 'a');
-  const daemon = spawn(hestiaBin, ['serve', '--listen', listen, '--socket', socket], {
+  const args = ['serve', '--listen', listen, '--socket', socket, ...serveFlags()];
+  const daemon = spawn(hestiaBin, args, {
     detached: true,
     stdio: ['ignore', log, log],
     env: process.env, // carries ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL
