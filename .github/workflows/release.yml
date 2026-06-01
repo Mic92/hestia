@@ -62,9 +62,36 @@ jobs:
           case "$tag" in
             *-*) prerelease=(--prerelease) ;;
           esac
+
+          # Release notes: usage snippet with the real sha256 values, so the
+          # release is copy-paste usable; --generate-notes appends the
+          # auto-generated changelog below it.
+          sha256_x86_64=$(cut -d' ' -f1 hestia-x86_64-linux.sha256)
+          sha256_aarch64=$(cut -d' ' -f1 hestia-aarch64-linux.sha256)
+          cat > notes.md <<EOF
+          > ⚠️ **Alpha software**: APIs, cache format, and behavior may change without notice.
+
+          ## Usage
+
+          \`\`\`yaml
+          - uses: Mic92/hestia/action@${tag}
+            with:
+              version: ${tag}
+              sha256: ${sha256_x86_64}   # x86_64-linux
+          \`\`\`
+
+          ## Checksums (SHA-256)
+
+          | Asset | Digest |
+          |---|---|
+          | hestia-x86_64-linux | \`${sha256_x86_64}\` |
+          | hestia-aarch64-linux | \`${sha256_aarch64}\` |
+          EOF
+
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$tag" \
+            --notes-file notes.md \
             --generate-notes \
             "${prerelease[@]}" \
             hestia-*
