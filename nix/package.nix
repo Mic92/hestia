@@ -7,7 +7,8 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "hestia";
-  version = "0.1.0-alpha.2";
+  # Single source of truth for the version; crane.nix reads it implicitly.
+  version = (lib.importTOML ../Cargo.toml).package.version;
 
   src = lib.fileset.toSource {
     root = ../.;
