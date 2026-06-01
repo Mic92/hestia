@@ -31,6 +31,11 @@ rustPlatform.buildRustPackage {
   # sandbox has none, so point it at the nixpkgs CA bundle for the tests.
   env.SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
 
+  # The release artifact only needs to link; the full test suite already
+  # gates every merge in CI. Running it again here doubles build time and
+  # peak memory, which OOM-kills the 16 GB GitHub arm64 runners.
+  doCheck = false;
+
   meta = {
     description = "Nix binary cache backed by the GitHub Actions cache (v2 API)";
     homepage = "https://github.com/Mic92/hestia";
