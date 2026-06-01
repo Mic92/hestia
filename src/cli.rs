@@ -89,12 +89,20 @@ pub struct GcArgs {
     pub dry_run: bool,
 
     /// Grace period in days before unreachable paths become garbage.
-    #[arg(long, value_name = "DAYS", default_value_t = 7)]
+    #[arg(long, value_name = "DAYS", default_value_t = 3)]
     pub grace: u64,
 
+    /// Paths pushed within this many days are kept even when unreachable.
+    #[arg(long, value_name = "DAYS", default_value_t = 14)]
+    pub push_ttl: u64,
+
     /// Roots not updated for this many days are dropped.
-    #[arg(long, value_name = "DAYS", default_value_t = 30)]
+    #[arg(long, value_name = "DAYS", default_value_t = 14)]
     pub root_ttl: u64,
+
+    /// Packs not accessed for this many days get an LRU touch.
+    #[arg(long, value_name = "DAYS", default_value_t = 4)]
+    pub touch_age: u64,
 }
 
 #[cfg(test)]
@@ -205,13 +213,16 @@ mod tests {
 
     #[test]
     fn gc_flags() {
+        // Defaults match the GC policy defaults from PLAN.md.
         let cli = parse(&["hestia", "gc"]);
         let Command::Gc(args) = cli.command else {
             panic!("expected gc");
         };
         assert!(!args.dry_run);
-        assert_eq!(args.grace, 7);
-        assert_eq!(args.root_ttl, 30);
+        assert_eq!(args.grace, 3);
+        assert_eq!(args.push_ttl, 14);
+        assert_eq!(args.root_ttl, 14);
+        assert_eq!(args.touch_age, 4);
 
         let cli = parse(&[
             "hestia",
@@ -219,15 +230,21 @@ mod tests {
             "--dry-run",
             "--grace",
             "14",
+            "--push-ttl",
+            "30",
             "--root-ttl",
             "60",
+            "--touch-age",
+            "2",
         ]);
         let Command::Gc(args) = cli.command else {
             panic!("expected gc");
         };
         assert!(args.dry_run);
         assert_eq!(args.grace, 14);
+        assert_eq!(args.push_ttl, 30);
         assert_eq!(args.root_ttl, 60);
+        assert_eq!(args.touch_age, 2);
     }
 
     #[test]
