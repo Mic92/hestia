@@ -1,0 +1,245 @@
+//! Versioned mutable entries on top of the write-once GHA cache.
+//!
+//! The GHA cache is strictly write-once per key, but the manifest must be
+//! updatable. The SaveMutable pattern (from go-actions-cache) fakes
+//! mutability with a monotonically increasing index suffix:
+//!
+//! ```text
+//! load:  prefix-match "m#"         -> newest entry = current version "m#N"
+//! save:  reserve "m#N+1"
+//!          already_exists -> another writer holds N+1: wait, re-load,
+//!                            re-merge, retry
+//!          reserved       -> upload new blob, finalize
+//! ```
+//!
+//! A reservation (even unfinalized) blocks its key forever, so a writer that
+//! crashes between reserve and finalize would deadlock the sequence. After
+//! `stale_skip_after` consecutive conflicts on the same index the writer
+//! assumes a crashed peer and skips over that index.
+
+use std::time::Duration;
+
+use bytes::Bytes;
+
+use crate::gha::twirp::{DownloadUrl, Reservation, TwirpClient};
+use crate::gha::{Error, blob};
+
+/// Cache key for version `index` of family `prefix`, e.g. `m#5`.
+fn key_for(prefix: &str, index: u64) -> String {
+    format!("{prefix}#{index}")
+}
+
+/// Restore-key prefix that matches every version of the family, e.g. `m#`.
+fn search_prefix(prefix: &str) -> String {
+    format!("{prefix}#")
+}
+
+/// Extract the numeric index from a full key, e.g. `m#5` -> 5.
+fn parse_index(prefix: &str, key: &str) -> Result<u64, Error> {
+    let family_prefix = search_prefix(prefix);
+    let suffix = key.strip_prefix(&family_prefix).ok_or_else(|| {
+        Error::InvalidResponse(format!(
+            "matched key {key:?} does not start with {family_prefix:?}"
+        ))
+    })?;
+    suffix
+        .parse()
+        .map_err(|_| Error::InvalidResponse(format!("matched key {key:?} has a non-numeric index")))
+}
+
+/// A loaded mutable entry.
+#[derive(Debug, Clone)]
+pub struct MutableEntry {
+    /// Full cache key, e.g. `m#5`.
+    pub key: String,
+    /// Parsed index, e.g. 5.
+    pub index: u64,
+    /// Entry contents.
+    pub data: Bytes,
+}
+
+/// Handle for one mutable, versioned cache entry family (e.g. `m`).
+pub struct SaveMutable<'a> {
+    twirp: &'a TwirpClient,
+    http: &'a reqwest::Client,
+    prefix: String,
+    /// Delay between conflict retries.
+    retry_delay: Duration,
+    /// Give up after this many conflicting save attempts.
+    max_attempts: u32,
+    /// Skip over an index after this many consecutive conflicts on it
+    /// (crashed-writer recovery).
+    stale_skip_after: u32,
+}
+
+impl<'a> SaveMutable<'a> {
+    pub fn new(
+        twirp: &'a TwirpClient,
+        http: &'a reqwest::Client,
+        prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            twirp,
+            http,
+            prefix: prefix.into(),
+            retry_delay: Duration::from_secs(2),
+            max_attempts: 60,
+            stale_skip_after: 5,
+        }
+    }
+
+    /// Tune retry behavior (tests use short delays).
+    pub fn with_retry(
+        mut self,
+        retry_delay: Duration,
+        max_attempts: u32,
+        stale_skip_after: u32,
+    ) -> Self {
+        self.retry_delay = retry_delay;
+        self.max_attempts = max_attempts;
+        self.stale_skip_after = stale_skip_after;
+        self
+    }
+
+    fn key_for(&self, index: u64) -> String {
+        key_for(&self.prefix, index)
+    }
+
+    fn search_prefix(&self) -> String {
+        search_prefix(&self.prefix)
+    }
+
+    fn parse_index(&self, key: &str) -> Result<u64, Error> {
+        parse_index(&self.prefix, key)
+    }
+
+    /// Load the newest entry of this family, or `None` if there is none yet.
+    pub async fn load(&self) -> Result<Option<MutableEntry>, Error> {
+        let prefix = self.search_prefix();
+        let lookup = self
+            .twirp
+            .get_download_url(&prefix, &[prefix.as_str()])
+            .await?;
+        let (url, matched_key) = match lookup {
+            DownloadUrl::Miss => return Ok(None),
+            DownloadUrl::Hit { url, matched_key } => (url, matched_key),
+        };
+        let index = self.parse_index(&matched_key)?;
+
+        // The signed URL was just issued, but refresh anyway if it raced
+        // with an expiry.
+        let twirp = self.twirp;
+        let prefix_clone = prefix.clone();
+        let data = blob::get_with_refresh(self.http, &url, None, async move || {
+            match twirp
+                .get_download_url(&prefix_clone, &[prefix_clone.as_str()])
+                .await?
+            {
+                DownloadUrl::Hit { url, .. } => Ok(url),
+                DownloadUrl::Miss => Err(Error::InvalidResponse(format!(
+                    "entry {prefix_clone:?} disappeared while downloading"
+                ))),
+            }
+        })
+        .await?;
+
+        Ok(Some(MutableEntry {
+            key: matched_key,
+            index,
+            data,
+        }))
+    }
+
+    /// Save a new version produced by `merge`.
+    ///
+    /// `merge` receives the current entry (if any) and returns the new
+    /// contents. It may be called multiple times: every conflict with a
+    /// concurrent writer triggers a re-load and re-merge so no writer's
+    /// changes get lost. Returns the index of the newly written version.
+    pub async fn save<F>(&self, mut merge: F) -> Result<u64, Error>
+    where
+        F: FnMut(Option<&MutableEntry>) -> Result<Vec<u8>, Error>,
+    {
+        let mut attempts: u32 = 0;
+        // Indexes at or below this are blocked by (presumably crashed) writers.
+        let mut skip_through: u64 = 0;
+        let mut last_conflict: Option<u64> = None;
+        let mut conflict_streak: u32 = 0;
+
+        loop {
+            let current = self.load().await?;
+            let data = Bytes::from(merge(current.as_ref())?);
+
+            let base = current.as_ref().map(|entry| entry.index).unwrap_or(0);
+            let index = base.max(skip_through) + 1;
+            let key = self.key_for(index);
+
+            match self.twirp.create_cache_entry(&key).await? {
+                Reservation::Created { upload_url } => {
+                    let size = data.len() as u64;
+                    let twirp = self.twirp;
+                    let key_clone = key.clone();
+                    blob::put_with_refresh(self.http, &upload_url, data, async move || {
+                        // Re-reserving an already-reserved key cannot return
+                        // a fresh URL, so an expired upload URL is fatal
+                        // unless the service hands us a new one.
+                        match twirp.create_cache_entry(&key_clone).await? {
+                            Reservation::Created { upload_url } => Ok(upload_url),
+                            Reservation::AlreadyExists => Err(Error::InvalidResponse(format!(
+                                "upload URL for {key_clone:?} expired and cannot be refreshed"
+                            ))),
+                        }
+                    })
+                    .await?;
+                    self.twirp.finalize_upload(&key, size).await?;
+                    return Ok(index);
+                }
+                Reservation::AlreadyExists => {
+                    attempts += 1;
+                    if attempts >= self.max_attempts {
+                        return Err(Error::Conflict { key, attempts });
+                    }
+                    if last_conflict == Some(index) {
+                        conflict_streak += 1;
+                    } else {
+                        last_conflict = Some(index);
+                        conflict_streak = 1;
+                    }
+                    if conflict_streak >= self.stale_skip_after {
+                        // Nobody finalized this index after several waits:
+                        // assume the writer holding the reservation crashed
+                        // and skip over it.
+                        skip_through = index;
+                        last_conflict = None;
+                        conflict_streak = 0;
+                    }
+                    tokio::time::sleep(self.retry_delay).await;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // No reqwest::Client in these tests: TLS client construction requires
+    // system CA certs, which do not exist in the Nix build sandbox.
+
+    #[test]
+    fn key_layout() {
+        assert_eq!(key_for("m", 1), "m#1");
+        assert_eq!(key_for("m", 42), "m#42");
+        assert_eq!(search_prefix("m"), "m#");
+    }
+
+    #[test]
+    fn parse_index_accepts_only_numeric_suffixes() {
+        assert_eq!(parse_index("m", "m#7").unwrap(), 7);
+        assert_eq!(parse_index("m", "m#123456").unwrap(), 123456);
+        assert!(parse_index("m", "m#").is_err());
+        assert!(parse_index("m", "m#abc").is_err());
+        assert!(parse_index("m", "other#1").is_err());
+    }
+}

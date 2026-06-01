@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@main
+      - name: Check formatting
+        run: nix fmt -- --ci
+      - name: Clippy
+        run: nix develop -c cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@main
+      - name: Run tests
+        run: nix develop -c cargo test
+
+  # Phase 0 milestone: prove that the action wrapper makes the GHA cache
+  # tokens visible to shell steps and that the results endpoint is reachable.
+  # If this job fails, the whole project needs rethinking (see PLAN.md,
+  # Critical Constraint 1).
+  #
+  # Phase 1 milestone: the real-API integration tests round-trip a blob
+  # through the actual GHA cache (Twirp reserve/finalize, Azure PUT/Range
+  # GET) and manage entries via the REST API.
+  token-probe:
+    runs-on: ubuntu-latest
+    permissions:
+      # actions:write is needed by the REST delete test
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@main
+      # No binary/version input: token-capture-only mode.
+      - uses: ./action
+      - name: Assert cache tokens are visible to shell steps
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_RUNTIME_TOKEN:-}" ]; then
+            echo "ACTIONS_RUNTIME_TOKEN is empty; token capture failed" >&2
+            exit 1
+          fi
+          if [ -z "${ACTIONS_RESULTS_URL:-}" ]; then
+            echo "ACTIONS_RESULTS_URL is empty; token capture failed" >&2
+            exit 1
+          fi
+          echo "Both cache tokens captured successfully."
+      - name: Probe cache results endpoint
+        run: |
+          set -euo pipefail
+          # Any HTTP response (even 401/404) proves the endpoint is reachable;
+          # only a connection failure (curl reports 000) is an error.
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$ACTIONS_RESULTS_URL")
+          echo "GET $ACTIONS_RESULTS_URL -> HTTP $code"
+          if [ "$code" = "000" ]; then
+            echo "Could not reach $ACTIONS_RESULTS_URL" >&2
+            exit 1
+          fi
+      - name: Run real-API integration tests
+        run: nix develop -c cargo test --test gha_real -- --ignored --nocapture
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # End-to-end test of the hestia-cache action on a real runner: install
+  # (locally built binary), nix.conf wiring, daemon readiness, post-build-hook
+  # capture, manifest commit, and substitution back out of the cache.
+  action-test:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@main
+      - name: Build hestia
+        run: nix build .# -o hestia-bin
+      - uses: ./action
+        with:
+          binary: ./hestia-bin/bin/hestia
+      - name: Build a run-unique derivation through the post-build-hook
+        run: |
+          set -euo pipefail
+          # runId makes the derivation unique per run, so it is always built
+          # locally (never substituted) and the hook must fire. $runId and
+          # $out are expanded by the Nix builder, not by this shell (quoted
+          # heredoc); the workflow expression is substituted by the runner.
+          cat > /tmp/action-test.nix <<'NIXEOF'
+          derivation {
+            name = "hestia-action-test";
+            system = builtins.currentSystem;
+            builder = "/bin/sh";
+            runId = "${{ github.run_id }}-${{ github.run_attempt }}";
+            args = [ "-c" "echo $runId > $out" ];
+          }
+          NIXEOF
+          nix build --impure --file /tmp/action-test.nix -o ./action-test-result
+      - name: Drain and verify the path is substitutable
+        run: |
+          set -euo pipefail
+          # Drain now (instead of waiting for the post step) so this job can
+          # assert the path actually round-trips through the GHA cache.
+          "$HESTIA_BIN" drain --socket "$HESTIA_SOCKET" --timeout 120
+
+          path=$(readlink -f ./action-test-result)
+          hash=$(basename "$path" | cut -c1-32)
+          echo "narinfo for $path:"
+          curl -fsS "http://$HESTIA_LISTEN/$hash.narinfo"
+
+          # Nix itself is the oracle: copy the path out of hestia into a
+          # fresh store.
+          nix copy --no-check-sigs \
+            --from "http://$HESTIA_LISTEN" \
+            --to /tmp/fresh-store \
+            "$path"
+          test -e "/tmp/fresh-store$path"
+      - name: Show daemon log
+        if: always()
+        run: cat "$HESTIA_SERVE_LOG"
+
+  # Phase 4 milestone: hestia's own CI dogfoods hestia. The first run
+  # populates the cache (post-build-hook -> drain); every later run
+  # substitutes from it instead of rebuilding.
+  #
+  # enabled-after-first-push: stays disabled until enabled on main after
+  # human review (set the repository variable HESTIA_DOGFOOD to "true").
+  dogfood:
+    if: ${{ vars.HESTIA_DOGFOOD == 'true' }} # enabled-after-first-push
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@main
+      - name: Build hestia
+        run: nix build .# -o hestia-bin
+      # Installs hestia, wires nix.conf, starts the daemon; the post step
+      # drains (uploads everything built below).
+      - uses: ./action
+        with:
+          binary: ./hestia-bin/bin/hestia
+      - name: Build the dev shell through the cache
+        # Anything that produces local (unsigned) store paths works; the
+        # devshell pulls in the whole rust toolchain closure.
+        run: nix develop -c cargo --version
+      - name: Show daemon log
+        if: always()
+        run: cat "$HESTIA_SERVE_LOG"

@@ -1,0 +1,55 @@
+name: hestia-cache
+description: >
+  Nix binary cache backed by the GitHub Actions cache (v2 API). Captures the
+  Actions runtime token (only visible to JS actions, never to `run:` steps),
+  installs the hestia binary, starts the daemon (post-build-hook listener +
+  substituter), wires it into nix.conf, and uploads everything that was built
+  when the job ends.
+
+branding:
+  icon: archive
+  color: purple
+
+inputs:
+  binary:
+    description: >
+      Path to a pre-built hestia binary (e.g. the result of `nix build`).
+      Takes precedence over `version`.
+    required: false
+    default: ""
+  version:
+    description: >
+      Hestia release tag to download from GitHub releases
+      (e.g. "v0.1.0-alpha.1"). Requires `sha256`.
+    required: false
+    default: ""
+  sha256:
+    description: >
+      Expected SHA-256 hex digest of the downloaded release binary. Required
+      together with `version`; unverified downloads are refused.
+    required: false
+    default: ""
+  listen:
+    description: Address the substituter HTTP server listens on.
+    required: false
+    default: "127.0.0.1:37515"
+  socket:
+    description: Unix socket path for the post-build-hook listener.
+    required: false
+    default: "/tmp/hestia/hook.sock"
+  drain-timeout:
+    description: >
+      Maximum number of seconds the post-job step waits for the final upload
+      (chunking, pack upload, manifest commit).
+    required: false
+    default: "300"
+
+# If neither `binary` nor `version` is set, the action only captures and
+# exports the cache tokens (ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL).
+# That mode exists for setups that run hestia themselves -- for example
+# hestia's own integration tests against the real cache API.
+
+runs:
+  using: node24
+  main: main.js
+  post: post.js

@@ -1,0 +1,47 @@
+# Garbage collection for the hestia binary cache.
+#
+# GC must run on the default branch: a PR job's cache scope is read-only
+# towards the default branch and dies with the PR, but the default-branch
+# scope grows forever without GC.
+#
+# This workflow doubles as the reference for other repositories using
+# hestia: copy it, replace the "Build hestia" step with the action's
+# version/sha256 inputs (see action/README.md), and keep the permissions.
+name: Cache GC
+
+on:
+  schedule:
+    # Daily, off-peak (UTC).
+    - cron: "23 3 * * *"
+  # Manual runs for debugging and one-off cleanups.
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Plan only; do not repack, touch, or delete anything.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    permissions:
+      # REST cache deletes need actions:write.
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@main
+      - name: Build hestia
+        run: nix build .# -o hestia-bin
+      # Token-capture-only mode: GC needs the cache API tokens
+      # (ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL) but no daemon.
+      - uses: ./action
+      - name: Run garbage collection
+        run: |
+          ./hestia-bin/bin/hestia gc \
+            ${{ inputs.dry-run && '--dry-run' || '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

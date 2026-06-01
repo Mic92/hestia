@@ -1,0 +1,70 @@
+# Release pipeline: tag push -> static binaries -> GitHub release.
+#
+# The binaries are statically linked (musl, see packages.static in
+# flake.nix): the hestia-cache action downloads and runs them on stock
+# runners, where dynamically linked nix-built binaries would not work
+# (their library paths point into /nix/store).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@main
+      - name: Build static binary
+        run: nix build .#static
+      - name: Prepare release asset
+        run: |
+          set -euo pipefail
+          install -m755 result/bin/hestia "hestia-${{ matrix.system }}"
+          sha256sum "hestia-${{ matrix.system }}" | tee "hestia-${{ matrix.system }}.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hestia-${{ matrix.system }}
+          path: |
+            hestia-${{ matrix.system }}
+            hestia-${{ matrix.system }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # Creating the release and uploading assets.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # Pre-1.0 / hyphenated tags (v0.1.0-alpha.1) are pre-releases.
+          prerelease=()
+          case "$tag" in
+            *-*) prerelease=(--prerelease) ;;
+          esac
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" \
+            --generate-notes \
+            "${prerelease[@]}" \
+            hestia-*

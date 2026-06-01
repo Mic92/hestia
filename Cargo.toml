@@ -1,0 +1,80 @@
+[package]
+name = "hestia"
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "MIT"
+description = "Nix binary cache backed by the GitHub Actions cache (v2 API)"
+repository = "https://github.com/Mic92/hestia"
+keywords = ["nix", "binary-cache", "github-actions", "cache", "ci"]
+categories = [
+  "caching",
+  "development-tools::build-utils",
+  "command-line-utilities",
+]
+
+[dependencies]
+# CLI / runtime
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "signal",
+  "time",
+  "sync",
+  "io-util",
+  "process",
+  "fs",
+] }
+
+# Serialization (manifest = CBOR + zstd)
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+zstd = "0.13"
+
+# HTTP client (Twirp, GitHub REST, Azure blob) and substituter server
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  "json",
+  "query",
+] }
+axum = "0.8"
+
+# Content-defined chunking
+fastcdc = "4"
+
+# Stream combinators for NAR event/byte streams
+futures-util = "0.3"
+
+# Errors
+thiserror = "2"
+
+# Blob payloads (cheap clones for upload retries)
+bytes = "1"
+
+# JSON bodies for the Twirp / REST / Azure APIs
+serde_json = "1"
+
+# Harmonia crates (not on crates.io; pinned to a specific rev)
+# Dropped after Phase 2/3 scope decisions (re-add when needed):
+#   harmonia-store-remote        -> path info comes from direct store
+#                                    database reads (harmonia-store-db),
+#                                    which works without a running daemon
+#   harmonia-utils-base-encoding -> nothing needs raw base32 yet
+harmonia-file-core = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-store-nar-info = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-utils-io = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "3ef11b5bcf6db6b645a3de672950b9c55bcdc2ba" }
+
+[dev-dependencies]
+# Property-based tests for manifest merge laws
+proptest = "1"
+# Verifies the hardcoded cache version constant
+sha2 = "0.11"
+# Blob storage directory for the fake GHA backend
+tempfile = "3"

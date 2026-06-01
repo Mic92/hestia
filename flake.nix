@@ -41,6 +41,19 @@
         }
       );
 
+      packages = eachSystem (
+        { pkgs, ... }:
+        {
+          default = pkgs.callPackage ./nix/package.nix { };
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # Statically linked (musl) build for release binaries: nix-built
+          # dynamic binaries reference /nix/store library paths and cannot
+          # run outside the store they were built in.
+          static = pkgs.pkgsStatic.callPackage ./nix/package.nix { };
+        }
+      );
+
       formatter = eachSystem ({ system, ... }: treefmt.${system}.config.build.wrapper);
 
       checks = eachSystem (
