@@ -118,6 +118,42 @@ pub fn now_unix() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Pack upload (shared by the write pipeline and GC repack)
+// ---------------------------------------------------------------------------
+
+/// Upload one pack blob (Twirp reserve → Azure PUT → finalize). Returns
+/// `false` when the cache already has it: pack keys are content-addressed,
+/// so an existing entry is guaranteed to hold identical content.
+pub async fn upload_pack(
+    twirp: &TwirpClient,
+    http: &reqwest::Client,
+    pack: &chunker::Pack,
+) -> Result<bool, GhaError> {
+    let key = pack.cache_key();
+    let data = Bytes::from(pack.data.clone());
+
+    match twirp.create_cache_entry(&key).await? {
+        Reservation::AlreadyExists => Ok(false),
+        Reservation::Created { upload_url } => {
+            let key_clone = key.clone();
+            blob::put_with_refresh(http, &upload_url, data, async move || {
+                // A pack upload outliving its SAS URL cannot be re-reserved
+                // (PLAN.md Open Question 8); surface a clear error.
+                match twirp.create_cache_entry(&key_clone).await? {
+                    Reservation::Created { upload_url } => Ok(upload_url),
+                    Reservation::AlreadyExists => Err(GhaError::InvalidResponse(format!(
+                        "upload URL for {key_clone} expired and cannot be refreshed"
+                    ))),
+                }
+            })
+            .await?;
+            twirp.finalize_upload(&key, pack.data.len() as u64).await?;
+            Ok(true)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
 
@@ -292,7 +328,7 @@ impl PipelineContext {
             let pack = builder.finish();
             stats.new_chunks = pack.chunks.len();
 
-            let uploaded = self.upload_pack(&pack).await?;
+            let uploaded = upload_pack(&self.twirp, &self.http, &pack).await?;
             if uploaded {
                 stats.packs_uploaded += 1;
                 stats.bytes_uploaded += pack.data.len() as u64;
@@ -349,36 +385,6 @@ impl PipelineContext {
         stats.manifest_version = version;
 
         Ok(stats)
-    }
-
-    /// Upload one pack blob. Returns false if the cache already has it
-    /// (content-addressed key, so identical content is guaranteed).
-    async fn upload_pack(&self, pack: &chunker::Pack) -> Result<bool, Error> {
-        let key = pack.cache_key();
-        let data = Bytes::from(pack.data.clone());
-
-        match self.twirp.create_cache_entry(&key).await? {
-            Reservation::AlreadyExists => Ok(false),
-            Reservation::Created { upload_url } => {
-                let twirp = &self.twirp;
-                let key_clone = key.clone();
-                blob::put_with_refresh(&self.http, &upload_url, data, async move || {
-                    // A pack upload outliving its SAS URL cannot be re-reserved
-                    // (PLAN.md Open Question 8); surface a clear error.
-                    match twirp.create_cache_entry(&key_clone).await? {
-                        Reservation::Created { upload_url } => Ok(upload_url),
-                        Reservation::AlreadyExists => Err(GhaError::InvalidResponse(format!(
-                            "upload URL for {key_clone} expired and cannot be refreshed"
-                        ))),
-                    }
-                })
-                .await?;
-                self.twirp
-                    .finalize_upload(&key, pack.data.len() as u64)
-                    .await?;
-                Ok(true)
-            }
-        }
     }
 }
 

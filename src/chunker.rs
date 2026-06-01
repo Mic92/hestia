@@ -136,6 +136,36 @@ impl PackBuilder {
         Ok(true)
     }
 
+    /// Append an already-compressed chunk frame without recompressing it.
+    ///
+    /// Used by GC repack: frames are Range-read from source packs and copied
+    /// into new packs byte-identically (PLAN.md GC design: "Range-copy
+    /// verified zstd frames, no recompression"). The caller must have
+    /// verified that `frame` decompresses to data hashing to `hash` (see
+    /// [`extract_chunk`]). Returns whether the chunk was actually added
+    /// (duplicates are skipped).
+    pub fn add_compressed(
+        &mut self,
+        hash: ChunkHash,
+        frame: &[u8],
+        uncompressed_size: u32,
+    ) -> bool {
+        if !self.seen.insert(hash) {
+            return false;
+        }
+        let offset = self.buffer.len() as u64;
+        self.buffer.extend_from_slice(frame);
+        self.chunks.push((
+            hash,
+            PackedChunk {
+                offset,
+                compressed_size: frame.len() as u32,
+                uncompressed_size,
+            },
+        ));
+        true
+    }
+
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
@@ -713,6 +743,36 @@ mod tests {
             expected_offset += packed.compressed_size as u64;
         }
         assert_eq!(expected_offset, pack.data.len() as u64);
+    }
+
+    #[test]
+    fn add_compressed_copies_frames_byte_identically() {
+        // Build a pack the normal way, then rebuild it from its own frames
+        // via add_compressed: the result must be byte-identical (this is
+        // what makes repacked stable packs deterministic and the CAS no-op
+        // trap reasoning sound).
+        let chunks = chunk_data(&test_data(300_000, 9));
+        let mut builder = PackBuilder::new();
+        for chunk in &chunks {
+            builder.add(chunk).unwrap();
+        }
+        let original = builder.finish();
+
+        let mut copier = PackBuilder::new();
+        for (hash, packed) in &original.chunks {
+            let start = packed.offset as usize;
+            let end = start + packed.compressed_size as usize;
+            let frame = &original.data[start..end];
+            // Verify-then-copy, exactly like GC repack does.
+            let decompressed = extract_chunk(frame, hash).unwrap();
+            assert!(copier.add_compressed(*hash, frame, decompressed.len() as u32));
+            // Duplicate adds are skipped.
+            assert!(!copier.add_compressed(*hash, frame, decompressed.len() as u32));
+        }
+        let copy = copier.finish();
+        assert_eq!(copy.data, original.data);
+        assert_eq!(copy.hash, original.hash);
+        assert_eq!(copy.chunks, original.chunks);
     }
 
     #[test]
