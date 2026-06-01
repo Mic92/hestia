@@ -32,6 +32,18 @@ fn url_expired(status: u16) -> bool {
     status == 403 || status == 401
 }
 
+/// Whether a transfer error is worth retrying with the same URL: network
+/// failures (connection drops, timeouts, truncated bodies) and server-side
+/// 5xx responses. Auth failures (401/403) are *not* transient — they need a
+/// fresh signed URL instead.
+pub fn is_transient(error: &Error) -> bool {
+    match error {
+        Error::Http(err) => !err.is_builder(),
+        Error::Status { status, .. } => *status >= 500,
+        _ => false,
+    }
+}
+
 async fn status_error(url: &str, response: reqwest::Response) -> Error {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
@@ -134,5 +146,24 @@ mod tests {
         assert!(url_expired(401));
         assert!(!url_expired(404));
         assert!(!url_expired(500));
+    }
+
+    #[test]
+    fn transient_errors_are_server_side_failures_not_auth_or_client_errors() {
+        let status = |status: u16| Error::Status {
+            status,
+            url: "http://blob/x".into(),
+            body: String::new(),
+        };
+        assert!(is_transient(&status(500)));
+        assert!(is_transient(&status(503)));
+        // Auth failures need a URL refresh, not a retry.
+        assert!(!is_transient(&status(401)));
+        assert!(!is_transient(&status(403)));
+        // Missing blobs (eviction) never come back by retrying.
+        assert!(!is_transient(&status(404)));
+        // Non-transfer errors are never transient.
+        assert!(!is_transient(&Error::MissingEnv("X")));
+        assert!(!is_transient(&Error::InvalidResponse("bad".into())));
     }
 }

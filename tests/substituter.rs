@@ -794,3 +794,95 @@ async fn substitution_with_trusted_store_url_realises_paths() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn transient_blob_failure_is_retried_transparently() {
+    timed(async {
+        // An Azure-side connection drop mid-Range-read must not surface to
+        // Nix at all: the substituter retries the read and serves the NAR.
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let fixture = store.add_fixture("transient-drop", 137);
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let substituter = RunningSubstituter::start(&fake, &http, &store).await;
+
+        // Request the NAR directly (not via narinfo) so the background
+        // prefetch cannot race with the injected failure.
+        let entry = &manifest.paths[&path_hash_of(&fixture)];
+        let nar_url = format!("nar/{}.nar", entry.nar_hash.to_hex());
+
+        // Exactly one connection drop: within the retry budget.
+        fake.fail_blob_reads(&http, 1).await;
+
+        let response = substituter.get(&http, &nar_url).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "a single transient failure must be absorbed by the retry"
+        );
+        let nar = response.bytes().await.unwrap();
+        assert_eq!(
+            Hash32::digest(&nar),
+            entry.nar_hash,
+            "retried NAR must still be byte-correct"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn persistent_blob_failures_yield_404_then_recover() {
+    timed(async {
+        // When Azure keeps dropping connections (outage), the NAR request
+        // must fail with a clean 404 — Nix rebuilds — and never with corrupt
+        // data. Once the outage is over, the same URL works again.
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let fixture = store.add_fixture("persistent-drop", 139);
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let substituter = RunningSubstituter::start(&fake, &http, &store).await;
+
+        let entry = &manifest.paths[&path_hash_of(&fixture)];
+        let nar_url = format!("nar/{}.nar", entry.nar_hash.to_hex());
+
+        // More failures than the retry budget can absorb.
+        fake.fail_blob_reads(&http, 1_000).await;
+        let response = substituter.get(&http, &nar_url).await;
+        assert_eq!(
+            response.status(),
+            404,
+            "persistent failures must produce a clean 404, never partial data"
+        );
+
+        // Nix copy against the broken cache fails without leaving partial
+        // paths behind.
+        let destination = store.create_destination();
+        let output = nix_copy(&substituter.store_url, &destination.uri, &fixture).await;
+        assert!(
+            !output.status.success(),
+            "nix copy must fail during the outage"
+        );
+        assert!(
+            !destination.physical_path(&fixture).exists(),
+            "no partial path may be registered after a failed substitution"
+        );
+
+        // Outage over: the substituter recovers without a restart.
+        fake.fail_blob_reads(&http, 0).await;
+        let response = substituter.get(&http, &nar_url).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            Hash32::digest(response.bytes().await.unwrap()),
+            entry.nar_hash
+        );
+    })
+    .await;
+}

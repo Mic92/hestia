@@ -57,6 +57,11 @@ const PACK_URL_TTL: Duration = Duration::from_secs(10 * 60);
 /// across NAR requests). Oldest chunks are dropped first.
 const CHUNK_CACHE_BUDGET: usize = 256 * 1024 * 1024;
 
+/// How many times a pack Range read is retried after a transient failure
+/// (connection drop, timeout, 5xx) before the whole NAR request gives up
+/// and returns 404.
+const TRANSIENT_READ_RETRIES: u32 = 2;
+
 // ---------------------------------------------------------------------------
 // Shared manifest slot
 // ---------------------------------------------------------------------------
@@ -223,20 +228,39 @@ impl ChunkFetcher {
         }
     }
 
-    /// Range-read one byte range of a pack, refreshing the signed URL once
-    /// if it has expired (403/401).
+    /// Range-read one byte range of a pack.
+    ///
+    /// Two failure modes are recovered from, everything else propagates
+    /// (and ultimately turns the NAR request into a 404):
+    ///
+    /// * expired signed URL (401/403) → refresh via Twirp, once;
+    /// * transient network/server failure (connection drop, timeout, 5xx)
+    ///   → retry the same URL up to [`TRANSIENT_READ_RETRIES`] times.
     async fn read_pack_range(
         &self,
         pack: PackHash,
         range: std::ops::Range<u64>,
     ) -> Result<Bytes, FetchError> {
-        let url = self.pack_url(pack, false).await?;
-        match blob::get(&self.http, &url, Some(range.clone())).await {
-            Err(GhaError::Status { status, .. }) if status == 403 || status == 401 => {
-                let fresh = self.pack_url(pack, true).await?;
-                Ok(blob::get(&self.http, &fresh, Some(range)).await?)
+        let mut url = self.pack_url(pack, false).await?;
+        let mut refreshed = false;
+        let mut transient_left = TRANSIENT_READ_RETRIES;
+        loop {
+            match blob::get(&self.http, &url, Some(range.clone())).await {
+                Err(GhaError::Status { status, .. })
+                    if (status == 403 || status == 401) && !refreshed =>
+                {
+                    refreshed = true;
+                    url = self.pack_url(pack, true).await?;
+                }
+                Err(err) if blob::is_transient(&err) && transient_left > 0 => {
+                    transient_left -= 1;
+                    eprintln!(
+                        "hestia substituter: transient error reading pack {}, retrying: {err}",
+                        pack_cache_key(&pack)
+                    );
+                }
+                result => return Ok(result?),
             }
-            result => Ok(result?),
         }
     }
 

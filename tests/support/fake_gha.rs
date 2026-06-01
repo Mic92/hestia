@@ -18,6 +18,8 @@
 //!   (subsequent transfers get 403, like an expired SAS URL).
 //! * `POST /test/expire-token-after/{n}`: the next `n` Twirp calls succeed,
 //!   every later one gets HTTP 401 (expired `ACTIONS_RUNTIME_TOKEN`).
+//! * `POST /test/fail-blob-reads/{n}`: the next `n` blob downloads get their
+//!   connection dropped mid-body (Azure timeout / connection reset).
 //! * `POST /test/exhaust-quota-after/{n}`: the next `n` CreateCacheEntry
 //!   calls succeed, every later one gets a `resource_exhausted` Twirp error
 //!   (the 10 GB repository cache quota is full).
@@ -77,6 +79,8 @@ struct Inner {
     twirp_calls_until_401: Option<u64>,
     /// `Some(n)`: n more CreateCacheEntry calls succeed, then quota errors.
     creates_until_quota: Option<u64>,
+    /// Number of upcoming blob GETs whose connection gets dropped mid-body.
+    blob_read_failures: u64,
 }
 
 impl Inner {
@@ -306,6 +310,30 @@ async fn blob_put(
     StatusCode::CREATED.into_response()
 }
 
+/// Build a blob response, optionally dropping the connection mid-body.
+///
+/// The injected failure advertises the full Content-Length but streams only
+/// half the bytes before erroring out: clients see a reset/truncated
+/// connection exactly like an Azure-side timeout.
+fn blob_response(status: StatusCode, data: Vec<u8>, drop_mid_body: bool) -> Response {
+    if !drop_mid_body {
+        return (status, data).into_response();
+    }
+    let half = data.len() / 2;
+    let body = axum::body::Body::from_stream(futures_util::stream::iter([
+        Ok::<_, std::io::Error>(Bytes::from(data[..half].to_vec())),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "injected connection drop",
+        )),
+    ]));
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_LENGTH, data.len())
+        .body(body)
+        .expect("static response parts are valid")
+}
+
 /// Parse `bytes=start-end` (both inclusive) / `bytes=start-`.
 fn parse_range(value: &str, len: u64) -> Option<(u64, u64)> {
     let spec = value.strip_prefix("bytes=")?;
@@ -351,6 +379,14 @@ async fn blob_get(
     };
     inner.blob_requests.push(request);
 
+    // Connection-drop injection (Azure timeout simulation).
+    let drop_mid_body = if inner.blob_read_failures > 0 {
+        inner.blob_read_failures -= 1;
+        true
+    } else {
+        false
+    };
+
     match headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
@@ -360,9 +396,9 @@ async fn blob_get(
         Some(None) => (StatusCode::RANGE_NOT_SATISFIABLE, "bad range").into_response(),
         Some(Some((start, end))) => {
             let slice = data[start as usize..=end as usize].to_vec();
-            (StatusCode::PARTIAL_CONTENT, slice).into_response()
+            blob_response(StatusCode::PARTIAL_CONTENT, slice, drop_mid_body)
         }
-        None => (StatusCode::OK, data).into_response(),
+        None => blob_response(StatusCode::OK, data, drop_mid_body),
     }
 }
 
@@ -481,6 +517,11 @@ async fn test_exhaust_quota_after(
     Json(json!({ "creates_until_quota": creates })).into_response()
 }
 
+async fn test_fail_blob_reads(State(state): State<AppState>, Path(reads): Path<u64>) -> Response {
+    state.inner.lock().unwrap().blob_read_failures = reads;
+    Json(json!({ "blob_read_failures": reads })).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Server wiring
 // ---------------------------------------------------------------------------
@@ -515,6 +556,7 @@ impl FakeGha {
             blob_requests: Vec::new(),
             twirp_calls_until_401: None,
             creates_until_quota: None,
+            blob_read_failures: 0,
         }));
         let state = AppState {
             inner: Arc::clone(&inner),
@@ -539,6 +581,7 @@ impl FakeGha {
                 "/test/exhaust-quota-after/{creates}",
                 post(test_exhaust_quota_after),
             )
+            .route("/test/fail-blob-reads/{reads}", post(test_fail_blob_reads))
             .with_state(state);
 
         let task = tokio::spawn(async move {
@@ -609,6 +652,19 @@ impl FakeGha {
     pub async fn exhaust_quota_after(&self, http: &reqwest::Client, creates: u64) {
         let url = format!("{}/test/exhaust-quota-after/{creates}", self.base_url);
         let response = http.post(&url).send().await.expect("exhaust-quota request");
+        assert!(response.status().is_success());
+    }
+
+    /// Drop the connection mid-body on the next `reads` blob downloads
+    /// (simulates Azure timeouts / connection resets). `0` clears the
+    /// injection.
+    pub async fn fail_blob_reads(&self, http: &reqwest::Client, reads: u64) {
+        let url = format!("{}/test/fail-blob-reads/{reads}", self.base_url);
+        let response = http
+            .post(&url)
+            .send()
+            .await
+            .expect("fail-blob-reads request");
         assert!(response.status().is_success());
     }
 }
