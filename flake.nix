@@ -4,12 +4,14 @@
   inputs.nixpkgs.url = "git+https://github.com/NixOS/nixpkgs?shallow=1&ref=nixpkgs-unstable";
   inputs.treefmt-nix.url = "github:numtide/treefmt-nix";
   inputs.treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
+  inputs.crane.url = "github:ipetkov/crane";
 
   outputs =
     {
       self,
       nixpkgs,
       treefmt-nix,
+      crane,
     }:
     let
       inherit (nixpkgs) lib;
@@ -32,6 +34,14 @@
         );
 
       treefmt = eachSystem ({ pkgs, ... }: treefmt-nix.lib.evalModule pkgs ./nix/treefmt.nix);
+
+      # Crane builds (package, clippy, tests) with shared dependency artifacts.
+      craneFor =
+        pkgs:
+        import ./nix/crane.nix {
+          inherit pkgs lib;
+          craneLib = crane.mkLib pkgs;
+        };
     in
     {
       devShells = eachSystem (
@@ -44,7 +54,7 @@
       packages = eachSystem (
         { pkgs, ... }:
         {
-          default = pkgs.callPackage ./nix/package.nix { };
+          default = (craneFor pkgs).package;
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # Statically linked (musl) build for release binaries: nix-built
@@ -56,10 +66,15 @@
 
       formatter = eachSystem ({ system, ... }: treefmt.${system}.config.build.wrapper);
 
+      # Everything CI verifies: `nix flake check` runs the formatter check,
+      # clippy, the test suite, and builds the package.
       checks = eachSystem (
-        { system, ... }:
+        { pkgs, system, ... }:
         {
           treefmt = treefmt.${system}.config.build.check self;
+          package = self.packages.${system}.default;
+          clippy = (craneFor pkgs).clippy;
+          tests = (craneFor pkgs).tests;
         }
       );
     };

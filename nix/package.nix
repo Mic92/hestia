@@ -1,3 +1,5 @@
+# Static (musl) release binaries via pkgsStatic. Everything else builds
+# with crane (nix/crane.nix).
 {
   lib,
   rustPlatform,

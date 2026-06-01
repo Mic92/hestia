@@ -460,7 +460,7 @@ Decisions (21–27).
 - Enable dogfooding (after the release): set the repository variables
   `HESTIA_DOGFOOD=true`, `HESTIA_DOGFOOD_VERSION=<tag>`,
   `HESTIA_DOGFOOD_SHA256=<sha256 of hestia-x86_64-linux>` so the regular
-  `build` job runs its `nix build .#` through hestia
+  `build` job runs all its flake checks through hestia
 - nix-community migration (repository transfer + harmonia crates on
   crates.io would remove the git-dependency pin)
 
@@ -788,6 +788,16 @@ continues from / interleaves with the Open Questions section above.
     uploaded *before* the manifest commit. The fake backend simulates lag
     only behind the `stale-lookups` injection endpoint; everything else
     stays strongly consistent.
+
+29. **Builds use crane; CI is a single `nix flake check`** (Phase 6
+    follow-up). Crane keeps the dependency build in a separate derivation
+    keyed on Cargo.toml/Cargo.lock, so source-only commits recompile just
+    the hestia crate. Formatting, clippy, tests, and the package are flake
+    checks — cacheable locally and by the dogfood cache in CI. The test
+    check has `pkgs.nix` in the sandbox; the scratch-store integration
+    tests run there (only the two system-store oracle tests skip, covered
+    by the action-test job). The static release build stays on
+    buildRustPackage (nix/package.nix).
 
 ## Mistakes Fixed from Earlier Draft
 

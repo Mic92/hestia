@@ -196,6 +196,7 @@ into a cache miss (rebuild) — never into wrong build inputs.
 $ nix develop -c cargo test          # unit + integration tests (fake GHA backend)
 $ nix develop -c cargo clippy --all-targets -- -D warnings
 $ nix fmt                            # treefmt (rustfmt, nixfmt, prettier, ...)
+$ nix flake check                    # everything CI runs: fmt, clippy, tests, build
 $ nix build .#                       # the hestia binary
 $ nix build .#static                 # static (musl) release binary
 ```
