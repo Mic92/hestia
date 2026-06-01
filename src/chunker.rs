@@ -377,6 +377,11 @@ pub async fn nar_hash_and_size(path: impl Into<PathBuf>) -> Result<(Hash32, u64)
         context.update(&bytes);
         size += bytes.len() as u64;
     }
+    finish_sha256(context, size)
+}
+
+/// Extract the SHA-256 digest from a finished hash context.
+fn finish_sha256(context: harmonia_utils_hash::Context, size: u64) -> Result<(Hash32, u64), Error> {
     match context.finish() {
         harmonia_utils_hash::Hash::SHA256(sha) => Ok((Hash32(*sha.digest_bytes()), size)),
         other => Err(Error::InvalidNar(format!(
@@ -432,12 +437,7 @@ impl HashSink {
     }
 
     fn finish(self) -> Result<(Hash32, u64), Error> {
-        match self.context.finish() {
-            harmonia_utils_hash::Hash::SHA256(sha) => Ok((Hash32(*sha.digest_bytes()), self.size)),
-            other => Err(Error::InvalidNar(format!(
-                "hash context returned unexpected algorithm {other:?}"
-            ))),
-        }
+        finish_sha256(self.context, self.size)
     }
 }
 
@@ -534,19 +534,8 @@ pub async fn nar_hash_from_chunks(
     tree: &FileTree<ChunkList>,
     chunks: &BTreeMap<ChunkHash, Bytes>,
 ) -> Result<(Hash32, u64), Error> {
-    let mut events = Vec::new();
-    // The root node's name is ignored by the NAR format (only nested entries
-    // carry names), so any value works here.
-    collect_events(Bytes::new(), &tree.0, chunks, &mut events)?;
-
     let mut sink = HashSink::new();
-    {
-        let mut writer = NarWriter::new(&mut sink);
-        for event in events {
-            writer.feed(event).await?;
-        }
-        writer.close().await?;
-    }
+    write_nar(tree, chunks, &mut sink).await?;
     sink.finish()
 }
 
@@ -562,18 +551,29 @@ pub async fn nar_from_chunks(
     tree: &FileTree<ChunkList>,
     chunks: &BTreeMap<ChunkHash, Bytes>,
 ) -> Result<Vec<u8>, Error> {
+    let mut buffer: Vec<u8> = Vec::new();
+    write_nar(tree, chunks, &mut buffer).await?;
+    Ok(buffer)
+}
+
+/// Synthesize the NAR event sequence for `tree` and serialize it through
+/// harmonia's [`NarWriter`] into `sink`.
+async fn write_nar<W: tokio::io::AsyncWrite + Unpin>(
+    tree: &FileTree<ChunkList>,
+    chunks: &BTreeMap<ChunkHash, Bytes>,
+    sink: &mut W,
+) -> Result<(), Error> {
     let mut events = Vec::new();
+    // The root node's name is ignored by the NAR format (only nested entries
+    // carry names), so any value works here.
     collect_events(Bytes::new(), &tree.0, chunks, &mut events)?;
 
-    let mut buffer: Vec<u8> = Vec::new();
-    {
-        let mut writer = NarWriter::new(&mut buffer);
-        for event in events {
-            writer.feed(event).await?;
-        }
-        writer.close().await?;
+    let mut writer = NarWriter::new(sink);
+    for event in events {
+        writer.feed(event).await?;
     }
-    Ok(buffer)
+    writer.close().await?;
+    Ok(())
 }
 
 /// Decompress and verify one chunk extracted from pack bytes.

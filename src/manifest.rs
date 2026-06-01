@@ -322,15 +322,12 @@ fn merge_map<K: Ord, V>(
     source: BTreeMap<K, V>,
     merge_value: impl Fn(V, V) -> V,
 ) {
-    for (key, value_b) in source {
-        match target.remove(&key) {
-            Some(value_a) => {
-                target.insert(key, merge_value(value_a, value_b));
-            }
-            None => {
-                target.insert(key, value_b);
-            }
-        }
+    for (key, value) in source {
+        let merged = match target.remove(&key) {
+            Some(existing) => merge_value(existing, value),
+            None => value,
+        };
+        target.insert(key, merged);
     }
 }
 
@@ -356,20 +353,21 @@ impl Manifest {
             .roots
             .values()
             .flat_map(|root| root.paths.iter().copied())
-            .filter(|path| self.paths.contains_key(path))
             .collect();
         while let Some(path) = stack.pop() {
-            if !visited.insert(path) {
-                continue;
-            }
+            // Not in the manifest: an upstream reference or an evicted root
+            // member -- a hole in the graph, not an error.
             let Some(entry) = self.paths.get(&path) else {
                 continue;
             };
-            for reference in entry.reference_hashes() {
-                if self.paths.contains_key(&reference) && !visited.contains(&reference) {
-                    stack.push(reference);
-                }
+            if !visited.insert(path) {
+                continue;
             }
+            stack.extend(
+                entry
+                    .reference_hashes()
+                    .filter(|reference| !visited.contains(reference)),
+            );
         }
         visited
     }
@@ -618,36 +616,14 @@ mod tests {
     #[test]
     fn hash32_parses_nix_hash_formats() {
         let hash = Hash32::digest(b"hello world");
+        assert_eq!(
+            hash.to_hex(),
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+
         // SRI format (what `nix path-info --json` emits as narHash).
-        let sri = format!("sha256-{}", {
-            // Standard base64 of the digest.
-            const TABLE: &[u8] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let bytes = hash.0;
-            let mut out = String::new();
-            for chunk in bytes.chunks(3) {
-                let b = [
-                    chunk[0],
-                    *chunk.get(1).unwrap_or(&0),
-                    *chunk.get(2).unwrap_or(&0),
-                ];
-                let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
-                out.push(TABLE[(n >> 18) as usize & 63] as char);
-                out.push(TABLE[(n >> 12) as usize & 63] as char);
-                out.push(if chunk.len() > 1 {
-                    TABLE[(n >> 6) as usize & 63] as char
-                } else {
-                    '='
-                });
-                out.push(if chunk.len() > 2 {
-                    TABLE[n as usize & 63] as char
-                } else {
-                    '='
-                });
-            }
-            out
-        });
-        assert_eq!(Hash32::parse_sha256(&sri), Some(hash));
+        let sri = "sha256-uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=";
+        assert_eq!(Hash32::parse_sha256(sri), Some(hash));
 
         // Prefixed base16.
         let base16 = format!("sha256:{}", hash.to_hex());
