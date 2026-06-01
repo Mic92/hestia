@@ -23,7 +23,7 @@ const T0: u64 = 1_750_000_000;
 const DAY: u64 = SECS_PER_DAY;
 const HOUR: u64 = SECS_PER_HOUR;
 
-/// Hard timeout for every test body (PLAN.md Open Question 16: a hung
+/// Hard timeout for every test body (PLAN.md Decision 16: a hung
 /// server must fail the test, not the suite).
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 

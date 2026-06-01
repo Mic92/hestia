@@ -89,7 +89,7 @@ not on crates.io):
 | Store path walk + NAR events | `harmonia-file-nar`: `NarDumper` (`dump(path)`) | Produces `Stream<NarEvent>`: file data as `Bytes` (small files buffered, large files mmap'd), directories/symlinks as events. Exactly the per-file access FastCDC needs. |
 | NAR serialization (events → bytes) | `harmonia-file-nar`: `NarByteStream`, `NarWriter` | Converts `NarEvent` stream to NAR framing. Used twice: (a) write side to compute `nar_hash`, (b) read side to serve reassembled NARs. **Same code path → byte-identical NARs → hashes match by construction.** |
 | File tree type for manifest | `harmonia-file-core`: `FileTree<C>` (generic over content) | `FileTree<ChunkList>` = manifest tree. Already has serde. |
-| PathInfo from the store database | `harmonia-store-db`: `StoreDb`, `query_path_info` | Direct SQLite reads, same as harmonia-cache in production. Works without a daemon (single-user installs, scratch stores in tests). *(Originally planned as harmonia-store-remote / daemon protocol; revised in Phase 3, see Open Question 11.)* |
+| PathInfo from the store database | `harmonia-store-db`: `StoreDb`, `query_path_info` | Direct SQLite reads, same as harmonia-cache in production. Works without a daemon (single-user installs, scratch stores in tests). *(Originally planned as harmonia-store-remote / daemon protocol; revised in Phase 3, see Decision 11.)* |
 | narinfo construction + formatting | `harmonia-store-nar-info`: `build_narinfo()`, text serialization | Handles URL/Compression/References/Sig lines; supports signing if we add it later. |
 | Store path types | `harmonia-store-path`: `StorePath`, `StorePathHash` | Parsing/validation. |
 | Signature parsing (upstream filter) | `harmonia-utils-signature`: `Signature::name()` | "Is this path signed by cache.nixos.org-1?" |
@@ -110,7 +110,7 @@ them to the same `NarByteStream`. No harmonia changes needed.
 - `harmonia-store-remote` (nix-daemon protocol): originally chosen as "the
   safer default", dropped in Phase 3 in favor of `harmonia-store-db` — a
   daemon only exists on multi-user installs, while the database exists
-  wherever paths were built (Open Question 11).
+  wherever paths were built (Decision 11).
 
 ## New Dependencies
 
@@ -246,10 +246,10 @@ and is independently committable. Red-green TDD.
 
 ### Phase 0: Scaffolding + token access (the existential risk first)
 
-**Status: done** (except the CI milestone, which can only run once the repo
-is pushed to GitHub — the `token-probe` job in `.github/workflows/ci.yml`
-validates it on the first push). Deviations recorded under Open Questions
-(5–7).
+**Status: done.** The CI milestone was validated after the first push
+(Mic92/hestia, PR #1): the `token-probe` job captures the runtime tokens
+and reaches the cache API on a real runner. Deviations recorded under
+Decisions (5–7).
 
 - [x] cargo init, flake.nix (rust toolchain, treefmt), CI workflow
 - [x] harmonia git deps resolve and build (all ten crates, pinned to rev
@@ -261,16 +261,17 @@ validates it on the first push). Deviations recorded under Open Questions
       `actions/github-script` and exports them to later shell steps
 - [x] bonus: `packages.default` (buildRustPackage with
       `cargoLock.allowBuiltinFetchGit`) so `nix build`/`nix run` work
-- [ ] **Milestone: a CI run lists its own cache entries via Twirp using
-      captured tokens.** Pending first push to GitHub; `token-probe` asserts
-      token visibility and endpoint reachability. If this fails, the whole
-      project needs rethinking — do it first.
+- [x] **Milestone: a CI run lists its own cache entries via Twirp using
+      captured tokens.** Validated on a real runner (PR #1 `token-probe`
+      job): tokens are visible to shell steps after the action exports
+      them, and the results endpoint answers.
 
 ### Phase 1: GHA cache client
 
-**Status: done** (code + fake-backend tests green locally; the real-API
-suite runs in the CI `token-probe` job and validates the milestone on the
-first push). Deviations recorded under Open Questions (8–9).
+**Status: done.** The real-API suite runs in the CI `token-probe` job and
+passes on real runners; it caught one fake/real divergence (download
+lookups only consult restore keys — Decision 9). Deviations recorded under
+Decisions (8–9).
 
 - [x] `gha/twirp.rs`: CreateCacheEntry, FinalizeCacheEntryUpload,
       GetCacheEntryDownloadURL (request shapes ported from
@@ -287,16 +288,18 @@ first push). Deviations recorded under Open Questions (8–9).
 - [x] Tests: 13 scenarios against fake-gha locally; same scenarios against
       the real API in `tests/gha_real.rs` (`#[ignore]` locally, run in CI
       with `cargo test --test gha_real -- --ignored`)
-- [ ] **Milestone: round-trip a blob through the real GHA cache from CI;
-      Range-read a slice of it; delete it via REST.** Pending first push
-      (test uses 256 KB; bump to 100 MB once CI proves the path works).
+- [x] **Milestone: round-trip a blob through the real GHA cache from CI;
+      Range-read a slice of it; delete it via REST.** Passing in CI
+      (`tests/gha_real.rs` in the `token-probe` job). The test uses 256 KB;
+      bumping to 100 MB is still worthwhile once uploads get exercised by
+      the dogfood job.
 
 ### Phase 2: Manifest + chunker
 
 **Status: done.** Milestone verified locally: bash-5.3 store path (43 files)
 reconstructed byte-identical from a pack; NAR hash matches both
 `nix-store --dump` and `nix path-info --json`. Schema deviations recorded
-under Open Questions (10).
+under Decisions (10).
 
 - [x] `manifest.rs`: serde structs, CBOR+zstd encode/decode (Hash32 as CBOR
       byte strings, PathHash as base32 strings), merge rules (paths/chunks
@@ -320,10 +323,9 @@ under Open Questions (10).
 
 ### Phase 3: Write pipeline + hook
 
-**Status: done** (except the on-runner milestone, which needs the repo
-pushed to GitHub with the action wrapper providing real tokens; everything
-below the GHA API boundary is covered by scratch-store + fake-gha tests).
-Deviations recorded under Open Questions (11–12).
+**Status: done.** The on-runner milestone is validated by the `action-test`
+CI job (build through the post-build-hook → drain → pack + manifest in the
+real GHA cache). Deviations recorded under Decisions (11–12).
 
 - [x] `protocol.rs` + `hook.rs`: JSON-lines socket protocol; `hestia hook`
       reads `$OUT_PATHS` (or explicit args) and always exits 0 — verified
@@ -332,11 +334,10 @@ Deviations recorded under Open Questions (11–12).
 - [x] `upstream.rs`: signature-name filtering (default trusted:
       `cache.nixos.org-1`, repeatable `--upstream-key` to override)
 - [x] `pathinfo.rs`: store-database reads via harmonia-store-db (NOT the
-      daemon protocol — see Open Question 11)
+      daemon protocol — see Decision 11)
 - [x] `pipeline.rs`: batch path-info query → filter (invalid / upstream /
       already-stored with last_pushed bump) → chunk → NAR-hash verification
-      from the chunked representation (integrity gate, see Open Question
-      12) → pack → upload (already_exists = skip) → SaveMutable commit with
+      from the chunked representation (integrity gate, see Decision 12) → pack → upload (already_exists = skip) → SaveMutable commit with
       re-merge; root = pushed ∪ accessed; `AccessLog` is the Phase 4
       substituter integration point
 - [x] `serve.rs`: daemon lifecycle (hook socket, serialized drains with
@@ -349,15 +350,17 @@ Deviations recorded under Open Questions (11–12).
       dedup re-runs and cross-path chunk sharing; daemon drain under
       concurrent hook sends; SaveMutable conflict between two concurrent
       pipelines
-- [ ] **Milestone: `nix build` with post-build-hook on a runner → paths
-      appear as pack + manifest entries in the repo's GHA cache.** Pending
-      first push.
+- [x] **Milestone: `nix build` with post-build-hook on a runner → paths
+      appear as pack + manifest entries in the repo's GHA cache.**
+      Validated by the `action-test` CI job.
 
 ### Phase 4: Substituter
 
-**Status: done** (except the on-runner milestone, which needs the repo
-pushed to GitHub; the `dogfood` CI job is committed but disabled — see
-below). Deviations and findings recorded under Open Questions (13–16).
+**Status: done.** Substitution out of the real GHA cache is validated by
+the `action-test` CI job (`nix copy` from the hestia substituter into a
+fresh store on a real runner); full-CI dogfooding stays gated until after
+the merge to main. Deviations and findings recorded under Decisions
+(13–16).
 
 - [x] `substituter.rs`: axum app
   - [x] `/nix-cache-info` (Priority 30, WantMassQuery 1, scratch-store
@@ -382,14 +385,13 @@ below). Deviations and findings recorded under Open Questions (13–16).
       leaves no partial path; access recording → root update; prefetch → no
       duplicate pack reads; URL expiry mid-serving → transparent refresh;
       manifest refresh without restart
-- [ ] **Milestone: second CI run substitutes from cache instead of
-      rebuilding; ephemeral runner store gets populated from packs.
-      Hestia's own CI starts dogfooding hestia.** Pending first push: the
-      `dogfood` job in `.github/workflows/ci.yml` builds hestia, starts
-      `hestia serve`, wires nix.conf (substituter + post-build-hook), and
-      drains — but is gated behind the repository variable `HESTIA_DOGFOOD`
-      (marker: `enabled-after-first-push`) until the token-probe job has
-      proven the cache API works on a real runner.
+- [x] **Milestone: substitution from the real GHA cache on a real runner.**
+      The `action-test` CI job builds a run-unique derivation through the
+      post-build-hook, drains, and `nix copy`s the path back out of the
+      cache into a fresh store. Full-CI dogfooding (the `dogfood` job:
+      hestia's CI caches its own devshell builds) remains gated behind the
+      repository variable `HESTIA_DOGFOOD` until enabled on main after
+      human review.
 
 ### Phase 5: GC
 
@@ -397,7 +399,7 @@ below). Deviations and findings recorded under Open Questions (13–16).
 weekly nixpkgs bumps, one branch deletion, one quota eviction) converges to
 live-set storage within 20%, no referenced pack idles past TouchAge, and
 every live path stays readable through the substituter. Deviations and
-findings recorded under Open Questions (17–20).
+findings recorded under Decisions (17–20).
 
 - [x] `gc.rs`: plan (REST reconcile, mark, sweep, schedule repack/touch) +
       execute (verified Range-copy, upload, manifest commit, REST delete),
@@ -420,14 +422,42 @@ findings recorded under Open Questions (17–20).
 
 ### Phase 6: Hardening + release
 
-- hestia-action: proper post-step drain, `gc` reusable workflow example
-- Failure-mode tests: token expiry mid-upload, Azure 403/timeouts, quota
-  exhaustion, manifest corruption (truncated upload)
-- README: setup guide, comparison with magic-nix-cache/cachix/attic,
-  configuration reference, security notes (trusted=true rationale,
-  PR scope isolation)
-- Decide: nix-community adoption, binary cache of hestia itself for
-  bootstrap (`nix run github:.../hestia`)
+**Status: done** (except the items listed under "Pending" below, which
+need a merge to main / a human decision). Findings recorded under
+Decisions (21–27).
+
+- [x] Failure-mode tests against fake-gha (extended error injection):
+      token expiry mid-upload (clear error, no partial commit), quota
+      exhaustion (graceful failure, orphaned packs cleaned by next GC),
+      Azure connection drops (transparent retry, clean 404 when
+      persistent), manifest corruption (daemon starts with empty manifest,
+      never crashes CI; GC refuses to act), concurrent serve daemons
+      (manifests merge, nothing lost)
+- [x] hestia-action rework: single node24 JS action with native `post:`
+      drain; sha256-verified release install or local-binary input;
+      nix.conf wiring (?trusted=true&priority=30, post-build-hook shim,
+      fallback); daemon start + /nix-cache-info readiness poll;
+      `action/README.md`
+- [x] CI `action-test` job: full end-to-end loop on a real runner
+      (install → build → hook → drain → substitute back out of the cache)
+- [x] `.github/workflows/gc.yml`: daily cron GC on the default branch
+      (doubles as the reference example for other repositories)
+- [x] `README.md`: what/why, architecture, quick start, configuration
+      reference, comparison table, security notes, limitations
+- [x] Release plumbing: `.github/workflows/release.yml` (tag push → static
+      musl binaries for x86_64-linux + aarch64-linux → GitHub release),
+      Cargo.toml metadata, version 0.1.0-alpha.1
+- [x] Real-API validation: token capture, blob round-trip/Range/delete,
+      restore-key semantics — all green in CI on the real cache service
+
+**Pending (needs merge to main / human decision):**
+
+- Enable the `dogfood` job on main (set repository variable
+  `HESTIA_DOGFOOD=true` after the merge)
+- Create the first release: tag `v0.1.0-alpha.1` on main, verify the
+  release workflow, then update the sha256 in the README/action examples
+- nix-community migration (repository transfer + harmonia crates on
+  crates.io would remove the git-dependency pin)
 
 ## Testing Strategy
 
@@ -506,21 +536,40 @@ API gets faked, and only because GitHub gives no other choice locally.
 
 ## Open Questions
 
+Genuinely unresolved items. Everything that got decided or answered during
+implementation lives under [Decisions](#decisions) below; numbering is
+shared between the two sections (an item keeps its number when it moves).
+
 1. **Multi-system runs** (e.g. matrix x86_64-linux + aarch64-darwin in one
-   workflow): separate roots per system work, but should packs be
-   system-tagged so GC can repack them separately? Probably yes — chunk
-   locality per system improves Range batching. Decide in Phase 2.
+   workflow): separate roots per system work (and are covered by tests),
+   but packs are not system-tagged, so GC repacks mix systems and Range
+   batching loses some locality. Tag packs by system once a real
+   multi-system workload shows the cost matters.
 2. **Manifest size at scale**: 531 paths ≈ 40 KB compressed. A monorepo with
    10k local paths ≈ ~800 KB. Fine. But the reachability walk and merge are
-   O(paths) per drain — measure in Phase 3, consider incremental merge if
-   slow.
-3. **Idle-exit vs post-step drain**: post-step is reliable on GitHub-hosted
-   runners; idle-exit is the fallback for setups that can't run post steps
-   (act, some self-hosted). Ship both; default to post-step.
+   O(paths) per drain — not yet measured under a large real workload;
+   consider incremental merge if dogfooding shows it is slow.
 4. **harmonia API stability**: git-pinned rev; harmonia refactors freely.
    Budget for occasional `cargo update` breakage. If it hurts, ask harmonia
    to publish the leaf crates (file-nar, file-core, store-path,
    utils-hash/signature/base-encoding) to crates.io.
+8. **Upload-URL refresh is unsolved** (Phase 1 finding). Download URLs can
+   be refreshed by calling GetCacheEntryDownloadURL again, but there is no
+   Twirp call that re-issues an upload URL for an already-reserved key
+   (CreateCacheEntry returns already_exists). If an upload outlives its SAS
+   URL (~long uploads on slow links), the entry is stuck: it can neither be
+   uploaded nor re-reserved. Mitigation for now: upload promptly after
+   reserving, keep packs well under a size where this matters. Revisit
+   when packs grow — possibly split giant packs.
+
+## Decisions
+
+Resolved questions and findings, in the order they came up. Numbering
+continues from / interleaves with the Open Questions section above.
+
+3. **Idle-exit vs post-step drain**: post-step is reliable on GitHub-hosted
+   runners; idle-exit is the fallback for setups that can't run post steps
+   (act, some self-hosted). Ship both; default to post-step.
 5. **Composite actions cannot declare `post:`** (Phase 0 finding). The
    action.yml sketch above showing a top-level `post:` is invalid for
    composite actions; only JS (`using: nodeXX`) actions support post hooks.
@@ -531,6 +580,8 @@ API gets faked, and only because GitHub gives no other choice locally.
    consumed from another repo. Before publishing (Phase 6), either convert
    the wrapper to a single JS action (no `actions/github-script` dependency,
    native `post:`) or use `${{ github.action_path }}`-based resolution.
+   *Resolved in Phase 6*: the wrapper is now a single node24 JS action with
+   a native `post:` hook (Decision 25).
 6. **reqwest 0.13 renamed the TLS feature**: `rustls-tls` → `rustls`
    (Phase 0 finding; the dependency table said "reqwest (rustls)").
    Resolved in Phase 1: reqwest 0.13 dropped the `webpki-roots` option
@@ -544,19 +595,13 @@ API gets faked, and only because GitHub gives no other choice locally.
    If that becomes a problem (e.g. pure-eval contexts), switch to explicit
    `outputHashes` — every harmonia crate in Cargo.lock needs an entry, all
    sharing the same hash.
-8. **Upload-URL refresh is unsolved** (Phase 1 finding). Download URLs can
-   be refreshed by calling GetCacheEntryDownloadURL again, but there is no
-   Twirp call that re-issues an upload URL for an already-reserved key
-   (CreateCacheEntry returns already_exists). If an upload outlives its SAS
-   URL (~long uploads on slow links), the entry is stuck: it can neither be
-   uploaded nor re-reserved. Mitigation for now: upload promptly after
-   reserving, keep packs well under a size where this matters. Revisit in
-   Phase 3 (pipeline) — possibly split giant packs.
 9. **Twirp lookup misses are ambiguous** (Phase 1 finding): the service can
    signal "no entry" either as HTTP 200 + `ok=false` or as a Twirp
    `not_found` error depending on path. The client treats both as a miss;
    the fake uses `ok=false` (matching go-actions-cache's expectation).
-   Verify against the real service output once CI runs.
+   *Verified against the real service in Phase 6* — with one extra finding:
+   GetCacheEntryDownloadURL ignores the `key` field for matching and only
+   prefix-matches `restore_keys` (Decision 24).
 10. **Manifest schema deviations from the PLAN sketch** (Phase 2):
     `ChunkList` is a struct with a named `chunks` field (not a tuple
     newtype) because harmonia's `Regular<C>` flattens its contents with
@@ -665,6 +710,55 @@ API gets faked, and only because GitHub gives no other choice locally.
     orphaned. Timestamps come from the REST API's RFC 3339 strings; the
     parser/formatter is hand-rolled in `gha::rest` (no chrono dependency)
     and the fake backend emits the same format production does.
+
+21. **A corrupt manifest degrades to an empty manifest, except in GC**
+    (Phase 6). Manifest decode failures (truncated upload, garbage blob)
+    previously failed every drain forever. Now `decode_manifest_or_empty`
+    logs the error and returns an empty manifest: cached paths read as
+    misses, Nix rebuilds them, and the next commit overwrites the corrupt
+    version. A binary cache must never be the reason CI fails. GC is the
+    one exception — it still fails loudly, because deleting packs based on
+    unreadable state would turn a corruption into data loss.
+
+22. **Token expiry gets a dedicated error** (Phase 6). Twirp HTTP 401 maps
+    to `Error::TokenExpired` with an actionable message (the runtime JWT
+    lives ~6h; re-running the job is the only fix) instead of a generic
+    "unexpected HTTP status 401". No partial manifest is ever committed on
+    the way down: SaveMutable only finalizes complete uploads.
+
+23. **The substituter retries transient Azure failures** (Phase 6). Pack
+    Range reads retry up to twice on network errors and 5xx responses
+    before the NAR request turns into a 404. Auth failures (401/403) still
+    take the URL-refresh path; missing blobs (eviction) still fail
+    immediately. The "never partial or corrupt data" rule is unchanged.
+
+24. **GetCacheEntryDownloadURL only matches restore keys** (Phase 6,
+    real-API finding). The production service ignores the `key` field for
+    matching; an exact-key request with empty `restore_keys` misses even
+    when the entry exists. The client now always sends the key as the
+    first restore key (go-actions-cache does the same), and the fake
+    mimics the restore-keys-only matching so it cannot drift back. Caught
+    by `tests/gha_real.rs` in the first CI run against the real service.
+
+25. **The action is a single node24 JS action** (Phase 6, resolves
+    Decision 5's caveat). Composite + nested-node-action workaround
+    replaced by one JS action with a native `post:` hook, no
+    `actions/github-script` dependency, and no npm dependencies at all
+    (node builtins + workflow commands replace @actions/core). Install
+    modes: sha256-verified release download, local binary path, or
+    token-capture-only (used by hestia's own CI and real-API tests).
+
+26. **Release binaries are static (musl)** (Phase 6). Nix-built dynamic
+    binaries reference /nix/store library paths and cannot run on stock
+    runners where the action downloads them. `packages.static` builds with
+    pkgsStatic; rusqlite already bundles sqlite and reqwest uses rustls,
+    so this needed no code changes. aarch64-linux builds natively on
+    ubuntu-24.04-arm runners (no cross compilation).
+
+27. **CI uses NixOS/nix-installer-action** (Phase 6). The Determinate
+    Systems installer action increasingly diverges from upstream Nix (it
+    installs Determinate Nix by default); the NixOS-org fork tracks
+    upstream. It publishes no version tags yet, so it is pinned `@main`.
 
 ## Mistakes Fixed from Earlier Draft
 
