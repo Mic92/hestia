@@ -221,6 +221,7 @@ impl PipelineContext {
             return Ok(stats);
         }
 
+        let load_started = std::time::Instant::now();
         let (loaded_version, loaded) = self.load_manifest_versioned().await?;
 
         // Read-your-writes (PLAN.md Decision 28): cache lookups may lag
@@ -296,6 +297,8 @@ impl PipelineContext {
         let mut prepared: Vec<PreparedPath> = Vec::new();
         // Chunks of earlier prepared paths in this batch (cross-path dedup).
         let mut batch_chunks: BTreeSet<crate::manifest::ChunkHash> = BTreeSet::new();
+
+        stats.load_ms = load_started.elapsed().as_millis() as u64;
 
         let chunk_started = std::time::Instant::now();
         for (path, info) in to_push {

@@ -75,6 +75,10 @@ pub struct DrainStats {
     /// needed committing.
     #[serde(default)]
     pub manifest_version: u64,
+    /// Time spent loading the manifest and querying the local store
+    /// (everything before chunking starts), in milliseconds.
+    #[serde(default)]
+    pub load_ms: u64,
     /// Time spent chunking and verifying new paths, in milliseconds.
     #[serde(default)]
     pub chunk_ms: u64,

@@ -85,7 +85,10 @@ fn throughput(bytes: u64, ms: u64) -> u64 {
 
 /// Per-stage timing breakdown of a drain, for the daemon log.
 pub fn stage_breakdown(stats: &DrainStats) -> String {
-    let mut stages = vec![format!("chunk {}", seconds(stats.chunk_ms))];
+    let mut stages = vec![
+        format!("load {}", seconds(stats.load_ms)),
+        format!("chunk {}", seconds(stats.chunk_ms)),
+    ];
     if stats.packs_uploaded > 0 {
         stages.push(format!(
             "pack {} ({}, {})",
@@ -150,7 +153,8 @@ mod tests {
             packs_uploaded: 1,
             bytes_uploaded: 456_789,
             manifest_version: 7,
-            chunk_ms: 1_200,
+            load_ms: 200,
+            chunk_ms: 1_000,
             pack_ms: 500,
             upload_ms: 200,
             commit_ms: 100,
@@ -163,8 +167,8 @@ mod tests {
         );
         assert_eq!(
             stage_breakdown(&stats),
-            "chunk 1.2s, pack 0.5s (123 chunks, 1 pack), upload 0.2s (2.2 MiB/s), \
-             commit 0.1s, total 2.0s"
+            "load 0.2s, chunk 1.0s, pack 0.5s (123 chunks, 1 pack), \
+             upload 0.2s (2.2 MiB/s), commit 0.1s, total 2.0s"
         );
     }
 
@@ -173,6 +177,7 @@ mod tests {
         let stats = DrainStats {
             pushed: 2,
             manifest_version: 3,
+            load_ms: 100,
             chunk_ms: 400,
             commit_ms: 100,
             elapsed_ms: 600,
@@ -181,7 +186,7 @@ mod tests {
         assert_eq!(summarize(&stats), "pushed 2 paths; manifest m#3");
         assert_eq!(
             stage_breakdown(&stats),
-            "chunk 0.4s, commit 0.1s, total 0.6s"
+            "load 0.1s, chunk 0.4s, commit 0.1s, total 0.6s"
         );
     }
 
@@ -206,7 +211,7 @@ mod tests {
         );
         assert_eq!(
             stage_breakdown(&stats),
-            "chunk 0.3s, pack 0.1s (1 chunk, 1 pack), upload 0.5s (2.0 MiB/s), \
+            "load 0.0s, chunk 0.3s, pack 0.1s (1 chunk, 1 pack), upload 0.5s (2.0 MiB/s), \
              commit 0.1s, total 1.0s"
         );
     }
