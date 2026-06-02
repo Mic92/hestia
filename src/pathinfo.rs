@@ -112,11 +112,6 @@ pub struct StoreDatabase {
 }
 
 impl StoreDatabase {
-    /// The system store: `/nix/store` backed by [`DEFAULT_DB_PATH`].
-    pub fn system() -> Self {
-        Self::new(DEFAULT_DB_PATH)
-    }
-
     /// A database for the default store dir (`/nix/store`) at a custom
     /// database location.
     pub fn new(db_path: impl Into<PathBuf>) -> Self {
@@ -252,8 +247,8 @@ mod tests {
     }
 
     #[test]
-    fn system_database_uses_default_locations() {
-        let store = StoreDatabase::system();
+    fn default_db_path_database_uses_default_store_dir() {
+        let store = StoreDatabase::new(DEFAULT_DB_PATH);
         assert_eq!(store.db_path(), Path::new(DEFAULT_DB_PATH));
         assert_eq!(store.store_dir().to_str(), "/nix/store");
     }

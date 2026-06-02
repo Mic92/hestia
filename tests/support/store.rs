@@ -290,7 +290,7 @@ impl DestinationStore {
 /// Open the system store database, or return `None` (test should skip)
 /// when it does not exist or is not readable.
 pub fn system_db_or_skip() -> Option<StoreDatabase> {
-    let store = StoreDatabase::system();
+    let store = StoreDatabase::new(DEFAULT_DB_PATH);
     if !Path::new(DEFAULT_DB_PATH).exists() {
         eprintln!("skipping: no system store database at {DEFAULT_DB_PATH}");
         return None;
