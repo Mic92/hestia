@@ -203,8 +203,10 @@ rebuilt.
   least-recently-used entries under pressure and after 7 days idle. Hestia
   treats the cache as lossy: evicted paths are rebuilt and re-pushed.
 * **Branch scoping.** PR builds read the default branch's cache but write
-  only their own scope. The shared cache only grows when the default branch
-  builds. Run GC on the default branch only.
+  only their own scope; GitHub enforces this server-side and it cannot be
+  disabled. The shared cache therefore only grows when the default branch
+  builds, and main does one full rebuild of changed paths after every merge.
+  Run GC on the default branch only.
 * **CI-only.** The cache API is unreachable from outside GitHub Actions;
   hestia cannot serve developer machines. Use cachix/attic for that.
 * **Token lifetime.** The cache API token is a ~6 h JWT. Jobs that run
