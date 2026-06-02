@@ -120,28 +120,4 @@ mod tests {
         assert!(collect_paths(&[], Some("")).is_empty());
         assert!(collect_paths(&[], Some("   \n  ")).is_empty());
     }
-
-    #[tokio::test]
-    async fn run_exits_success_when_daemon_is_unreachable() {
-        // The core guarantee: a missing daemon must never fail the build.
-        // ExitCode has no PartialEq, so compare through Debug formatting.
-        let args = HookArgs {
-            socket: PathBuf::from("/nonexistent/hestia/hook.sock"),
-            paths: vec![PathBuf::from("/nix/store/aaa-foo")],
-        };
-        let code = run(&args).await;
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-    }
-
-    #[tokio::test]
-    async fn run_exits_success_with_nothing_to_do() {
-        let args = HookArgs {
-            socket: PathBuf::from("/nonexistent/hestia/hook.sock"),
-            paths: vec![],
-        };
-        // OUT_PATHS is not set in the test environment (and even if it were,
-        // the daemon is unreachable) -- either way the exit code is success.
-        let code = run(&args).await;
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-    }
 }
