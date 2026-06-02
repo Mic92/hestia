@@ -19,8 +19,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
-
 use crate::chunker::{self, PackBuilder, chunk_path, nar_hash_from_chunks};
 use crate::gha::Error as GhaError;
 use crate::gha::savemutable::SaveMutable;
@@ -141,9 +139,8 @@ pub async fn upload_pack(
     match twirp.create_cache_entry(&key).await? {
         Reservation::AlreadyExists => Ok(false),
         Reservation::Created { upload_url } => {
-            let data = Bytes::from(pack.data.clone());
             twirp
-                .upload_and_finalize(http, &key, upload_url, data)
+                .upload_and_finalize(http, &key, upload_url, pack.data.clone())
                 .await?;
             Ok(true)
         }

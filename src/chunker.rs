@@ -173,7 +173,7 @@ impl PackBuilder {
     pub fn finish(self) -> Pack {
         Pack {
             hash: Hash32::digest(&self.buffer),
-            data: self.buffer,
+            data: Bytes::from(self.buffer),
             chunks: self.chunks,
         }
     }
@@ -183,8 +183,9 @@ impl PackBuilder {
 #[derive(Debug, Clone)]
 pub struct Pack {
     pub hash: PackHash,
-    /// The blob: concatenated zstd frames.
-    pub data: Vec<u8>,
+    /// The blob: concatenated zstd frames (`Bytes`, so upload retries
+    /// clone it cheaply).
+    pub data: Bytes,
     /// Chunk positions, in insertion order.
     pub chunks: Vec<(ChunkHash, PackedChunk)>,
 }
@@ -830,7 +831,7 @@ mod tests {
 
         // Corrupted compressed bytes -> decompression error or hash mismatch,
         // but never silently wrong data.
-        let mut corrupted = pack.data.clone();
+        let mut corrupted = pack.data.to_vec();
         let middle = corrupted.len() / 2;
         corrupted[middle] ^= 0xff;
         assert!(extract_chunk(&corrupted, &chunks[0].hash).is_err());
