@@ -3,25 +3,21 @@
 > ⚠️ **Alpha software**: APIs, cache format, and behavior may change without
 > notice. Not yet recommended for production CI.
 
-Speed up your Nix builds on GitHub Actions — for free, with zero setup.
+Hestia is a Nix binary cache for GitHub Actions. It stores build results in
+the GitHub Actions cache, so later runs download them instead of rebuilding.
+There is nothing to set up: no accounts, no secrets, no server to run. Add
+the action to your workflow and you have a binary cache.
 
-Hestia caches everything your CI builds in the **GitHub Actions cache**, so
-later runs download results instead of rebuilding them. No accounts, no
-secrets, no servers to run: add one action to your workflow and you have a
-binary cache.
+How it differs from [magic-nix-cache]:
 
-Compared to [magic-nix-cache], hestia is built for speed and efficiency:
-
-- **Faster cache transfers.** Build results are bundled into a few large
-  uploads/downloads instead of one cache entry per store path.
-- **Only changes are uploaded.** Data is deduplicated in small chunks, so a
-  nixpkgs bump re-uploads only what actually changed — not every rebuilt
-  package.
-- **No rate-limit errors.** Far fewer GitHub API calls means no more
-  `429 Too Many Requests` failures on large builds.
-- **The cache cleans itself.** A scheduled garbage-collection workflow keeps
-  your repository inside GitHub's 10 GB cache quota, keeping what your
-  branches still use and dropping the rest.
+- Build results are packed into a few large cache entries instead of one per
+  store path, which makes transfers a lot faster.
+- Data is deduplicated in content-defined chunks, so a nixpkgs bump uploads
+  only what changed rather than every rebuilt package.
+- It makes far fewer GitHub API calls, so large builds don't run into
+  `429 Too Many Requests`.
+- A scheduled garbage-collection workflow keeps your repository inside
+  GitHub's 10 GB cache quota by deleting paths no branch uses anymore.
 
 [magic-nix-cache]: https://github.com/DeterminateSystems/magic-nix-cache
 
@@ -45,13 +41,14 @@ jobs:
       - run: nix build .#
 ```
 
-Plus a daily GC workflow on the default branch — copy
-[`.github/workflows/gc.yml`](.github/workflows/gc.yml).
+Everything built in your workflow gets cached; later runs (and PRs) pull
+from the cache instead of rebuilding.
+
+You will also want a daily GC workflow on the default branch to stay within
+the cache quota; copy [`.github/workflows/gc.yml`](.github/workflows/gc.yml)
+for that.
 
 See [`action/README.md`](action/README.md) for all action inputs.
-
-That's it. Everything built in your workflow is cached; later runs (and PRs)
-pull from the cache instead of rebuilding.
 
 ## Comparison
 
@@ -61,16 +58,15 @@ pull from the cache instead of rebuilding.
 | Storage | GHA cache (free, 10 GB/repo) | GHA cache (free, 10 GB/repo) | cachix.org | your S3/disk |
 | Accounts / secrets needed | none | none | auth token | server + token |
 | Infrastructure to run | none | none | none | server, database, storage |
-| Uploads only what changed (dedup) | ✅ | ❌ (whole store paths) | ❌ | ✅ |
+| Uploads only what changed (dedup) | yes | no (whole store paths) | no | yes |
 | Rate-limit errors on big builds | no | yes (`429`) | no | no |
 | Garbage collection | automatic (scheduled workflow) | none (LRU eviction only) | retention rules | policies |
-| Cache shared beyond CI | ❌ (CI-only by design) | ❌ | ✅ (any machine) | ✅ |
-| Signing | not needed (`?trusted=true`, localhost) | not needed | ✅ | ✅ |
+| Cache shared beyond CI | no (CI-only by design) | no | yes (any machine) | yes |
+| Signing | not needed (`?trusted=true`, localhost) | not needed | yes | yes |
 | Telemetry | none | reports usage to Determinate Systems (opt-out) | — | none |
 
-Use cachix or attic when developer machines should hit the cache too.
-Use hestia when you want CI caching with zero accounts, zero secrets, and
-zero infrastructure.
+If developer machines should hit the cache too, you want cachix or attic
+instead; hestia only works inside CI.
 
 ## How it works
 
@@ -81,16 +77,16 @@ nix build ──built paths──▶ hestia ──upload──▶ GitHub Actions
 nix build ◀─cached paths── hestia ◀─download─ GitHub Actions cache
 ```
 
-Nix reports every path it builds to the daemon, and asks it for paths before
-building them — to Nix it looks like a regular binary cache. At the end of
+To Nix, the daemon looks like a regular binary cache: Nix asks it for paths
+before building them and reports every path it does build. At the end of
 the job, new build results and their runtime dependencies (the full closure,
 nixpkgs packages included) are split into content-defined chunks, packed
-into a few large blobs, and uploaded. Chunks already in the cache are never
-uploaded again, and every download is hash-verified before Nix gets to see
-it. Corrupt or evicted cache data simply means a rebuild — never wrong build
-inputs.
+into a few large blobs, and uploaded. Chunks that are already in the cache
+are never uploaded again, and every download is hash-verified before Nix
+gets to see it. The worst thing corrupt or evicted cache data can cause is a
+rebuild, never wrong build inputs.
 
-### Roots: what keeps cache data alive
+### Roots
 
 Every job records the paths it pushed and the paths it downloaded under a
 *root* named `<branch>-<system>`, e.g. `main-x86_64-linux`. The branch part
@@ -100,19 +96,20 @@ garbage collection; everything else is deleted once it falls out of the push
 grace period.
 
 Pull requests get their own roots (`123/merge-x86_64-linux`), so a PR cannot
-evict paths the default branch still needs. Roots that stop being updated —
-merged PRs, deleted branches — expire after `--root-ttl` (14 days by
+evict paths the default branch still needs. Roots that stop being updated
+(merged PRs, deleted branches) expire after `--root-ttl` (14 days by
 default) and their paths become collectable.
 
-This is hestia's liveness tracking inside the manifest. It is separate from
-GitHub's own cache access scoping (who may read/write entries, see
-[Security](#security)); both apply.
+Roots are how hestia decides what is still alive. They are unrelated to
+GitHub's own cache access scoping (who may read or write entries, see
+[Security](#security)), which applies on top.
 
 The full architecture and design rationale live in [PLAN.md](PLAN.md).
 
 ## Configuration reference
 
-The action covers the common case. Direct CLI use:
+The action takes care of all of this; the tables below are only relevant if
+you run the CLI yourself.
 
 ### `hestia serve` — per-job daemon
 
@@ -168,35 +165,40 @@ Always exits 0 (a failing post-build-hook would fail the build).
 
 ## Security
 
-**Why `?trusted=true` is safe here.** Hestia serves *unsigned* narinfos, and
-the action configures the substituter URL with `?trusted=true` so Nix accepts
-them. This does not weaken Nix's trust model in CI: the substituter listens
-on `127.0.0.1` inside the job, and everything it serves came either from the
-job's own builds or from cache entries that **only this repository's
-workflows** could have written. Trusting it is exactly as safe as trusting
-the runner that is already executing your build.
+### Why `?trusted=true` is safe here
 
-**PR scope isolation (GitHub's model, not hestia's).** GitHub gives each
-cache access scope: a PR job can *read* the default branch's cache but can
-only *write* to its own PR scope, which is discarded when the branch is
-deleted. Consequences:
+Hestia serves unsigned narinfos, and the action configures the substituter
+URL with `?trusted=true` so Nix accepts them. This does not weaken Nix's
+trust model in CI: the substituter listens on `127.0.0.1` inside the job, and
+everything it serves came either from the job's own builds or from cache
+entries that only this repository's workflows could have written. If you
+trust the runner to execute your build, there is nothing extra to trust
+here.
 
-* A malicious PR **cannot** poison the cache used by `main` or by other PRs.
-  Its writes land in its own scope and die with it.
-* A malicious PR **can** read everything `main` cached (already-public build
-  outputs) and can fill its own scope with garbage — bounded by the 10 GB
-  repo quota that GitHub evicts by LRU anyway.
+### PR scope isolation (GitHub's model, not hestia's)
+
+GitHub gives each cache entry an access scope: a PR job can read the default
+branch's cache but can only write to its own PR scope, which is discarded
+when the branch is deleted. In practice this means:
+
+* A malicious PR cannot poison the cache used by `main` or by other PRs.
+  Its writes land in its own scope and disappear with it.
+* A malicious PR can read everything `main` cached (which is just
+  already-public build outputs) and can fill its own scope with garbage,
+  bounded by the 10 GB repository quota that GitHub evicts by LRU anyway.
 * `pull_request_target` / fork PRs never get write tokens for the base
   scope; the standard GitHub Actions security guidance applies unchanged.
 
-**What hestia itself enforces.** Pack blobs are content-addressed
-(SHA-256-named, hash-verified on every read), NARs are verified against the
-manifest's NAR hash before being served, and corrupt or evicted data turns
-into a cache miss (rebuild) — never into wrong build inputs.
+### What hestia itself enforces
+
+Pack blobs are content-addressed (SHA-256-named, hash-verified on every
+read), and NARs are verified against the manifest's NAR hash before being
+served. Anything that doesn't check out is treated as a cache miss and gets
+rebuilt.
 
 ## Limitations
 
-* **10 GB per repository, shared.** The GHA cache quota covers *all*
+* **10 GB per repository, shared.** The GHA cache quota covers all
   workflows of the repo (including `actions/cache` users). GitHub evicts
   least-recently-used entries under pressure and after 7 days idle. Hestia
   treats the cache as lossy: evicted paths are rebuilt and re-pushed.
@@ -205,8 +207,9 @@ into a cache miss (rebuild) — never into wrong build inputs.
   builds. Run GC on the default branch only.
 * **CI-only.** The cache API is unreachable from outside GitHub Actions;
   hestia cannot serve developer machines. Use cachix/attic for that.
-* **Token lifetime.** The cache API token is a ~6 h JWT. Jobs longer than
-  that lose upload ability near the end (clear error, no corruption).
+* **Token lifetime.** The cache API token is a ~6 h JWT. Jobs that run
+  longer than that lose the ability to upload near the end (you get a clear
+  error, not corruption).
 * **Eviction semantics.** A path can disappear between the narinfo lookup
   and the NAR fetch (eviction race). Nix falls back to building; with
   `fallback = true` (set by the action) this never fails a job.
