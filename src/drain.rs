@@ -38,6 +38,11 @@ fn human_bytes(bytes: u64) -> String {
     format!("{value:.1} {unit}")
 }
 
+/// `0.5s`, `57.3s`.
+fn seconds(ms: u64) -> String {
+    format!("{:.1}s", ms as f64 / 1000.0)
+}
+
 /// Human-readable one-line summary of what a drain accomplished.
 pub fn summarize(stats: &DrainStats) -> String {
     let mut parts = vec![format!("pushed {}", count(stats.pushed, "path"))];
@@ -55,12 +60,15 @@ pub fn summarize(stats: &DrainStats) -> String {
     }
     let mut summary = parts.join(", ");
     if stats.packs_uploaded > 0 {
-        summary.push_str(&format!(
-            " ({}, {} in {})",
-            count(stats.new_chunks, "chunk"),
-            human_bytes(stats.bytes_uploaded),
-            count(stats.packs_uploaded, "pack"),
-        ));
+        let mut inner = human_bytes(stats.bytes_uploaded);
+        if stats.elapsed_ms > 0 {
+            inner.push_str(&format!(
+                " in {}, {}/s",
+                seconds(stats.elapsed_ms),
+                human_bytes(throughput(stats.bytes_uploaded, stats.elapsed_ms))
+            ));
+        }
+        summary.push_str(&format!(" ({inner})"));
     }
     if stats.manifest_version > 0 {
         summary.push_str(&format!("; manifest m#{}", stats.manifest_version));
@@ -68,6 +76,32 @@ pub fn summarize(stats: &DrainStats) -> String {
         summary.push_str("; nothing to commit");
     }
     summary
+}
+
+/// Bytes per second. `ms` is clamped to 1 to avoid dividing by zero.
+fn throughput(bytes: u64, ms: u64) -> u64 {
+    (bytes as f64 / (ms.max(1) as f64 / 1000.0)) as u64
+}
+
+/// Per-stage timing breakdown of a drain, for the daemon log.
+pub fn stage_breakdown(stats: &DrainStats) -> String {
+    let mut stages = vec![format!("chunk {}", seconds(stats.chunk_ms))];
+    if stats.packs_uploaded > 0 {
+        stages.push(format!(
+            "pack {} ({}, {})",
+            seconds(stats.pack_ms),
+            count(stats.new_chunks, "chunk"),
+            count(stats.packs_uploaded, "pack"),
+        ));
+        stages.push(format!(
+            "upload {} ({}/s)",
+            seconds(stats.upload_ms),
+            human_bytes(throughput(stats.bytes_uploaded, stats.upload_ms))
+        ));
+    }
+    stages.push(format!("commit {}", seconds(stats.commit_ms)));
+    stages.push(format!("total {}", seconds(stats.elapsed_ms)));
+    stages.join(", ")
 }
 
 pub async fn run(args: &DrainArgs) -> ExitCode {
@@ -116,12 +150,38 @@ mod tests {
             packs_uploaded: 1,
             bytes_uploaded: 456_789,
             manifest_version: 7,
+            chunk_ms: 1_200,
+            pack_ms: 500,
+            upload_ms: 200,
+            commit_ms: 100,
+            elapsed_ms: 2_000,
         };
-        let summary = summarize(&stats);
         assert_eq!(
-            summary,
+            summarize(&stats),
             "pushed 4 paths, 3 already cached, 2 upstream-signed, 1 invalid \
-             (123 chunks, 446.1 KiB in 1 pack); manifest m#7"
+             (446.1 KiB in 2.0s, 223.0 KiB/s); manifest m#7"
+        );
+        assert_eq!(
+            stage_breakdown(&stats),
+            "chunk 1.2s, pack 0.5s (123 chunks, 1 pack), upload 0.2s (2.2 MiB/s), \
+             commit 0.1s, total 2.0s"
+        );
+    }
+
+    #[test]
+    fn deduplicated_drain_has_no_upload_in_summary_or_breakdown() {
+        let stats = DrainStats {
+            pushed: 2,
+            manifest_version: 3,
+            chunk_ms: 400,
+            commit_ms: 100,
+            elapsed_ms: 600,
+            ..DrainStats::default()
+        };
+        assert_eq!(summarize(&stats), "pushed 2 paths; manifest m#3");
+        assert_eq!(
+            stage_breakdown(&stats),
+            "chunk 0.4s, commit 0.1s, total 0.6s"
         );
     }
 
@@ -131,13 +191,23 @@ mod tests {
             pushed: 1,
             new_chunks: 1,
             packs_uploaded: 1,
-            bytes_uploaded: 100,
+            bytes_uploaded: 1_048_576,
             manifest_version: 1,
+            chunk_ms: 300,
+            pack_ms: 100,
+            upload_ms: 500,
+            commit_ms: 100,
+            elapsed_ms: 1_000,
             ..DrainStats::default()
         };
         assert_eq!(
             summarize(&stats),
-            "pushed 1 path (1 chunk, 100 B in 1 pack); manifest m#1"
+            "pushed 1 path (1.0 MiB in 1.0s, 1.0 MiB/s); manifest m#1"
+        );
+        assert_eq!(
+            stage_breakdown(&stats),
+            "chunk 0.3s, pack 0.1s (1 chunk, 1 pack), upload 0.5s (2.0 MiB/s), \
+             commit 0.1s, total 1.0s"
         );
     }
 

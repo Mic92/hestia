@@ -75,6 +75,21 @@ pub struct DrainStats {
     /// needed committing.
     #[serde(default)]
     pub manifest_version: u64,
+    /// Time spent chunking and verifying new paths, in milliseconds.
+    #[serde(default)]
+    pub chunk_ms: u64,
+    /// Time spent compressing chunks into packs, in milliseconds.
+    #[serde(default)]
+    pub pack_ms: u64,
+    /// Time spent uploading packs, in milliseconds.
+    #[serde(default)]
+    pub upload_ms: u64,
+    /// Time spent committing the manifest, in milliseconds.
+    #[serde(default)]
+    pub commit_ms: u64,
+    /// Wall-clock duration of the whole drain, in milliseconds.
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 /// One response line from the daemon.
