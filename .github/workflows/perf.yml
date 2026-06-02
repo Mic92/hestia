@@ -1,0 +1,66 @@
+# Daemon profiling on demand: build hestia with debug info, push a synthetic
+# workload through the daemon and substitute it back out, record both with
+# perf, and upload the flamegraphs as a workflow artifact.
+name: Perf
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  flamegraph:
+    runs-on: ubuntu-latest
+    permissions:
+      # The profiled daemon writes to the GHA cache.
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@main
+      - name: Build hestia with debug info
+        # The nix package strips debug info; perf needs it for DWARF
+        # unwinding and symbol names.
+        run: nix develop --command env CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --release
+      - name: Start hestia cache
+        uses: ./action
+        with:
+          binary: target/release/hestia
+      - name: Install perf
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -qy linux-tools-common "linux-tools-$(uname -r)" ||
+            sudo apt-get install -qy linux-tools-common linux-tools-generic
+          # Allow profiling other processes and resolving kernel symbols.
+          sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          perf --version
+      - name: Build synthetic workload
+        env:
+          PERF_WORKLOAD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: nix build --impure --file nix/perf-workload.nix -o ./workload
+      # Push direction: chunking, packing, uploading, manifest commit.
+      - name: Profile the drain
+        run: |
+          bin/profile.sh start
+          "$HESTIA_BIN" drain --socket "$HESTIA_SOCKET" --timeout 600
+          nix shell --inputs-from . nixpkgs#inferno \
+            --command bin/profile.sh stop drain-flamegraph.svg
+      # Serve direction: pack range reads, chunk decompression, NAR
+      # reassembly. The fresh store forces real substitution of the path
+      # the drain just uploaded.
+      - name: Profile substitution of the same path
+        run: |
+          bin/profile.sh start
+          nix copy --no-check-sigs \
+            --from "http://$HESTIA_LISTEN" \
+            --to /tmp/fresh-store \
+            "$(readlink -f ./workload)"
+          nix shell --inputs-from . nixpkgs#inferno \
+            --command bin/profile.sh stop substitute-flamegraph.svg
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flamegraphs
+          path: "*-flamegraph.svg"
+          if-no-files-found: error
