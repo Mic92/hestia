@@ -28,9 +28,16 @@ use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
 use crate::substituter::ManifestStore;
 use crate::upstream::UpstreamFilter;
+use futures_util::{StreamExt as _, TryStreamExt as _};
 
 /// SaveMutable family prefix for the manifest ("m" → keys `m#1`, `m#2`, …).
 pub const MANIFEST_PREFIX: &str = "m";
+
+/// Compressed bytes per pack before a new pack is started.
+pub const PACK_TARGET_SIZE: u64 = 64 * 1024 * 1024;
+
+/// How many packs upload concurrently during a drain.
+const UPLOAD_CONCURRENCY: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -162,6 +169,9 @@ pub struct PipelineContext {
     /// SaveMutable family prefix (always [`MANIFEST_PREFIX`] in production;
     /// tests use distinct prefixes to isolate scenarios).
     pub manifest_prefix: String,
+    /// Compressed bytes per pack ([`PACK_TARGET_SIZE`] in production; tests
+    /// use small values to exercise pack splitting).
+    pub pack_target_size: u64,
     /// Where committed manifests are published for the substituter.
     ///
     /// Read-your-writes: the cache service's lookups are eventually
@@ -349,27 +359,46 @@ impl PipelineContext {
 
         let mut delta = Manifest::new();
 
+        // Pack: seal a pack whenever it reaches the target size, so a large
+        // drain produces several packs that can upload concurrently.
         let pack_started = std::time::Instant::now();
+        let mut packs: Vec<chunker::Pack> = Vec::new();
         let mut builder = PackBuilder::new();
         for path in &prepared {
             for chunk in &path.new_chunks {
                 builder.add(chunk)?;
+                if builder.compressed_size() >= self.pack_target_size {
+                    packs.push(std::mem::take(&mut builder).finish());
+                }
+            }
+        }
+        if !builder.is_empty() {
+            packs.push(builder.finish());
+        }
+        stats.new_chunks = packs.iter().map(|pack| pack.chunks.len()).sum();
+        stats.pack_ms = pack_started.elapsed().as_millis() as u64;
+
+        let upload_started = std::time::Instant::now();
+        let upload_futures: Vec<_> = packs
+            .iter()
+            .map(|pack| async move {
+                let uploaded = upload_pack(&self.twirp, &self.http, pack).await?;
+                Ok::<_, GhaError>((uploaded, pack.data.len() as u64))
+            })
+            .collect();
+        let uploads: Vec<(bool, u64)> = futures_util::stream::iter(upload_futures)
+            .buffer_unordered(UPLOAD_CONCURRENCY)
+            .try_collect()
+            .await?;
+        stats.upload_ms = upload_started.elapsed().as_millis() as u64;
+        for (uploaded, size) in uploads {
+            if uploaded {
+                stats.packs_uploaded += 1;
+                stats.bytes_uploaded += size;
             }
         }
 
-        if !builder.is_empty() {
-            let pack = builder.finish();
-            stats.new_chunks = pack.chunks.len();
-            stats.pack_ms = pack_started.elapsed().as_millis() as u64;
-
-            let upload_started = std::time::Instant::now();
-            let uploaded = upload_pack(&self.twirp, &self.http, &pack).await?;
-            stats.upload_ms = upload_started.elapsed().as_millis() as u64;
-            if uploaded {
-                stats.packs_uploaded += 1;
-                stats.bytes_uploaded += pack.data.len() as u64;
-            }
-
+        for pack in &packs {
             for (chunk_hash, location) in pack.locations() {
                 delta.chunks.insert(chunk_hash, location);
             }

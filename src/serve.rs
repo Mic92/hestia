@@ -365,6 +365,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         expand_closure: !args.no_closure,
         root_key: pipeline::root_key(&branch, &system),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
+        pack_target_size: pipeline::PACK_TARGET_SIZE,
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.
         publish: None,
     };

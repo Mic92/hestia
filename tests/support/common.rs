@@ -11,7 +11,7 @@ use hestia::gha::savemutable::SaveMutable;
 use hestia::gha::twirp::{Reservation, TwirpClient};
 use hestia::manifest::{FileSystemObject, Manifest, PathHash};
 use hestia::pathinfo::StoreDatabase;
-use hestia::pipeline::{MANIFEST_PREFIX, PipelineContext};
+use hestia::pipeline::{MANIFEST_PREFIX, PACK_TARGET_SIZE, PipelineContext};
 use hestia::upstream::UpstreamFilter;
 
 use super::fake_gha::FakeGha;
@@ -45,6 +45,7 @@ pub fn pipeline_context_with(
         expand_closure: true,
         root_key: TEST_ROOT_KEY.to_string(),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
+        pack_target_size: PACK_TARGET_SIZE,
         publish: None,
     }
 }

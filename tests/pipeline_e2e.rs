@@ -436,3 +436,40 @@ async fn identical_content_across_paths_shares_chunks() {
     assert_eq!(manifest.paths.len(), 2);
     assert_all_chunks_locatable(&manifest);
 }
+
+#[tokio::test]
+async fn small_pack_target_splits_a_drain_into_multiple_packs() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    // ~600 KB of pseudo-random data -> several FastCDC chunks.
+    let fixture = store.add_fixture("multipack", 7);
+
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let ctx = PipelineContext {
+        // Every chunk exceeds the target, so every chunk seals its own pack.
+        pack_target_size: 1,
+        ..context(&fake, &http, store.database())
+    };
+
+    let stats = ctx
+        .run(to_path_set(&[&fixture]), BTreeSet::new(), now_unix())
+        .await
+        .expect("pipeline run failed");
+
+    assert_eq!(stats.pushed, 1);
+    assert!(
+        stats.packs_uploaded >= 2,
+        "expected multiple packs, got {}",
+        stats.packs_uploaded
+    );
+    assert_eq!(stats.packs_uploaded, pack_count(&fake, &http).await);
+
+    // Every chunk must remain locatable across the pack split.
+    let (_, manifest) = committed_manifest(&fake, &http)
+        .await
+        .expect("manifest committed");
+    assert_eq!(manifest.packs.len(), stats.packs_uploaded);
+    assert_all_chunks_locatable(&manifest);
+}
