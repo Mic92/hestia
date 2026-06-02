@@ -27,7 +27,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
 
-use crate::chunker::{self, PackBuilder, extract_chunk, flatten_tree, pack_cache_key};
+use crate::chunker::{
+    self, PackBuilder, coalesce_adjacent, extract_chunk, flatten_tree, pack_cache_key,
+};
 use crate::cli::GcArgs;
 use crate::gha::rest::{CacheEntry, RestClient};
 use crate::gha::savemutable::SaveMutable;
@@ -755,17 +757,8 @@ impl GcContext {
                 };
 
                 // Coalesce adjacent frames into single Range requests.
-                let mut runs: Vec<Vec<&ChunkCopy>> = Vec::new();
-                for copy in copies {
-                    let adjacent = runs.last().and_then(|run| run.last()).is_some_and(|last| {
-                        last.from.offset + u64::from(last.from.compressed_size) == copy.from.offset
-                    });
-                    if adjacent {
-                        runs.last_mut().expect("non-empty").push(copy);
-                    } else {
-                        runs.push(vec![copy]);
-                    }
-                }
+                let runs =
+                    coalesce_adjacent(copies, |copy| (copy.from.offset, copy.from.compressed_size));
 
                 for run in runs {
                     let start = run[0].from.offset;

@@ -34,7 +34,9 @@ use harmonia_store_nar_info::{build_narinfo, format_narinfo_txt};
 use harmonia_store_path::StoreDir;
 use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
 
-use crate::chunker::{self, extract_chunk, flatten_tree, nar_from_chunks, pack_cache_key};
+use crate::chunker::{
+    self, coalesce_adjacent, extract_chunk, flatten_tree, nar_from_chunks, pack_cache_key,
+};
 use crate::gha::twirp::{DownloadUrl, TwirpClient};
 use crate::gha::{Error as GhaError, blob};
 use crate::manifest::{
@@ -344,19 +346,9 @@ impl ChunkFetcher {
         chunks.sort_by_key(|(_, location)| location.offset);
 
         // Coalesce adjacent chunks into runs.
-        let mut runs: Vec<Vec<(ChunkHash, ChunkLocation)>> = Vec::new();
-        for (hash, location) in chunks {
-            match runs.last_mut() {
-                Some(run)
-                    if run.last().is_some_and(|(_, last)| {
-                        last.offset + u64::from(last.compressed_size) == location.offset
-                    }) =>
-                {
-                    run.push((hash, location));
-                }
-                _ => runs.push(vec![(hash, location)]),
-            }
-        }
+        let runs = coalesce_adjacent(chunks, |(_, location)| {
+            (location.offset, location.compressed_size)
+        });
 
         let mut fetched = Vec::new();
         for run in runs {

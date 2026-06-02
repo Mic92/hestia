@@ -190,6 +190,28 @@ pub struct Pack {
     pub chunks: Vec<(ChunkHash, PackedChunk)>,
 }
 
+/// Group offset-sorted pack ranges into runs of adjacent frames, so each
+/// run can be fetched with one Range request. `span` returns an item's
+/// `(offset, compressed_size)`.
+pub fn coalesce_adjacent<T>(
+    items: impl IntoIterator<Item = T>,
+    span: impl Fn(&T) -> (u64, u32),
+) -> Vec<Vec<T>> {
+    let mut runs: Vec<Vec<T>> = Vec::new();
+    for item in items {
+        let (offset, _) = span(&item);
+        let adjacent = runs.last().and_then(|run| run.last()).is_some_and(|last| {
+            let (last_offset, last_size) = span(last);
+            last_offset + u64::from(last_size) == offset
+        });
+        match runs.last_mut() {
+            Some(run) if adjacent => run.push(item),
+            _ => runs.push(vec![item]),
+        }
+    }
+    runs
+}
+
 /// GHA cache key for a pack blob (`pack-<sha256 hex>`).
 pub fn pack_cache_key(hash: &PackHash) -> String {
     format!("pack-{}", hash.to_hex())
