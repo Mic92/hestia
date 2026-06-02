@@ -34,7 +34,7 @@ jobs:
       - uses: NixOS/nix-installer-action@main
       - uses: Mic92/hestia/action@main
         with:
-          version: v0.1.0-alpha.2
+          version: v0.1.0-alpha.3
           sha256: <sha256 of the release binary>
       - run: nix build .#
 ```
