@@ -101,8 +101,16 @@ impl DaemonState {
         let paths = std::mem::take(&mut *self.buffered.lock().expect("buffer lock poisoned"));
         let accessed = self.access_log.snapshot();
 
+        let started = Instant::now();
         match self.pipeline.run(paths.clone(), accessed, now_unix()).await {
-            Ok(stats) => {
+            Ok(mut stats) => {
+                stats.elapsed_ms = started.elapsed().as_millis() as u64;
+                if stats.pushed > 0 {
+                    eprintln!(
+                        "hestia serve: drain stages: {}",
+                        crate::drain::stage_breakdown(&stats)
+                    );
+                }
                 self.touch();
                 // The pipeline publishes the committed manifest into the
                 // shared ManifestStore itself (read-your-writes; reloading

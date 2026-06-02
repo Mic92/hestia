@@ -297,6 +297,7 @@ impl PipelineContext {
         // Chunks of earlier prepared paths in this batch (cross-path dedup).
         let mut batch_chunks: BTreeSet<crate::manifest::ChunkHash> = BTreeSet::new();
 
+        let chunk_started = std::time::Instant::now();
         for (path, info) in to_push {
             let chunked = chunk_path(&path).await?;
             let chunk_map = chunked.chunk_map();
@@ -341,8 +342,11 @@ impl PipelineContext {
             });
         }
 
+        stats.chunk_ms = chunk_started.elapsed().as_millis() as u64;
+
         let mut delta = Manifest::new();
 
+        let pack_started = std::time::Instant::now();
         let mut builder = PackBuilder::new();
         for path in &prepared {
             for chunk in &path.new_chunks {
@@ -353,8 +357,11 @@ impl PipelineContext {
         if !builder.is_empty() {
             let pack = builder.finish();
             stats.new_chunks = pack.chunks.len();
+            stats.pack_ms = pack_started.elapsed().as_millis() as u64;
 
+            let upload_started = std::time::Instant::now();
             let uploaded = upload_pack(&self.twirp, &self.http, &pack).await?;
+            stats.upload_ms = upload_started.elapsed().as_millis() as u64;
             if uploaded {
                 stats.packs_uploaded += 1;
                 stats.bytes_uploaded += pack.data.len() as u64;
@@ -394,6 +401,7 @@ impl PipelineContext {
 
         // The merge closure keeps the manifest it encoded so the committed
         // version can be published without re-loading it from the cache.
+        let commit_started = std::time::Instant::now();
         let mut committed: Option<Manifest> = None;
         let version = self
             .save_mutable()
@@ -419,6 +427,7 @@ impl PipelineContext {
                 Ok(encoded)
             })
             .await?;
+        stats.commit_ms = commit_started.elapsed().as_millis() as u64;
         stats.manifest_version = version;
 
         // Publish exactly what was committed (includes concurrent writers'
