@@ -19,15 +19,27 @@ start() {
     echo "recording already running (pid $(cat "$perf_pid_file"))" >&2
     exit 1
   fi
-  sudo perf record -F 199 --call-graph dwarf,16384 -a -o "$perf_data" &
-  echo $! >"$perf_pid_file"
-  # Let perf finish setting up before the caller starts the workload.
+  sudo perf record -F 99 --call-graph dwarf -a -o "$perf_data" &
+  local pid=$!
+  # Let perf finish setting up before the caller starts the workload, and
+  # catch immediate failures (bad options, missing permissions) here
+  # instead of as a confusing kill error in stop.
   sleep 1
-  echo "recording started (pid $(cat "$perf_pid_file"))" >&2
+  if ! sudo kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" || true
+    echo "perf record exited immediately; see its output above" >&2
+    exit 1
+  fi
+  echo "$pid" >"$perf_pid_file"
+  echo "recording started (pid $pid)" >&2
 }
 
 stop() {
   local output="${1:?usage: $0 stop <output.svg>}"
+  if [[ ! -e $perf_pid_file ]]; then
+    echo "no recording is running (start one with: $0 start)" >&2
+    exit 1
+  fi
   local pid
   pid=$(cat "$perf_pid_file")
 
@@ -39,10 +51,12 @@ stop() {
 
   local title
   title=$(basename "$output" .svg)
-  perf script -i "$perf_data" >"$perf_data.txt"
-  inferno-collapse-perf <"$perf_data.txt" |
+  # Stream perf script into the collapser: its text output is many times
+  # the size of perf.data and must not land on disk.
+  perf script -i "$perf_data" |
+    inferno-collapse-perf |
     inferno-flamegraph --title "$title" >"$output"
-  rm -f "$perf_data" "$perf_data.txt"
+  rm -f "$perf_data"
   echo "flamegraph written to $output" >&2
 }
 
