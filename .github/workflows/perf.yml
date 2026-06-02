@@ -19,6 +19,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
+      # rust-cache derives its cache key from `rustc -vV`, so the devshell
+      # toolchain has to be on PATH before it runs.
+      - name: Expose the devshell toolchain
+        run: nix develop --command which rustc | xargs dirname >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The toolchain is pinned by the flake; a nixpkgs bump must not
+          # reuse artifacts from the old compiler.
+          prefix-key: perf-${{ hashFiles('flake.lock') }}
       - name: Build hestia with debug info
         # The nix package strips debug info; perf needs it for DWARF
         # unwinding and symbol names.
