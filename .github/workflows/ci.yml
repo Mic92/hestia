@@ -39,9 +39,6 @@ jobs:
       # jobs substitute are complete and pushed.
       - name: Assert package closures are complete
         run: nix build .# .#gha-real-tests --no-link
-      - name: Show daemon log
-        if: ${{ always() && vars.HESTIA_DOGFOOD == 'true' }}
-        run: cat "$HESTIA_SERVE_LOG"
 
   # Phase 0 milestone: prove that the action wrapper makes the GHA cache
   # tokens visible to shell steps and that the results endpoint is reachable.
@@ -167,6 +164,3 @@ jobs:
             --to /tmp/fresh-store \
             "$path"
           test -e "/tmp/fresh-store$path"
-      - name: Show daemon log
-        if: always()
-        run: cat "$HESTIA_SERVE_LOG"

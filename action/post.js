@@ -10,28 +10,43 @@
 const fs = require('fs');
 const { spawnSync } = require('child_process');
 
+/** Read a value the main step saved with saveState(). */
+function getState(name) {
+  return (process.env[`STATE_${name}`] || '').trim();
+}
+
 function main() {
-  const binary = process.env.HESTIA_BIN || '';
+  const binary = getState('bin');
   if (!binary) {
     console.log('hestia-cache: no daemon was started in this job; nothing to drain');
     return 0;
   }
 
-  const socket = process.env.HESTIA_SOCKET || '/tmp/hestia/hook.sock';
-  const timeout = process.env.HESTIA_DRAIN_TIMEOUT || '300';
+  const socket = getState('socket');
+  const timeout = getState('drainTimeout') || '300';
 
   console.log('hestia-cache: draining (uploading built paths, committing the manifest)');
   const drain = spawnSync(binary, ['drain', '--socket', socket, '--timeout', timeout], {
     stdio: 'inherit',
   });
 
-  if (drain.status !== 0) {
-    // Show the daemon log: the drain summary alone rarely explains failures.
-    const log = process.env.HESTIA_SERVE_LOG || '';
-    if (log && fs.existsSync(log)) {
-      console.log('--- hestia serve log ---');
-      console.log(fs.readFileSync(log, 'utf8'));
+  // The daemon log carries what the drain summary does not: per-stage drain
+  // timings, substituter hits, and error details. Collapsed on success so it
+  // does not bury the summary; printed plainly on failure.
+  const log = getState('serveLog');
+  if (log && fs.existsSync(log)) {
+    if (drain.status === 0) {
+      console.log('::group::hestia daemon log');
+    } else {
+      console.log('--- hestia daemon log ---');
     }
+    console.log(fs.readFileSync(log, 'utf8'));
+    if (drain.status === 0) {
+      console.log('::endgroup::');
+    }
+  }
+
+  if (drain.status !== 0) {
     console.error('::error::hestia drain failed; the paths built by this job were not cached');
   }
   return drain.status === null ? 1 : drain.status;

@@ -30,6 +30,16 @@ function getInput(name) {
   return (process.env[`INPUT_${name.toUpperCase()}`] || '').trim();
 }
 
+/**
+ * Save a value for this invocation's post step (the runner exposes it there
+ * as STATE_<name>). Unlike exported environment variables, state is not
+ * shared between invocations: a job that runs this action twice gets two
+ * post steps, each draining its own daemon.
+ */
+function saveState(name, value) {
+  fs.appendFileSync(process.env.GITHUB_STATE, `${name}=${value}\n`);
+}
+
 function fail(message) {
   console.error(`::error::${message}`);
   process.exit(1);
@@ -297,13 +307,20 @@ async function main() {
   startDaemon(hestiaBin, listen, socket, logFile);
   await waitForReadiness(listen, logFile);
 
-  // State for later steps and the drain post-step.
+  // Environment variables for the user's later shell steps. When the action
+  // runs more than once in a job, these point at the latest daemon.
   exportVariable('HESTIA_BIN', hestiaBin);
   exportVariable('HESTIA_SOCKET', socket);
   exportVariable('HESTIA_LISTEN', listen);
   exportVariable('HESTIA_DRAIN_TIMEOUT', getInput('drain-timeout') || '300');
   exportVariable('HESTIA_SERVE_LOG', logFile);
   fs.appendFileSync(process.env.GITHUB_PATH, `${installDir}\n`);
+
+  // State for this invocation's own post step.
+  saveState('bin', hestiaBin);
+  saveState('socket', socket);
+  saveState('serveLog', logFile);
+  saveState('drainTimeout', getInput('drain-timeout') || '300');
 }
 
 main().catch((error) => {
