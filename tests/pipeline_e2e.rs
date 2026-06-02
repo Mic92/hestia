@@ -9,41 +9,17 @@ mod support;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use hestia::gha::savemutable::SaveMutable;
-use hestia::manifest::{FileSystemObject, Manifest, PathHash};
+use hestia::manifest::PathHash;
 use hestia::pathinfo::StoreDatabase;
-use hestia::pipeline::{AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
+use hestia::pipeline::{AccessLog, PipelineContext, now_unix};
 use hestia::upstream::UpstreamFilter;
 
+use support::common::{
+    TEST_ROOT_KEY, assert_all_chunks_locatable, committed_manifest, path_hash_of,
+    pipeline_context as context, to_path_set,
+};
 use support::fake_gha::FakeGha;
 use support::store::ScratchStore;
-
-const TEST_ROOT_KEY: &str = "main-test-system";
-
-fn context(fake: &FakeGha, http: &reqwest::Client, store: StoreDatabase) -> PipelineContext {
-    PipelineContext {
-        twirp: fake.twirp(http),
-        http: http.clone(),
-        store,
-        // Scratch store paths are unsigned, so the default filter (which
-        // would skip cache.nixos.org-signed paths) lets them through --
-        // exactly like locally built paths in production.
-        upstream: UpstreamFilter::default(),
-        expand_closure: true,
-        root_key: TEST_ROOT_KEY.to_string(),
-        manifest_prefix: MANIFEST_PREFIX.to_string(),
-        publish: None,
-    }
-}
-
-/// Load the committed manifest from the fake backend, or None if no version
-/// was ever committed.
-async fn committed_manifest(ctx: &PipelineContext) -> Option<(u64, Manifest)> {
-    let save = SaveMutable::new(&ctx.twirp, &ctx.http, &ctx.manifest_prefix);
-    let entry = save.load().await.expect("loading manifest failed")?;
-    let manifest = Manifest::decode(&entry.data).expect("manifest must decode");
-    Some((entry.index, manifest))
-}
 
 /// The store path basename (`<hash>-<name>`).
 fn fixture_name(store_path: &Path) -> String {
@@ -55,14 +31,6 @@ fn fixture_name(store_path: &Path) -> String {
         .to_string()
 }
 
-/// The manifest path key for a store path.
-fn path_hash_of(store_path: &Path) -> PathHash {
-    let name = store_path.file_name().unwrap().to_str().unwrap();
-    name[..32]
-        .parse()
-        .expect("store path basename starts with its hash")
-}
-
 /// Number of `pack-*` entries in the fake backend.
 async fn pack_count(fake: &FakeGha, http: &reqwest::Client) -> usize {
     fake.rest(http)
@@ -70,34 +38,6 @@ async fn pack_count(fake: &FakeGha, http: &reqwest::Client) -> usize {
         .await
         .expect("listing packs failed")
         .len()
-}
-
-/// Every chunk referenced by every path in the manifest must have a
-/// location pointing at a pack the manifest knows about.
-fn assert_all_chunks_locatable(manifest: &Manifest) {
-    for entry in manifest.paths.values() {
-        for (_, node) in hestia::chunker::flatten_tree(&entry.tree) {
-            if let FileSystemObject::Regular(regular) = node {
-                for chunk_hash in &regular.contents.chunks {
-                    let location = manifest
-                        .chunks
-                        .get(chunk_hash)
-                        .expect("tree chunk must have a location");
-                    assert!(
-                        manifest.packs.contains_key(&location.pack),
-                        "chunk location must point at a known pack"
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn to_path_set(paths: &[&Path]) -> BTreeSet<String> {
-    paths
-        .iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect()
 }
 
 #[tokio::test]
@@ -136,7 +76,9 @@ async fn pushes_paths_end_to_end() {
     assert_eq!(stats.manifest_version, 1);
 
     // The committed manifest is correct.
-    let (version, manifest) = committed_manifest(&ctx).await.expect("manifest committed");
+    let (version, manifest) = committed_manifest(&fake, &http)
+        .await
+        .expect("manifest committed");
     assert_eq!(version, 1);
     assert_eq!(manifest.paths.len(), 3);
 
@@ -199,7 +141,9 @@ async fn closure_expansion_pushes_dependencies() {
     assert_eq!(stats.paths_received, 1, "only top was hooked");
     assert_eq!(stats.pushed, 2, "top and its dependency must be pushed");
 
-    let (_, manifest) = committed_manifest(&ctx).await.expect("manifest committed");
+    let (_, manifest) = committed_manifest(&fake, &http)
+        .await
+        .expect("manifest committed");
     assert!(manifest.paths.contains_key(&path_hash_of(&top)));
     assert!(
         manifest.paths.contains_key(&path_hash_of(&dep)),
@@ -233,7 +177,9 @@ async fn no_closure_pushes_only_hooked_paths() {
 
     assert_eq!(stats.pushed, 1, "only the hooked path must be pushed");
 
-    let (_, manifest) = committed_manifest(&ctx).await.expect("manifest committed");
+    let (_, manifest) = committed_manifest(&fake, &http)
+        .await
+        .expect("manifest committed");
     assert!(manifest.paths.contains_key(&path_hash_of(&top)));
     assert!(
         !manifest.paths.contains_key(&path_hash_of(&dep)),
@@ -265,7 +211,9 @@ async fn disabled_upstream_filter_caches_signed_paths() {
     assert_eq!(stats.skipped_upstream, 0);
     assert_eq!(stats.pushed, 1, "signed path must be cached");
 
-    let (_, manifest) = committed_manifest(&ctx).await.expect("manifest committed");
+    let (_, manifest) = committed_manifest(&fake, &http)
+        .await
+        .expect("manifest committed");
     assert!(manifest.paths.contains_key(&path_hash_of(&signed)));
 }
 
@@ -308,7 +256,7 @@ async fn second_run_dedups_and_uploads_nothing() {
 
     // The path entry survived with its push clock bumped, and stays in
     // the root (dedup-skipped paths remain pinned).
-    let (_, manifest) = committed_manifest(&ctx).await.unwrap();
+    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
     let hash = path_hash_of(&fixture);
     assert_eq!(manifest.paths.len(), 1);
     assert_eq!(manifest.paths[&hash].last_pushed, second_now);
@@ -341,7 +289,7 @@ async fn upstream_signed_path_is_skipped() {
     assert_eq!(stats.manifest_version, 1);
 
     // Only the local path made it into the manifest and the root.
-    let (_, manifest) = committed_manifest(&ctx).await.unwrap();
+    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
     assert!(manifest.paths.contains_key(&path_hash_of(&local)));
     assert!(!manifest.paths.contains_key(&path_hash_of(&signed)));
     let root = &manifest.roots[TEST_ROOT_KEY];
@@ -372,7 +320,7 @@ async fn only_upstream_paths_means_nothing_is_committed() {
     assert_eq!(stats.skipped_upstream, 1);
     assert_eq!(stats.pushed, 0);
     assert_eq!(stats.manifest_version, 0, "nothing should be committed");
-    assert!(committed_manifest(&ctx).await.is_none());
+    assert!(committed_manifest(&fake, &http).await.is_none());
     assert_eq!(pack_count(&fake, &http).await, 0);
 }
 
@@ -408,7 +356,7 @@ async fn invalid_and_malformed_paths_are_skipped_without_failing_the_drain() {
     assert_eq!(stats.pushed, 1);
     assert_eq!(stats.manifest_version, 1);
 
-    let (_, manifest) = committed_manifest(&ctx).await.unwrap();
+    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
     assert_eq!(manifest.paths.len(), 1);
 }
 
@@ -440,7 +388,7 @@ async fn accessed_paths_join_the_root_without_store_queries() {
     assert_eq!(stats.packs_uploaded, 0);
     assert_eq!(stats.manifest_version, 1, "root-only update still commits");
 
-    let (_, manifest) = committed_manifest(&ctx).await.unwrap();
+    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
     let root = &manifest.roots[TEST_ROOT_KEY];
     assert!(root.paths.contains(&accessed_hash));
     assert_eq!(root.updated, now);
@@ -484,7 +432,7 @@ async fn identical_content_across_paths_shares_chunks() {
         second.new_chunks
     );
 
-    let (_, manifest) = committed_manifest(&ctx).await.unwrap();
+    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
     assert_eq!(manifest.paths.len(), 2);
     assert_all_chunks_locatable(&manifest);
 }

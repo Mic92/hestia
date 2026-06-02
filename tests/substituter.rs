@@ -14,15 +14,12 @@ use std::time::Duration;
 
 use hestia::chunker::pack_cache_key;
 use hestia::manifest::{Hash32, Manifest, PathHash};
-use hestia::pathinfo::StoreDatabase;
-use hestia::pipeline::{AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
+use hestia::pipeline::{AccessLog, now_unix};
 use hestia::substituter::{ManifestStore, Substituter};
-use hestia::upstream::UpstreamFilter;
 
+use support::common::{TEST_ROOT_KEY, pipeline_context, to_path_set};
 use support::fake_gha::FakeGha;
 use support::store::ScratchStore;
-
-const TEST_ROOT_KEY: &str = "main-test-system";
 
 /// Hard timeout for every test body: a hung server or a deadlocked await
 /// turns into a test failure instead of a stuck test binary.
@@ -32,23 +29,6 @@ async fn timed<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(TEST_TIMEOUT, future)
         .await
         .expect("test timed out: deadlock or hung server")
-}
-
-fn pipeline_context(
-    fake: &FakeGha,
-    http: &reqwest::Client,
-    store: StoreDatabase,
-) -> PipelineContext {
-    PipelineContext {
-        twirp: fake.twirp(http),
-        http: http.clone(),
-        store,
-        upstream: UpstreamFilter::default(),
-        expand_closure: true,
-        root_key: TEST_ROOT_KEY.to_string(),
-        manifest_prefix: MANIFEST_PREFIX.to_string(),
-        publish: None,
-    }
 }
 
 /// A substituter HTTP server running in the background of the test.
@@ -131,13 +111,6 @@ fn path_hash_str(store_path: &Path) -> String {
 
 fn path_hash_of(store_path: &Path) -> PathHash {
     path_hash_str(store_path).parse().unwrap()
-}
-
-fn to_path_set(paths: &[&Path]) -> BTreeSet<String> {
-    paths
-        .iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect()
 }
 
 /// Push paths through the write pipeline and return the committed manifest.

@@ -5,6 +5,7 @@
 //! meaningless here.
 #![allow(dead_code)]
 
+pub mod common;
 pub mod fake_gha;
 pub mod sim;
 pub mod store;

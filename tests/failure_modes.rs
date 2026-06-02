@@ -16,70 +16,21 @@
 mod support;
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use bytes::Bytes;
-
 use hestia::gc::{GcContext, GcPolicy};
-use hestia::gha::blob;
 use hestia::gha::savemutable::SaveMutable;
-use hestia::gha::twirp::{Reservation, TwirpClient};
-use hestia::manifest::{Manifest, PathHash};
 use hestia::pipeline::{AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
-use hestia::upstream::UpstreamFilter;
 
+use support::common::{
+    TEST_ROOT_KEY, committed_manifest, path_hash_of, pipeline_context, store_entry, to_path_set,
+};
 use support::fake_gha::FakeGha;
 use support::store::ScratchStore;
 
-const TEST_ROOT_KEY: &str = "main-test-system";
-
 fn context(fake: &FakeGha, http: &reqwest::Client, store: &ScratchStore) -> PipelineContext {
-    PipelineContext {
-        twirp: fake.twirp(http),
-        http: http.clone(),
-        store: store.database(),
-        upstream: UpstreamFilter::default(),
-        expand_closure: true,
-        root_key: TEST_ROOT_KEY.to_string(),
-        manifest_prefix: MANIFEST_PREFIX.to_string(),
-        publish: None,
-    }
-}
-
-/// Reserve + upload + finalize one cache entry directly (bypassing hestia's
-/// pipeline), e.g. to plant a corrupt manifest blob.
-async fn store_entry(twirp: &TwirpClient, http: &reqwest::Client, key: &str, data: &[u8]) {
-    let Reservation::Created { upload_url } = twirp.create_cache_entry(key).await.unwrap() else {
-        panic!("entry {key} unexpectedly already exists");
-    };
-    blob::put(http, &upload_url, Bytes::copy_from_slice(data))
-        .await
-        .unwrap();
-    twirp.finalize_upload(key, data.len() as u64).await.unwrap();
-}
-
-/// Load the committed manifest from the fake backend, or None.
-async fn committed_manifest(fake: &FakeGha, http: &reqwest::Client) -> Option<(u64, Manifest)> {
-    let twirp = fake.twirp(http);
-    let save = SaveMutable::new(&twirp, http, MANIFEST_PREFIX);
-    let entry = save.load().await.expect("loading manifest failed")?;
-    Some((
-        entry.index,
-        Manifest::decode(&entry.data).expect("manifest must decode"),
-    ))
-}
-
-fn path_hash_of(store_path: &Path) -> PathHash {
-    let name = store_path.file_name().unwrap().to_str().unwrap();
-    name[..32].parse().unwrap()
-}
-
-fn to_path_set(paths: &[&Path]) -> BTreeSet<String> {
-    paths
-        .iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect()
+    pipeline_context(fake, http, store.database())
 }
 
 // ---------------------------------------------------------------------------

@@ -13,23 +13,8 @@ use bytes::Bytes;
 use hestia::gha::savemutable::SaveMutable;
 use hestia::gha::twirp::{DownloadUrl, Reservation};
 use hestia::gha::{Error, blob};
+use support::common::store_entry;
 use support::fake_gha::FakeGha;
-
-/// Reserve + upload + finalize one entry; returns nothing but panics on error.
-async fn store_entry(
-    twirp: &hestia::gha::twirp::TwirpClient,
-    http: &reqwest::Client,
-    key: &str,
-    data: &[u8],
-) {
-    let Reservation::Created { upload_url } = twirp.create_cache_entry(key).await.unwrap() else {
-        panic!("entry {key} unexpectedly already exists");
-    };
-    blob::put(http, &upload_url, Bytes::copy_from_slice(data))
-        .await
-        .unwrap();
-    twirp.finalize_upload(key, data.len() as u64).await.unwrap();
-}
 
 #[tokio::test]
 async fn blob_round_trip() {

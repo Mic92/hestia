@@ -12,36 +12,15 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use hestia::gha::savemutable::SaveMutable;
-use hestia::manifest::Manifest;
 use hestia::pathinfo::StoreDatabase;
-use hestia::pipeline::{self, AccessLog, MANIFEST_PREFIX, PipelineContext};
+use hestia::pipeline::{self, AccessLog, PipelineContext};
 use hestia::protocol::{self, DrainStats, Request};
 use hestia::serve::Daemon;
 use hestia::substituter::{ManifestStore, Substituter};
-use hestia::upstream::UpstreamFilter;
 
+use support::common::{TEST_ROOT_KEY, committed_manifest, path_hash_of, pipeline_context};
 use support::fake_gha::FakeGha;
 use support::store::ScratchStore;
-
-const TEST_ROOT_KEY: &str = "main-test-system";
-
-fn pipeline_context(
-    fake: &FakeGha,
-    http: &reqwest::Client,
-    store: StoreDatabase,
-) -> PipelineContext {
-    PipelineContext {
-        twirp: fake.twirp(http),
-        http: http.clone(),
-        store,
-        upstream: UpstreamFilter::default(),
-        expand_closure: true,
-        root_key: TEST_ROOT_KEY.to_string(),
-        manifest_prefix: MANIFEST_PREFIX.to_string(),
-        publish: None,
-    }
-}
 
 /// A daemon running in the background of the test.
 struct RunningDaemon {
@@ -98,21 +77,6 @@ impl RunningDaemon {
         })
         .await
     }
-}
-
-async fn committed_manifest(fake: &FakeGha, http: &reqwest::Client) -> Option<(u64, Manifest)> {
-    let twirp = fake.twirp(http);
-    let save = SaveMutable::new(&twirp, http, MANIFEST_PREFIX);
-    let entry = save.load().await.expect("loading manifest failed")?;
-    Some((
-        entry.index,
-        Manifest::decode(&entry.data).expect("manifest must decode"),
-    ))
-}
-
-fn path_hash_of(store_path: &Path) -> hestia::manifest::PathHash {
-    let name = store_path.file_name().unwrap().to_str().unwrap();
-    name[..32].parse().unwrap()
 }
 
 #[tokio::test]
