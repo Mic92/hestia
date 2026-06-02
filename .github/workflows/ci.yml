@@ -18,10 +18,7 @@ jobs:
   # binary (this job cannot use the package it is about to build); with
   # the variables unset the dogfood step is skipped.
   #   HESTIA_DOGFOOD          "true"
-  #   HESTIA_DOGFOOD_VERSION  release tag, e.g. "v0.1.0-alpha.1"
-  #   HESTIA_DOGFOOD_SHA256   sha256 of that release's hestia-x86_64-linux
-  #   HESTIA_DOGFOOD_SHA256_AARCH64  same for hestia-aarch64-linux
-  #                           (used by release.yml's arm64 leg)
+  #   HESTIA_DOGFOOD_VERSION  release tag, e.g. "v0.1.0-alpha.4"
   build:
     runs-on: ubuntu-latest
     permissions:
@@ -36,7 +33,6 @@ jobs:
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
-          sha256: ${{ vars.HESTIA_DOGFOOD_SHA256 }}
       - name: Run flake checks
         run: nix flake check --print-build-logs
       # No-op after the flake checks; asserts the closures the dependent
@@ -73,7 +69,6 @@ jobs:
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
-          sha256: ${{ vars.HESTIA_DOGFOOD_SHA256 }}
       # No binary/version input: token-capture-only mode (must stay tested).
       - uses: ./action
       - name: Assert cache tokens are visible to shell steps
@@ -127,7 +122,6 @@ jobs:
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
-          sha256: ${{ vars.HESTIA_DOGFOOD_SHA256 }}
       - name: Build hestia
         run: nix build .# -o hestia-bin
       # Instance under test on its own port/socket, started last: the

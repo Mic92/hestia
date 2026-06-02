@@ -11,8 +11,9 @@ What it does, in order:
 1. Captures the Actions cache API tokens (`ACTIONS_RUNTIME_TOKEN`,
    `ACTIONS_RESULTS_URL`). These are only visible to JS actions — this is why
    hestia needs an action and cannot be set up from `run:` steps alone.
-2. Installs the `hestia` binary (from a GitHub release, sha256-verified, or
-   from a path you built yourself).
+2. Installs the `hestia` binary (from a GitHub release, verified against
+   GitHub's build provenance attestations, or from a path you built
+   yourself).
 3. Starts the hestia daemon: a post-build-hook listener plus a local
    substituter (Nix binary cache protocol over HTTP).
 4. Wires both into `nix.conf` (`extra-substituters` with `?trusted=true`,
@@ -35,7 +36,6 @@ jobs:
       - uses: Mic92/hestia/action@main
         with:
           version: v0.1.0-alpha.4
-          sha256: <sha256 of the release binary>
       - run: nix build .#
 ```
 
@@ -65,8 +65,8 @@ themselves (hestia's own integration tests use it).
 | Input | Default | Description |
 |---|---|---|
 | `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
-| `version` | — | Release tag to download (e.g. `v0.1.0-alpha.1`). Requires `sha256`. |
-| `sha256` | — | Expected SHA-256 of the downloaded binary. Downloads are refused without it. |
+| `version` | — | Release tag to download (e.g. `v0.1.0-alpha.4`). The download is verified against GitHub's build attestations. |
+| `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
 | `listen` | `127.0.0.1:37515` | Substituter listen address. |
 | `socket` | `/tmp/hestia/hook.sock` | Post-build-hook unix socket path. |
 | `drain-timeout` | `300` | Seconds the post-job step waits for the final upload. |

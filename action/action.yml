@@ -20,15 +20,16 @@ inputs:
   version:
     description: >
       Hestia release tag to download from GitHub releases
-      (e.g. "v0.1.0-alpha.1"). Requires `sha256`.
+      (e.g. "v0.1.0-alpha.4"). The downloaded binary is verified against
+      GitHub's build provenance attestations before it runs.
     required: false
     default: ""
-  sha256:
+  github-token:
     description: >
-      Expected SHA-256 hex digest of the downloaded release binary. Required
-      together with `version`; unverified downloads are refused.
+      Token for the attestation API lookup that verifies downloaded release
+      binaries.
     required: false
-    default: ""
+    default: ${{ github.token }}
   listen:
     description: Address the substituter HTTP server listens on.
     required: false

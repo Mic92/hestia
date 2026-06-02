@@ -6,7 +6,7 @@
 #
 # This workflow doubles as the reference for other repositories using
 # hestia: copy it, replace the "Build hestia" step with the action's
-# version/sha256 inputs (see action/README.md), and keep the permissions.
+# version input (see action/README.md), and keep the permissions.
 name: Cache GC
 
 on:
@@ -43,7 +43,6 @@ jobs:
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
-          sha256: ${{ vars.HESTIA_DOGFOOD_SHA256 }}
       - name: Build hestia
         if: vars.HESTIA_DOGFOOD != 'true'
         run: nix build .# -o hestia-bin

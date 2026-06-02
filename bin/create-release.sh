@@ -91,20 +91,12 @@ if [[ -z $run_id ]]; then
 fi
 gh run watch "$run_id" --exit-status
 
-# Point CI dogfooding at the new release.
-tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
-gh release download "$tag" --pattern '*.sha256' --dir "$tmpdir"
-sha256_x86_64=$(cut -d' ' -f1 "$tmpdir/hestia-x86_64-linux.sha256")
-sha256_aarch64=$(cut -d' ' -f1 "$tmpdir/hestia-aarch64-linux.sha256")
+# Point CI dogfooding at the new release. Downloads are verified via build
+# attestations, so only the version variable is needed.
 gh variable set HESTIA_DOGFOOD_VERSION --body "$tag"
-gh variable set HESTIA_DOGFOOD_SHA256 --body "$sha256_x86_64"
-gh variable set HESTIA_DOGFOOD_SHA256_AARCH64 --body "$sha256_aarch64"
 
 echo
 echo "released ${tag}:"
 gh release view "$tag" --json url --jq .url
 echo "dogfood variables updated:"
 echo "  HESTIA_DOGFOOD_VERSION=${tag}"
-echo "  HESTIA_DOGFOOD_SHA256=${sha256_x86_64}"
-echo "  HESTIA_DOGFOOD_SHA256_AARCH64=${sha256_aarch64}"

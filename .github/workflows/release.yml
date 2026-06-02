@@ -51,7 +51,6 @@ jobs:
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
-          sha256: ${{ matrix.system == 'aarch64-linux' && vars.HESTIA_DOGFOOD_SHA256_AARCH64 || vars.HESTIA_DOGFOOD_SHA256 }}
       - name: System diagnostics
         run: |
           uname -a
@@ -133,9 +132,9 @@ jobs:
             *-*) prerelease=(--prerelease) ;;
           esac
 
-          # Release notes: usage snippet with the real sha256 values, so the
-          # release is copy-paste usable; --generate-notes appends the
-          # auto-generated changelog below it.
+          # Release notes: copy-paste usage snippet; --generate-notes appends
+          # the changelog below it. The checksums table is for manual
+          # verification only (the action checks the build attestations).
           sha256_x86_64=$(cut -d' ' -f1 hestia-x86_64-linux.sha256)
           sha256_aarch64=$(cut -d' ' -f1 hestia-aarch64-linux.sha256)
           cat > notes.md <<EOF
@@ -147,7 +146,6 @@ jobs:
           - uses: Mic92/hestia/action@${tag}
             with:
               version: ${tag}
-              sha256: ${sha256_x86_64}   # x86_64-linux
           \`\`\`
 
           ## Checksums (SHA-256)

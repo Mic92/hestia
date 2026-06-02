@@ -66,6 +66,54 @@ function captureTokens() {
   console.log('hestia-cache: cache tokens captured and exported');
 }
 
+/**
+ * Verify a downloaded release binary against GitHub's attestation API.
+ *
+ * The lookup is scoped to `repo` and keyed by content digest, so a match
+ * proves the binary was built by that repository's release workflow. The
+ * Sigstore signature is not checked (that needs a full Sigstore client);
+ * the trust anchor is the GitHub API over TLS, the same anchor the release
+ * download relies on.
+ */
+async function verifyAttestation(repo, assetName, digest, token) {
+  const url = `https://api.github.com/repos/${repo}/attestations/sha256:${digest}`;
+  const headers = {
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    fail(`attestation lookup failed: HTTP ${response.status} for ${url}`);
+  }
+  const attestations = (await response.json()).attestations || [];
+  if (attestations.length === 0) {
+    fail(
+      `no build attestation found for ${assetName} (sha256:${digest}) in ${repo}; ` +
+        'refusing to run an unverified binary'
+    );
+  }
+
+  // The API does not always inline the bundle (sometimes there is only a
+  // compressed bundle_url), so logging the building workflow is best effort.
+  let builtBy = '';
+  for (const attestation of attestations) {
+    try {
+      const statement = JSON.parse(
+        Buffer.from(attestation.bundle.dsseEnvelope.payload, 'base64').toString('utf8')
+      );
+      const workflow = statement.predicate.buildDefinition.externalParameters.workflow;
+      builtBy = `, built by ${workflow.repository}/${workflow.path}@${workflow.ref}`;
+      break;
+    } catch {
+      // No inline bundle; the digest lookup above already verified.
+    }
+  }
+  console.log(`hestia-cache: attestation verified for ${assetName} (sha256:${digest})${builtBy}`);
+}
+
 /** Install the hestia binary into installDir; returns its path. */
 async function installBinary(installDir) {
   const target = path.join(installDir, 'hestia');
@@ -76,25 +124,20 @@ async function installBinary(installDir) {
     console.log(`hestia-cache: installing from local binary ${binary}`);
     fs.copyFileSync(binary, target);
   } else {
-    const expectedSha256 = getInput('sha256').toLowerCase();
-    if (!expectedSha256) {
-      fail("the 'sha256' input is required when installing a release (unverified downloads are refused)");
-    }
     const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch] || process.arch;
     // GITHUB_ACTION_REPOSITORY points at the repo this action was loaded
     // from, so forks automatically download their own releases.
     const repo = process.env.GITHUB_ACTION_REPOSITORY || 'Mic92/hestia';
-    const url = `https://github.com/${repo}/releases/download/${version}/hestia-${arch}-linux`;
+    const assetName = `hestia-${arch}-linux`;
+    const url = `https://github.com/${repo}/releases/download/${version}/${assetName}`;
     console.log(`hestia-cache: downloading ${url}`);
     const response = await fetch(url, { redirect: 'follow' });
     if (!response.ok) {
       fail(`download failed: HTTP ${response.status} for ${url}`);
     }
     const data = Buffer.from(await response.arrayBuffer());
-    const actualSha256 = crypto.createHash('sha256').update(data).digest('hex');
-    if (actualSha256 !== expectedSha256) {
-      fail(`sha256 mismatch for ${url}: expected ${expectedSha256}, got ${actualSha256}`);
-    }
+    const digest = crypto.createHash('sha256').update(data).digest('hex');
+    await verifyAttestation(repo, assetName, digest, getInput('github-token'));
     fs.writeFileSync(target, data);
   }
   fs.chmodSync(target, 0o755);
