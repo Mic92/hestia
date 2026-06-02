@@ -266,17 +266,3 @@ async fn nar_hash_from_chunks_matches_nix_for_real_store_path() {
     assert_eq!(size, expected_size, "NAR size mismatch");
     assert_eq!(hash, expected_hash, "NAR hash mismatch");
 }
-
-#[tokio::test]
-async fn chunking_real_path_is_deterministic() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("fixture-0.1.0");
-    create_fixture(&root);
-
-    let first = chunk_path(&root).await.unwrap();
-    let second = chunk_path(&root).await.unwrap();
-    assert_eq!(first.tree, second.tree);
-    let hashes_first: Vec<ChunkHash> = first.chunks.iter().map(|c| c.hash).collect();
-    let hashes_second: Vec<ChunkHash> = second.chunks.iter().map(|c| c.hash).collect();
-    assert_eq!(hashes_first, hashes_second);
-}

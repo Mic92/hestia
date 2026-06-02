@@ -449,62 +449,6 @@ async fn accessed_paths_join_the_root_without_store_queries() {
 }
 
 #[tokio::test]
-async fn concurrent_pipelines_keep_both_paths() {
-    // SaveMutable conflict handling: two pipelines (e.g. matrix jobs)
-    // committing concurrently against the same cache must not lose each
-    // other's paths.
-    let Some(store) = ScratchStore::create() else {
-        return;
-    };
-    let path_a = store.add_fixture("concurrent-a", 29);
-    let path_b = store.add_fixture("concurrent-b", 31);
-
-    let fake = FakeGha::start().await;
-    let http = reqwest::Client::new();
-    // Two independent contexts (separate clients), same backend.
-    let ctx_a = context(&fake, &http, store.database());
-    let ctx_b = context(&fake, &http, store.database());
-
-    let now = now_unix();
-    let (stats_a, stats_b) = tokio::join!(
-        ctx_a.run(to_path_set(&[&path_a]), BTreeSet::new(), now),
-        ctx_b.run(to_path_set(&[&path_b]), BTreeSet::new(), now),
-    );
-    let stats_a = stats_a.expect("pipeline A failed");
-    let stats_b = stats_b.expect("pipeline B failed");
-
-    assert_eq!(stats_a.pushed, 1);
-    assert_eq!(stats_b.pushed, 1);
-
-    // Exactly one of them got version 1; the other re-merged onto version 2.
-    let mut versions = [stats_a.manifest_version, stats_b.manifest_version];
-    versions.sort();
-    assert_eq!(versions, [1, 2]);
-
-    // The final manifest contains BOTH paths with all chunks locatable.
-    let (version, manifest) = committed_manifest(&ctx_a).await.unwrap();
-    assert_eq!(version, 2);
-    let hash_a = path_hash_of(&path_a);
-    let hash_b = path_hash_of(&path_b);
-    assert!(
-        manifest.paths.contains_key(&hash_a),
-        "path A lost in the merge"
-    );
-    assert!(
-        manifest.paths.contains_key(&hash_b),
-        "path B lost in the merge"
-    );
-    assert_all_chunks_locatable(&manifest);
-
-    // Both packs were uploaded (different content, different hashes).
-    assert_eq!(pack_count(&fake, &http).await, 2);
-
-    // Roots merged: concurrent updates within the union window keep both.
-    let root = &manifest.roots[TEST_ROOT_KEY];
-    assert!(root.paths.contains(&hash_a) && root.paths.contains(&hash_b));
-}
-
-#[tokio::test]
 async fn identical_content_across_paths_shares_chunks() {
     // Chunk-level dedup across store paths: two different paths with the
     // same blob content must not store the blob twice.

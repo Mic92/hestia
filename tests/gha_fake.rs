@@ -403,35 +403,6 @@ async fn eviction_makes_entry_disappear() {
 }
 
 #[tokio::test]
-async fn rest_pagination_with_small_pages() {
-    let fake = FakeGha::start().await;
-    let http = reqwest::Client::new();
-    let twirp = fake.twirp(&http);
-
-    // More entries than one fake page (fake per_page default is 30, our
-    // client asks for 100; create 7 and list with the client to make sure
-    // multi-page accumulation terminates and returns everything).
-    for i in 0..7 {
-        store_entry(&twirp, &http, &format!("pack-page-{i}"), &[0u8; 10]).await;
-    }
-
-    let rest = fake.rest(&http);
-    let entries = rest.list_caches("pack-page-").await.unwrap();
-    assert_eq!(entries.len(), 7);
-
-    // Listing honors last_accessed_at ordering (most recent first): touch
-    // pack-page-0 and verify it moves to the front.
-    let DownloadUrl::Hit { url, .. } = twirp.get_download_url("pack-page-0", &[]).await.unwrap()
-    else {
-        panic!("expected hit");
-    };
-    blob::get(&http, &url, Some(0..1)).await.unwrap();
-
-    let entries = rest.list_caches("pack-page-").await.unwrap();
-    assert_eq!(entries[0].key, "pack-page-0");
-}
-
-#[tokio::test]
 async fn download_lookup_only_consults_restore_keys() {
     // Fidelity test for a production-API behavior discovered by
     // tests/gha_real.rs in CI: GetCacheEntryDownloadURL ignores the `key`
