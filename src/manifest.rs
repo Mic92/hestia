@@ -35,7 +35,7 @@ pub enum Error {
 ///
 /// Serialized as a CBOR byte string (33 bytes on the wire) instead of an
 /// array of integers.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash32(pub [u8; 32]);
 
 pub type ChunkHash = Hash32;
