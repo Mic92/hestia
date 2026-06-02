@@ -1,6 +1,6 @@
-# Daemon profiling on demand: build hestia with debug info, push a synthetic
-# workload through the daemon and substitute it back out, record both with
-# perf, and upload the flamegraphs as a workflow artifact.
+# Daemon profiling on demand: build hestia with debug info, push a real
+# package closure through the daemon and substitute it back out, record
+# both with perf, and upload the flamegraphs as a workflow artifact.
 name: Perf
 
 on:
@@ -16,6 +16,11 @@ jobs:
       # The profiled daemon writes to the GHA cache.
       actions: write
       contents: read
+    env:
+      # Per-run cache namespace: every run drains into an empty cache and
+      # never touches the production cache CI dogfoods. Salted entries
+      # expire via GitHub's normal eviction.
+      HESTIA_CACHE_VERSION_SALT: ${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
@@ -45,10 +50,15 @@ jobs:
           # Allow profiling other processes and resolving kernel symbols.
           sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
           perf --version
-      - name: Build synthetic workload
-        env:
-          PERF_WORKLOAD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: nix build --impure --file nix/perf-workload.nix -o ./workload
+      - name: Build workload
+        # The closure of a few real nixpkgs packages (~120 paths, ~500 MiB).
+        # Substituted paths never trigger the post-build-hook, so the roots
+        # go to the daemon via the hook command.
+        run: |
+          nix build --inputs-from . \
+            nixpkgs#python3 nixpkgs#git nixpkgs#nodejs -o ./workload
+          readarray -t roots < <(readlink -f ./workload*)
+          "$HESTIA_BIN" hook --socket "$HESTIA_SOCKET" "${roots[@]}"
       # Push direction: chunking, packing, uploading, manifest commit.
       - name: Profile the drain
         run: |
@@ -57,15 +67,16 @@ jobs:
           nix shell --inputs-from . nixpkgs#inferno \
             --command bin/profile.sh stop drain-flamegraph.svg
       # Serve direction: pack range reads, chunk decompression, NAR
-      # reassembly. The fresh store forces real substitution of the path
+      # reassembly. The fresh store forces real substitution of the paths
       # the drain just uploaded.
-      - name: Profile substitution of the same path
+      - name: Profile substitution of the same paths
         run: |
           bin/profile.sh start
+          readarray -t roots < <(readlink -f ./workload*)
           nix copy --no-check-sigs \
             --from "http://$HESTIA_LISTEN" \
             --to /tmp/fresh-store \
-            "$(readlink -f ./workload)"
+            "${roots[@]}"
           nix shell --inputs-from . nixpkgs#inferno \
             --command bin/profile.sh stop substitute-flamegraph.svg
       - uses: actions/upload-artifact@v7

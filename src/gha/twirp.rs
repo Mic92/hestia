@@ -37,6 +37,22 @@ fn rpc_url(base_url: &str, method: &str) -> String {
 pub const ENV_RESULTS_URL: &str = "ACTIONS_RESULTS_URL";
 pub const ENV_RUNTIME_TOKEN: &str = "ACTIONS_RUNTIME_TOKEN";
 
+/// Optional cache namespace salt (benchmarking): a salted daemon sees an
+/// empty cache and shares no entries with unsalted daemons. The perf
+/// workflow sets this to the run id.
+pub const ENV_VERSION_SALT: &str = "HESTIA_CACHE_VERSION_SALT";
+
+/// [`CACHE_VERSION`] when `salt` is empty, sha256("hestia-1:<salt>")
+/// otherwise.
+fn cache_version(salt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    if salt.is_empty() {
+        return CACHE_VERSION.to_string();
+    }
+    let digest = Sha256::digest(format!("hestia-1:{salt}"));
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateCacheEntryRequest {
     pub key: String,
@@ -120,6 +136,9 @@ pub struct TwirpClient {
     http: reqwest::Client,
     base_url: String,
     token: String,
+    /// Cache entry `version` sent with every request ([`CACHE_VERSION`]
+    /// unless a namespace salt is configured).
+    version: String,
 }
 
 impl TwirpClient {
@@ -132,10 +151,12 @@ impl TwirpClient {
             http,
             base_url: results_url.into(),
             token: runtime_token.into(),
+            version: CACHE_VERSION.to_string(),
         }
     }
 
-    /// Build a client from `ACTIONS_RESULTS_URL` / `ACTIONS_RUNTIME_TOKEN`.
+    /// Build a client from `ACTIONS_RESULTS_URL` / `ACTIONS_RUNTIME_TOKEN`,
+    /// honoring the optional `HESTIA_CACHE_VERSION_SALT` namespace salt.
     pub fn from_env(http: reqwest::Client) -> Result<Self, Error> {
         let url = std::env::var(ENV_RESULTS_URL).map_err(|_| Error::MissingEnv(ENV_RESULTS_URL))?;
         let token =
@@ -146,7 +167,15 @@ impl TwirpClient {
         if token.is_empty() {
             return Err(Error::MissingEnv(ENV_RUNTIME_TOKEN));
         }
-        Ok(Self::new(http, url, token))
+        let salt = std::env::var(ENV_VERSION_SALT).unwrap_or_default();
+        Ok(Self::new(http, url, token).with_version_salt(&salt))
+    }
+
+    /// Switch to the cache namespace derived from `salt` (no-op for an
+    /// empty salt). See [`ENV_VERSION_SALT`].
+    pub fn with_version_salt(mut self, salt: &str) -> Self {
+        self.version = cache_version(salt);
+        self
     }
 
     async fn call<Req, Resp>(&self, method: &str, request: &Req) -> Result<Resp, Error>
@@ -197,7 +226,7 @@ impl TwirpClient {
     pub async fn create_cache_entry(&self, key: &str) -> Result<Reservation, Error> {
         let request = CreateCacheEntryRequest {
             key: key.to_string(),
-            version: CACHE_VERSION.to_string(),
+            version: self.version.clone(),
         };
         match self
             .call::<_, CreateCacheEntryResponse>("CreateCacheEntry", &request)
@@ -220,7 +249,7 @@ impl TwirpClient {
         let request = FinalizeCacheEntryUploadRequest {
             key: key.to_string(),
             size_bytes,
-            version: CACHE_VERSION.to_string(),
+            version: self.version.clone(),
         };
         let response: FinalizeCacheEntryUploadResponse =
             self.call("FinalizeCacheEntryUpload", &request).await?;
@@ -279,7 +308,7 @@ impl TwirpClient {
                 .chain(restore_keys.iter().copied().filter(|&k| k != key))
                 .map(String::from)
                 .collect(),
-            version: CACHE_VERSION.to_string(),
+            version: self.version.clone(),
         };
         match self
             .call::<_, GetCacheEntryDownloadUrlResponse>("GetCacheEntryDownloadURL", &request)
@@ -307,6 +336,19 @@ mod tests {
         let digest = Sha256::digest(b"hestia-1");
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(CACHE_VERSION, hex);
+    }
+
+    #[test]
+    fn salted_version_differs_per_salt_and_defaults_to_the_constant() {
+        assert_eq!(cache_version(""), CACHE_VERSION);
+
+        let a = cache_version("run-1");
+        let b = cache_version("run-2");
+        assert_ne!(a, CACHE_VERSION);
+        assert_ne!(a, b);
+        assert_eq!(a, cache_version("run-1"));
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

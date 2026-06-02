@@ -434,3 +434,47 @@ async fn download_lookup_only_consults_restore_keys() {
         "client lookup must hit: {lookup:?}"
     );
 }
+
+#[tokio::test]
+async fn version_salt_isolates_the_cache_namespace() {
+    // A salted client must see none of the entries an unsalted client
+    // wrote, and vice versa.
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let unsalted = fake.twirp(&http);
+    let salted = fake.twirp(&http).with_version_salt("perf-run-1");
+
+    store_entry(&unsalted, &http, "pack-shared-key", b"production data").await;
+
+    // The salted client misses the entry and can reserve the same key.
+    assert_eq!(
+        salted
+            .get_download_url("pack-shared-key", &[])
+            .await
+            .unwrap(),
+        DownloadUrl::Miss
+    );
+    let Reservation::Created { .. } = salted.create_cache_entry("pack-shared-key").await.unwrap()
+    else {
+        panic!("salted client must be able to reserve a key the unsalted client owns");
+    };
+
+    // A different salt is yet another namespace.
+    let other_salt = fake.twirp(&http).with_version_salt("perf-run-2");
+    assert_eq!(
+        other_salt
+            .get_download_url("pack-shared-key", &[])
+            .await
+            .unwrap(),
+        DownloadUrl::Miss
+    );
+
+    // The unsalted client still sees its own entry.
+    assert!(matches!(
+        unsalted
+            .get_download_url("pack-shared-key", &[])
+            .await
+            .unwrap(),
+        DownloadUrl::Hit { .. }
+    ));
+}

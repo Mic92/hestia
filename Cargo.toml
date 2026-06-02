@@ -55,6 +55,9 @@ bytes = "1"
 # JSON bodies for the Twirp / REST / Azure APIs
 serde_json = "1"
 
+# Cache version namespace (sha256 of a constant, optionally salted)
+sha2 = "0.11"
+
 # Harmonia crates (not on crates.io; pinned to a specific rev)
 # Dropped after Phase 2/3 scope decisions (re-add when needed):
 #   harmonia-store-remote        -> path info comes from direct store
@@ -74,7 +77,5 @@ harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", 
 [dev-dependencies]
 # Property-based tests for manifest merge laws
 proptest = "1"
-# Verifies the hardcoded cache version constant
-sha2 = "0.11"
 # Blob storage directory for the fake GHA backend
 tempfile = "3"
