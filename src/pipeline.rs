@@ -22,9 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 
 use crate::chunker::{self, PackBuilder, chunk_path, nar_hash_from_chunks};
+use crate::gha::Error as GhaError;
 use crate::gha::savemutable::SaveMutable;
 use crate::gha::twirp::{Reservation, TwirpClient};
-use crate::gha::{Error as GhaError, blob};
 use crate::manifest::{Manifest, PackInfo, PathEntry, PathHash, Root};
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
@@ -142,19 +142,9 @@ pub async fn upload_pack(
         Reservation::AlreadyExists => Ok(false),
         Reservation::Created { upload_url } => {
             let data = Bytes::from(pack.data.clone());
-            let key_clone = key.clone();
-            blob::put_with_refresh(http, &upload_url, data, async move || {
-                // A pack upload outliving its SAS URL cannot be re-reserved
-                // (PLAN.md Open Question 8); surface a clear error.
-                match twirp.create_cache_entry(&key_clone).await? {
-                    Reservation::Created { upload_url } => Ok(upload_url),
-                    Reservation::AlreadyExists => Err(GhaError::InvalidResponse(format!(
-                        "upload URL for {key_clone} expired and cannot be refreshed"
-                    ))),
-                }
-            })
-            .await?;
-            twirp.finalize_upload(&key, pack.data.len() as u64).await?;
+            twirp
+                .upload_and_finalize(http, &key, upload_url, data)
+                .await?;
             Ok(true)
         }
     }

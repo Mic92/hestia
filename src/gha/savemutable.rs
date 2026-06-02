@@ -187,22 +187,9 @@ impl<'a> SaveMutable<'a> {
 
             match self.twirp.create_cache_entry(&key).await? {
                 Reservation::Created { upload_url } => {
-                    let size = data.len() as u64;
-                    let twirp = self.twirp;
-                    let key_clone = key.clone();
-                    blob::put_with_refresh(self.http, &upload_url, data, async move || {
-                        // Re-reserving an already-reserved key cannot return
-                        // a fresh URL, so an expired upload URL is fatal
-                        // unless the service hands us a new one.
-                        match twirp.create_cache_entry(&key_clone).await? {
-                            Reservation::Created { upload_url } => Ok(upload_url),
-                            Reservation::AlreadyExists => Err(Error::InvalidResponse(format!(
-                                "upload URL for {key_clone:?} expired and cannot be refreshed"
-                            ))),
-                        }
-                    })
-                    .await?;
-                    self.twirp.finalize_upload(&key, size).await?;
+                    self.twirp
+                        .upload_and_finalize(self.http, &key, upload_url, data)
+                        .await?;
                     return Ok(index);
                 }
                 Reservation::AlreadyExists => {

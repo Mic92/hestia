@@ -14,9 +14,10 @@
 //! error for us: cache keys are content-addressed, so it means the data is
 //! already there (CAS semantics).
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::gha::Error;
+use crate::gha::{Error, blob};
 
 /// Cache `version` namespace: sha256 of "hestia-1".
 ///
@@ -229,6 +230,32 @@ impl TwirpClient {
             )));
         }
         Ok(response.entry_id)
+    }
+
+    /// PUT `data` to a reserved entry's upload URL, then finalize it.
+    ///
+    /// If the SAS URL expires mid-upload, the key is re-reserved once for
+    /// a fresh URL. An `AlreadyExists` answer means no fresh URL is coming
+    /// and the upload fails.
+    pub async fn upload_and_finalize(
+        &self,
+        http: &reqwest::Client,
+        key: &str,
+        upload_url: String,
+        data: Bytes,
+    ) -> Result<(), Error> {
+        let size = data.len() as u64;
+        blob::put_with_refresh(http, &upload_url, data, async move || {
+            match self.create_cache_entry(key).await? {
+                Reservation::Created { upload_url } => Ok(upload_url),
+                Reservation::AlreadyExists => Err(Error::InvalidResponse(format!(
+                    "upload URL for {key:?} expired and cannot be refreshed"
+                ))),
+            }
+        })
+        .await?;
+        self.finalize_upload(key, size).await?;
+        Ok(())
     }
 
     /// Look up a download URL (Twirp `GetCacheEntryDownloadURL`).
