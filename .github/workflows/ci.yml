@@ -85,7 +85,7 @@ jobs:
           set -euo pipefail
           version="7a32118639289175533829e84c9aaa9fa781f6a5f1b18a9c8a6bd3642b39dd88"
           url=$(curl -sf -X POST \
-            "$ACTIONS_RESULTS_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL" \
+            "${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL" \
             -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"key\":\"m#\",\"restore_keys\":[\"m#\"],\"version\":\"$version\"}" |
