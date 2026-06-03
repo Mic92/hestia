@@ -1,9 +1,9 @@
 # Release pipeline: tag push -> static binaries -> GitHub release.
 #
-# The binaries are statically linked (musl, see packages.static in
-# flake.nix): the hestia-cache action downloads and runs them on stock
-# runners, where dynamically linked nix-built binaries would not work
-# (their library paths point into /nix/store).
+# The binaries are statically linked (musl): the hestia-cache action
+# downloads and runs them on stock runners, where dynamically linked
+# nix-built binaries would not work (their library paths point into
+# /nix/store).
 name: Release
 
 on:
@@ -52,7 +52,7 @@ jobs:
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
       - name: Build static binary
-        run: nix build .#static
+        run: nix build .#
       - name: Prepare release asset
         run: |
           set -euo pipefail

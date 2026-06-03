@@ -1,13 +1,34 @@
 # Crane builds: dependencies live in a separate derivation (cargoArtifacts)
 # keyed on Cargo.toml/Cargo.lock, so source-only changes do not recompile
-# them. The static release binary uses nix/package.nix instead.
+# them.
+#
+# With `staticTarget` set (Linux), cargo cross-compiles to that stdenv's
+# musl target and links statically; build scripts and proc macros stay
+# glibc-dynamic.
 {
   pkgs,
   lib,
   craneLib,
+  # stdenv of the static target platform, or null for a native build.
+  staticTarget ? null,
 }:
 let
   src = craneLib.cleanCargoSource ../.;
+
+  staticArgs = lib.optionalAttrs (staticTarget != null) (
+    let
+      triple = staticTarget.hostPlatform.rust.rustcTarget;
+      cc = "${staticTarget.cc}/bin/${staticTarget.cc.targetPrefix}cc";
+      envTriple = lib.toUpper (lib.replaceStrings [ "-" ] [ "_" ] triple);
+    in
+    {
+      CARGO_BUILD_TARGET = triple;
+      "CARGO_TARGET_${envTriple}_LINKER" = cc;
+      # For the cc crate (zstd-sys, aws-lc-sys C code).
+      TARGET_CC = cc;
+      TARGET_AR = "${staticTarget.cc.bintools}/bin/${staticTarget.cc.targetPrefix}ar";
+    }
+  );
 
   commonArgs = {
     inherit src;
@@ -16,7 +37,8 @@ let
     # reqwest's rustls-platform-verifier needs CA certs to construct any
     # client, even for plain-HTTP localhost use; the sandbox has none.
     env.SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-  };
+  }
+  // staticArgs;
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 in

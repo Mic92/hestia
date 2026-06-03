@@ -20,7 +20,6 @@
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
-        "x86_64-darwin"
       ];
 
       eachSystem =
@@ -36,11 +35,25 @@
       treefmt = eachSystem ({ pkgs, ... }: treefmt-nix.lib.evalModule pkgs ./nix/treefmt.nix);
 
       # Crane builds (package, clippy, tests) with shared dependency artifacts.
+      # Linux targets musl, so CI tests the same static binaries releases
+      # ship; darwin stays dynamic. The cross rustc runs on glibc and ships
+      # std for both glibc and musl. Not pkgsStatic: its stdenv forces
+      # -static onto build scripts and proc macros, which must link
+      # dynamically.
       craneFor =
         pkgs:
+        let
+          isLinux = pkgs.stdenv.hostPlatform.isLinux;
+          craneLib = (crane.mkLib pkgs).overrideScope (
+            _final: _prev:
+            lib.optionalAttrs isLinux {
+              inherit (pkgs.pkgsStatic.buildPackages) rustc clippy;
+            }
+          );
+        in
         import ./nix/crane.nix {
-          inherit pkgs lib;
-          craneLib = crane.mkLib pkgs;
+          inherit pkgs lib craneLib;
+          staticTarget = if isLinux then pkgs.pkgsStatic.stdenv else null;
         };
     in
     {
@@ -57,12 +70,6 @@
           default = (craneFor pkgs).package;
           # Real-API test binary; CI's token-probe job substitutes it.
           gha-real-tests = (craneFor pkgs).ghaRealTests;
-        }
-        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          # Statically linked (musl) build for release binaries: nix-built
-          # dynamic binaries reference /nix/store library paths and cannot
-          # run outside the store they were built in.
-          static = pkgs.pkgsStatic.callPackage ./nix/package.nix { };
         }
       );
 

@@ -220,8 +220,7 @@ $ nix develop -c cargo test          # unit + integration tests (fake GHA backen
 $ nix develop -c cargo clippy --all-targets -- -D warnings
 $ nix fmt                            # treefmt (rustfmt, nixfmt, prettier, ...)
 $ nix flake check                    # everything CI runs: fmt, clippy, tests, build
-$ nix build .#                       # the hestia binary
-$ nix build .#static                 # static (musl) release binary
+$ nix build .#                       # the hestia binary (static musl on Linux)
 ```
 
 ## License
