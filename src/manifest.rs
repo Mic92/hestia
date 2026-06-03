@@ -29,29 +29,98 @@ pub enum Error {
 
     #[error("compression failed: {0}")]
     Compression(#[from] std::io::Error),
+
+    #[error("invalid manifest encoding: {0}")]
+    InvalidEncoding(String),
 }
 
-/// A 32-byte SHA-256 digest (chunk hash, pack hash, or NAR hash).
-///
-/// Serialized as a CBOR byte string (33 bytes on the wire) instead of an
-/// array of integers.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Hash32(pub [u8; 32]);
+/// Generates a fixed-size hash digest type: CBOR byte-string serialization,
+/// hex display, SHA-256 (truncated to the type's length) construction.
+macro_rules! hash_newtype {
+    ($(#[$doc:meta])* $name:ident, $len:expr) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub [u8; $len]);
 
-pub type ChunkHash = Hash32;
+        impl $name {
+            /// Hash length in bytes.
+            pub const LEN: usize = $len;
+
+            /// SHA-256 of `data`, truncated to [`Self::LEN`] bytes.
+            pub fn digest(data: impl AsRef<[u8]>) -> Self {
+                let digest = harmonia_utils_hash::Sha256::digest(data);
+                let mut bytes = [0u8; $len];
+                bytes.copy_from_slice(&digest.digest_bytes()[..$len]);
+                Self(bytes)
+            }
+
+            pub fn to_hex(self) -> String {
+                self.0.iter().map(|b| format!("{b:02x}")).collect()
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, concat!(stringify!($name), "({})"), self.to_hex())
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.to_hex())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct Visitor;
+                impl<'de> serde::de::Visitor<'de> for Visitor {
+                    type Value = $name;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        write!(f, "{} bytes", $len)
+                    }
+
+                    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<$name, E> {
+                        let array: [u8; $len] = v
+                            .try_into()
+                            .map_err(|_| E::invalid_length(v.len(), &self))?;
+                        Ok($name(array))
+                    }
+                }
+                deserializer.deserialize_bytes(Visitor)
+            }
+        }
+    };
+}
+
+hash_newtype!(
+    /// A full 32-byte SHA-256 digest (pack hash or NAR hash).
+    Hash32,
+    32
+);
+
+hash_newtype!(
+    /// A SHA-256 digest truncated to 16 bytes.
+    ///
+    /// Used for chunk hashes: 128 bits keeps collisions out of reach
+    /// (birthday bound 2^64 chunks) while halving the dominant cost of the
+    /// manifest, which stores one hash per chunk.
+    Hash16,
+    16
+);
+
+pub type ChunkHash = Hash16;
 pub type PackHash = Hash32;
 pub type NarHash = Hash32;
 
 impl Hash32 {
-    /// SHA-256 of `data`.
-    pub fn digest(data: impl AsRef<[u8]>) -> Self {
-        Self(*harmonia_utils_hash::Sha256::digest(data).digest_bytes())
-    }
-
-    pub fn to_hex(self) -> String {
-        self.0.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
     /// Parse a SHA-256 hash in any format Nix uses: SRI (`sha256-<base64>`),
     /// prefixed (`sha256:<base16|base32|base64>`), or bare.
     ///
@@ -59,45 +128,6 @@ impl Hash32 {
     pub fn parse_sha256(s: &str) -> Option<Self> {
         let hash: harmonia_utils_hash::fmt::Any<harmonia_utils_hash::Sha256> = s.parse().ok()?;
         Some(Self(*hash.into_hash().digest_bytes()))
-    }
-}
-
-impl std::fmt::Debug for Hash32 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Hash32({})", self.to_hex())
-    }
-}
-
-impl std::fmt::Display for Hash32 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.to_hex())
-    }
-}
-
-impl Serialize for Hash32 {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for Hash32 {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = Hash32;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("32 bytes")
-            }
-
-            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Hash32, E> {
-                let array: [u8; 32] = v
-                    .try_into()
-                    .map_err(|_| E::invalid_length(v.len(), &self))?;
-                Ok(Hash32(array))
-            }
-        }
-        deserializer.deserialize_bytes(Visitor)
     }
 }
 
@@ -182,8 +212,13 @@ pub struct PackInfo {
 }
 
 /// One stored path: everything needed to serve narinfo + NAR for it.
+///
+/// Generic over the file contents `C`: chunk hashes in memory
+/// ([`ChunkList`]), chunk-table indices on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PathEntry {
+// FileTree's Deserialize impl wants DeserializeOwned, not Deserialize<'de>.
+#[serde(bound(deserialize = "C: serde::de::DeserializeOwned"))]
+pub struct PathEntry<C = ChunkList> {
     /// Full store path basename (`<hash>-<name>`). The manifest key is only
     /// the hash part; narinfo responses need the name too (StorePath and
     /// References lines carry full basenames).
@@ -198,8 +233,8 @@ pub struct PathEntry {
     pub ca: Option<String>,
     #[serde(default)]
     pub deriver: Option<StorePath>,
-    /// File tree with chunk lists as file contents.
-    pub tree: FileTree<ChunkList>,
+    /// File tree with `C` as file contents.
+    pub tree: FileTree<C>,
     /// Last time the GC mark phase reached this path (unix seconds).
     #[serde(default)]
     pub last_reachable: u64,
@@ -207,6 +242,23 @@ pub struct PathEntry {
     /// dedup-skipped (unix seconds).
     #[serde(default)]
     pub last_pushed: u64,
+}
+
+impl<C> PathEntry<C> {
+    /// Convert the file contents with `f`, keeping everything else.
+    fn map_contents<D, E>(self, f: &mut impl FnMut(&C) -> Result<D, E>) -> Result<PathEntry<D>, E> {
+        Ok(PathEntry {
+            store_path: self.store_path,
+            nar_hash: self.nar_hash,
+            nar_size: self.nar_size,
+            references: self.references,
+            ca: self.ca,
+            deriver: self.deriver,
+            tree: map_tree(&self.tree, f)?,
+            last_reachable: self.last_reachable,
+            last_pushed: self.last_pushed,
+        })
+    }
 }
 
 /// A GC root: the set of paths one (branch, system) pair currently needs.
@@ -220,18 +272,18 @@ pub struct Root {
 }
 
 /// The top-level manifest document.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// Deliberately not `Serialize`/`Deserialize`: the in-memory layout is
+/// optimized for merging, not for storage. [`Manifest::encode`] /
+/// [`Manifest::decode`] translate to and from the columnar wire form.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Manifest {
-    #[serde(default)]
     pub paths: BTreeMap<PathHash, PathEntry>,
-    #[serde(default)]
     pub chunks: BTreeMap<ChunkHash, ChunkLocation>,
     /// Packs keyed by hash (deviation from PLAN.md's `Vec<PackRef>`: a map
     /// makes dedup-by-hash the natural merge operation).
-    #[serde(default)]
     pub packs: BTreeMap<PackHash, PackInfo>,
     /// Roots keyed by "branch-system", e.g. "main-x86_64-linux".
-    #[serde(default)]
     pub roots: BTreeMap<String, Root>,
 }
 
@@ -404,8 +456,121 @@ impl Manifest {
     }
 }
 
-/// zstd level for manifest compression. The manifest is small (tens of KB);
-/// favor ratio over speed.
+// --- Wire format ------------------------------------------------------------
+//
+// Encoding the in-memory maps directly stores every chunk hash twice (chunk
+// index + file tree) and repeats field names and pack hashes per entry. The
+// wire form is columnar instead: hashes concatenated into byte strings, each
+// stored once; locations as parallel integer arrays; trees referencing
+// chunks by table index. Production manifest: 5.8 MB -> 2.2 MB.
+
+/// A CBOR byte string (`Vec<u8>` would serialize as an array of integers).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Blob(Vec<u8>);
+
+impl Serialize for Blob {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Blob {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Blob;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a byte string")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Blob, E> {
+                Ok(Blob(v.to_vec()))
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Blob, E> {
+                Ok(Blob(v))
+            }
+        }
+        deserializer.deserialize_bytes(Visitor)
+    }
+}
+
+/// File contents on the wire: indices into the chunk table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct WireChunkList {
+    #[serde(default)]
+    chunks: Vec<u64>,
+}
+
+/// Columnar wire representation.
+///
+/// The hash tables are concatenated, sorted hashes; a hash's position is
+/// its table index. Location rows are parallel arrays sorted by
+/// (pack index, offset), with offsets delta-encoded within each pack.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WireManifest {
+    #[serde(default)]
+    chunk_hashes: Blob,
+    #[serde(default)]
+    pack_hashes: Blob,
+    #[serde(default)]
+    location_chunks: Vec<u64>,
+    #[serde(default)]
+    location_packs: Vec<u64>,
+    #[serde(default)]
+    location_offsets: Vec<u64>,
+    #[serde(default)]
+    location_compressed_sizes: Vec<u32>,
+    #[serde(default)]
+    location_uncompressed_sizes: Vec<u32>,
+    #[serde(default)]
+    location_repacks_survived: Vec<u32>,
+    /// Pack metadata keyed by pack table index.
+    #[serde(default)]
+    pack_infos: BTreeMap<u64, PackInfo>,
+    #[serde(default)]
+    paths: BTreeMap<PathHash, PathEntry<WireChunkList>>,
+    #[serde(default)]
+    roots: BTreeMap<String, Root>,
+}
+
+/// Rebuild a tree with its file contents transformed by `f`.
+fn map_tree<A, B, E>(
+    tree: &FileTree<A>,
+    f: &mut impl FnMut(&A) -> Result<B, E>,
+) -> Result<FileTree<B>, E> {
+    Ok(FileTree(match &tree.0 {
+        FileSystemObject::Regular(regular) => FileSystemObject::Regular(Regular {
+            executable: regular.executable,
+            contents: f(&regular.contents)?,
+        }),
+        FileSystemObject::Symlink(symlink) => FileSystemObject::Symlink(symlink.clone()),
+        FileSystemObject::Directory(directory) => FileSystemObject::Directory(Directory {
+            entries: directory
+                .entries
+                .iter()
+                .map(|(name, child)| Ok((name.clone(), Box::new(map_tree(child, f)?))))
+                .collect::<Result<BTreeMap<_, _>, E>>()?,
+        }),
+    }))
+}
+
+/// Visit the contents of every regular file in a tree.
+fn visit_contents<C>(tree: &FileTree<C>, visit: &mut impl FnMut(&C)) {
+    match &tree.0 {
+        FileSystemObject::Regular(regular) => visit(&regular.contents),
+        FileSystemObject::Symlink(_) => {}
+        FileSystemObject::Directory(directory) => {
+            for child in directory.entries.values() {
+                visit_contents(child, visit);
+            }
+        }
+    }
+}
+
+/// zstd level for manifest compression: the columnar form leaves mostly
+/// incompressible hash bytes, so higher levels gain little.
 const ZSTD_LEVEL: i32 = 9;
 
 impl Manifest {
@@ -413,17 +578,193 @@ impl Manifest {
         Self::default()
     }
 
-    /// Serialize to zstd-compressed CBOR.
+    /// Serialize to zstd-compressed columnar CBOR.
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         let mut cbor = Vec::new();
-        ciborium::into_writer(self, &mut cbor)?;
+        ciborium::into_writer(&self.to_wire()?, &mut cbor)?;
         Ok(zstd::encode_all(cbor.as_slice(), ZSTD_LEVEL)?)
     }
 
-    /// Deserialize from zstd-compressed CBOR.
+    /// Deserialize from zstd-compressed columnar CBOR.
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
         let cbor = zstd::decode_all(data)?;
-        Ok(ciborium::from_reader(cbor.as_slice())?)
+        Self::from_wire(ciborium::from_reader(cbor.as_slice())?)
+    }
+
+    fn to_wire(&self) -> Result<WireManifest, Error> {
+        // Chunk table: every chunk hash the manifest mentions. File trees
+        // may reference chunks the chunk index does not know (their
+        // location lives in another manifest version), so this is a union.
+        let mut chunk_table: BTreeSet<ChunkHash> = self.chunks.keys().copied().collect();
+        for entry in self.paths.values() {
+            visit_contents(&entry.tree, &mut |list: &ChunkList| {
+                chunk_table.extend(list.chunks.iter().copied());
+            });
+        }
+        let chunk_index: BTreeMap<ChunkHash, u64> = chunk_table
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| (*hash, index as u64))
+            .collect();
+
+        // Same for the pack table.
+        let mut pack_table: BTreeSet<PackHash> = self.packs.keys().copied().collect();
+        pack_table.extend(self.chunks.values().map(|location| location.pack));
+        let pack_index: BTreeMap<PackHash, u64> = pack_table
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| (*hash, index as u64))
+            .collect();
+
+        let mut wire = WireManifest {
+            chunk_hashes: Blob(chunk_table.iter().flat_map(|hash| hash.0).collect()),
+            pack_hashes: Blob(pack_table.iter().flat_map(|hash| hash.0).collect()),
+            pack_infos: self
+                .packs
+                .iter()
+                .map(|(hash, info)| (pack_index[hash], info.clone()))
+                .collect(),
+            roots: self.roots.clone(),
+            ..WireManifest::default()
+        };
+
+        let mut rows: Vec<(&ChunkHash, &ChunkLocation)> = self.chunks.iter().collect();
+        rows.sort_by_key(|(_, location)| (location.pack, location.offset));
+        let mut previous_offset: BTreeMap<u64, u64> = BTreeMap::new();
+        for (hash, location) in rows {
+            let pack = pack_index[&location.pack];
+            let previous = previous_offset.insert(pack, location.offset).unwrap_or(0);
+            wire.location_chunks.push(chunk_index[hash]);
+            wire.location_packs.push(pack);
+            wire.location_offsets.push(location.offset - previous);
+            wire.location_compressed_sizes
+                .push(location.compressed_size);
+            wire.location_uncompressed_sizes
+                .push(location.uncompressed_size);
+            wire.location_repacks_survived
+                .push(location.repacks_survived);
+        }
+
+        wire.paths = self
+            .paths
+            .iter()
+            .map(|(hash, entry)| {
+                let entry = entry.clone().map_contents(&mut |list: &ChunkList| {
+                    Ok::<_, Error>(WireChunkList {
+                        chunks: list.chunks.iter().map(|hash| chunk_index[hash]).collect(),
+                    })
+                })?;
+                Ok((*hash, entry))
+            })
+            .collect::<Result<_, Error>>()?;
+
+        Ok(wire)
+    }
+
+    fn from_wire(wire: WireManifest) -> Result<Self, Error> {
+        let invalid = |message: String| Error::InvalidEncoding(message);
+
+        if !wire.chunk_hashes.0.len().is_multiple_of(ChunkHash::LEN) {
+            return Err(invalid(format!(
+                "chunk hash table length {} is not a multiple of {}",
+                wire.chunk_hashes.0.len(),
+                ChunkHash::LEN
+            )));
+        }
+        if !wire.pack_hashes.0.len().is_multiple_of(PackHash::LEN) {
+            return Err(invalid(format!(
+                "pack hash table length {} is not a multiple of {}",
+                wire.pack_hashes.0.len(),
+                PackHash::LEN
+            )));
+        }
+        let chunk_table: Vec<ChunkHash> = wire
+            .chunk_hashes
+            .0
+            .chunks_exact(ChunkHash::LEN)
+            .map(|bytes| Hash16(bytes.try_into().expect("chunks_exact yields exact lengths")))
+            .collect();
+        let pack_table: Vec<PackHash> = wire
+            .pack_hashes
+            .0
+            .chunks_exact(PackHash::LEN)
+            .map(|bytes| Hash32(bytes.try_into().expect("chunks_exact yields exact lengths")))
+            .collect();
+        let chunk_at = |index: u64| {
+            chunk_table
+                .get(index as usize)
+                .copied()
+                .ok_or_else(|| invalid(format!("chunk index {index} out of range")))
+        };
+        let pack_at = |index: u64| {
+            pack_table
+                .get(index as usize)
+                .copied()
+                .ok_or_else(|| invalid(format!("pack index {index} out of range")))
+        };
+
+        let rows = wire.location_chunks.len();
+        if [
+            wire.location_packs.len(),
+            wire.location_offsets.len(),
+            wire.location_compressed_sizes.len(),
+            wire.location_uncompressed_sizes.len(),
+            wire.location_repacks_survived.len(),
+        ]
+        .iter()
+        .any(|&len| len != rows)
+        {
+            return Err(invalid("location columns have differing lengths".into()));
+        }
+
+        let mut chunks = BTreeMap::new();
+        let mut previous_offset: BTreeMap<u64, u64> = BTreeMap::new();
+        for row in 0..rows {
+            let pack = wire.location_packs[row];
+            let offset =
+                previous_offset.get(&pack).copied().unwrap_or(0) + wire.location_offsets[row];
+            previous_offset.insert(pack, offset);
+            chunks.insert(
+                chunk_at(wire.location_chunks[row])?,
+                ChunkLocation {
+                    pack: pack_at(pack)?,
+                    offset,
+                    compressed_size: wire.location_compressed_sizes[row],
+                    uncompressed_size: wire.location_uncompressed_sizes[row],
+                    repacks_survived: wire.location_repacks_survived[row],
+                },
+            );
+        }
+
+        let packs = wire
+            .pack_infos
+            .into_iter()
+            .map(|(index, info)| Ok((pack_at(index)?, info)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+
+        let paths = wire
+            .paths
+            .into_iter()
+            .map(|(hash, entry)| {
+                let entry = entry.map_contents(&mut |list: &WireChunkList| {
+                    Ok::<_, Error>(ChunkList {
+                        chunks: list
+                            .chunks
+                            .iter()
+                            .map(|&index| chunk_at(index))
+                            .collect::<Result<Vec<_>, Error>>()?,
+                    })
+                })?;
+                Ok((hash, entry))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+
+        Ok(Manifest {
+            paths,
+            chunks,
+            packs,
+            roots: wire.roots,
+        })
     }
 }
 
@@ -450,7 +791,10 @@ mod tests {
                     .parse()
                     .unwrap(),
             ),
-            tree: leaf_tree(vec![Hash32::digest([seed, 1]), Hash32::digest([seed, 2])]),
+            tree: leaf_tree(vec![
+                ChunkHash::digest([seed, 1]),
+                ChunkHash::digest([seed, 2]),
+            ]),
             last_reachable: 0,
             last_pushed: 100,
         }
@@ -470,8 +814,8 @@ mod tests {
 
     fn sample_manifest() -> Manifest {
         let mut manifest = Manifest::new();
-        let chunk_a = Hash32::digest(b"chunk a");
-        let chunk_b = Hash32::digest(b"chunk b");
+        let chunk_a = ChunkHash::digest(b"chunk a");
+        let chunk_b = ChunkHash::digest(b"chunk b");
         let pack = Hash32::digest(b"pack");
 
         manifest.paths.insert(
@@ -580,12 +924,10 @@ mod tests {
     #[test]
     fn unknown_fields_are_ignored_on_decode() {
         // Forward compatibility: a future hestia version may add fields.
-        // Simulate by encoding a manifest as CBOR with extra fields injected
-        // at top level, path level, and chunk level, then decoding with
-        // today's schema.
+        // Simulate by patching extra fields into the wire CBOR at top level
+        // and path level, then decoding with today's schema.
         let manifest = sample_manifest();
-        let mut cbor = Vec::new();
-        ciborium::into_writer(&manifest, &mut cbor).unwrap();
+        let cbor = zstd::decode_all(manifest.encode().unwrap().as_slice()).unwrap();
         let mut value: ciborium::Value = ciborium::from_reader(cbor.as_slice()).unwrap();
 
         fn add_field(value: &mut ciborium::Value, key: &str) {
@@ -623,6 +965,58 @@ mod tests {
         // Valid zstd, invalid CBOR.
         let garbage = zstd::encode_all(&b"garbage cbor"[..], 3).unwrap();
         assert!(Manifest::decode(&garbage).is_err());
+    }
+
+    #[test]
+    fn corrupt_wire_indices_are_an_error_not_a_panic() {
+        // A tree referencing a chunk index that is not in the table must
+        // surface as InvalidEncoding.
+        let manifest = sample_manifest();
+        let cbor = zstd::decode_all(manifest.encode().unwrap().as_slice()).unwrap();
+        let mut value: ciborium::Value = ciborium::from_reader(cbor.as_slice()).unwrap();
+        // Truncate the chunk hash table to length 0.
+        for (key, field) in value.as_map_mut().unwrap() {
+            if key.as_text() == Some("chunk_hashes") {
+                *field = ciborium::Value::Bytes(Vec::new());
+            }
+        }
+        let mut patched = Vec::new();
+        ciborium::into_writer(&value, &mut patched).unwrap();
+        let compressed = zstd::encode_all(patched.as_slice(), 3).unwrap();
+
+        let result = Manifest::decode(&compressed);
+        assert!(
+            matches!(result, Err(Error::InvalidEncoding(_))),
+            "expected InvalidEncoding, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn wire_format_stores_each_chunk_hash_once() {
+        // A chunk hash referenced by both the chunk index and a file tree
+        // must appear exactly once in the encoded bytes.
+        let manifest = sample_manifest();
+        let encoded = manifest.encode().unwrap();
+        let raw = zstd::decode_all(encoded.as_slice()).unwrap();
+        for hash in manifest.chunks.keys() {
+            let count = raw.windows(ChunkHash::LEN).filter(|w| *w == hash.0).count();
+            assert_eq!(count, 1, "chunk hash {hash} appears {count} times");
+        }
+    }
+
+    #[test]
+    fn chunk_hashes_are_16_bytes() {
+        assert_eq!(ChunkHash::LEN, 16);
+        // Pack and NAR hashes stay full SHA-256.
+        assert_eq!(PackHash::LEN, 32);
+        assert_eq!(NarHash::LEN, 32);
+    }
+
+    #[test]
+    fn truncated_digest_is_a_sha256_prefix() {
+        let full = Hash32::digest(b"same input");
+        let truncated = Hash16::digest(b"same input");
+        assert_eq!(truncated.0[..], full.0[..16]);
     }
 
     #[test]
@@ -736,7 +1130,7 @@ mod tests {
     #[test]
     fn merge_dedups_packs_and_chunks() {
         let pack = Hash32::digest(b"pack");
-        let chunk = Hash32::digest(b"chunk");
+        let chunk = ChunkHash::digest(b"chunk");
 
         let mut a = Manifest::new();
         a.packs.insert(
@@ -771,7 +1165,7 @@ mod tests {
         b.chunks.insert(
             chunk,
             ChunkLocation {
-                pack: Hash32::digest(b"other pack"),
+                pack: PackHash::digest(b"other pack"),
                 offset: 7,
                 compressed_size: 10,
                 uncompressed_size: 20,
@@ -910,8 +1304,13 @@ mod tests {
             (0u8..6).prop_map(|seed| Hash32::digest([seed]))
         }
 
+        fn arb_chunk_hash() -> impl Strategy<Value = ChunkHash> {
+            (0u8..6).prop_map(|seed| ChunkHash::digest([seed]))
+        }
+
         fn arb_chunk_list() -> impl Strategy<Value = ChunkList> {
-            proptest::collection::vec(arb_hash32(), 0..3).prop_map(|chunks| ChunkList { chunks })
+            proptest::collection::vec(arb_chunk_hash(), 0..3)
+                .prop_map(|chunks| ChunkList { chunks })
         }
 
         fn arb_path_entry() -> impl Strategy<Value = PathEntry> {
@@ -990,7 +1389,7 @@ mod tests {
         fn arb_manifest() -> impl Strategy<Value = Manifest> {
             (
                 proptest::collection::btree_map(arb_path_hash(), arb_path_entry(), 0..4),
-                proptest::collection::btree_map(arb_hash32(), arb_chunk_location(), 0..4),
+                proptest::collection::btree_map(arb_chunk_hash(), arb_chunk_location(), 0..4),
                 proptest::collection::btree_map(arb_hash32(), arb_pack_info(), 0..3),
                 proptest::collection::btree_map("[a-z]{1,4}", arb_root(), 0..3),
             )
@@ -1072,7 +1471,7 @@ mod tests {
             entries: BTreeMap::from([
                 (
                     "file".to_string(),
-                    Box::new(leaf_tree(vec![Hash32::digest(b"x")])),
+                    Box::new(leaf_tree(vec![ChunkHash::digest(b"x")])),
                 ),
                 (
                     "link".to_string(),

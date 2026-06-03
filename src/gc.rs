@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     fn chunk_hash(seed: u8) -> ChunkHash {
-        Hash32::digest([b'c', seed])
+        ChunkHash::digest([b'c', seed])
     }
 
     fn pack_hash(seed: u8) -> PackHash {

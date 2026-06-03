@@ -646,10 +646,13 @@ mod tests {
         // Three chunks of 100 MiB each: the third insert must evict the first.
         let big = Bytes::from(vec![0u8; 100 * 1024 * 1024]);
         for seed in 0..3u8 {
-            cache.insert(Hash32::digest([seed]), big.clone());
+            cache.insert(ChunkHash::digest([seed]), big.clone());
         }
-        assert!(cache.get(&Hash32::digest([0])).is_none(), "oldest evicted");
-        assert!(cache.get(&Hash32::digest([2])).is_some(), "newest kept");
+        assert!(
+            cache.get(&ChunkHash::digest([0])).is_none(),
+            "oldest evicted"
+        );
+        assert!(cache.get(&ChunkHash::digest([2])).is_some(), "newest kept");
         assert!(cache.total <= CHUNK_CACHE_BUDGET);
     }
 
@@ -657,7 +660,7 @@ mod tests {
     fn chunk_cache_insert_is_idempotent() {
         let mut cache = ChunkCache::default();
         let data = Bytes::from_static(b"chunk data");
-        let hash = Hash32::digest(&data);
+        let hash = ChunkHash::digest(&data);
         cache.insert(hash, data.clone());
         cache.insert(hash, data.clone());
         assert_eq!(cache.total, data.len(), "no double counting");

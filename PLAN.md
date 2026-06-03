@@ -72,8 +72,11 @@ These shape the whole implementation; get them wrong and nothing works.
    Twirp, retry (pattern from go-actions-cache `downloadV2`).
 
 6. **Cache `version` field** is a namespace, not a format version. Pick one
-   constant (e.g. `sha256("hestia-1")`) and never change it casually —
-   changing it orphans all existing entries.
+   constant (e.g. `sha256("hestia-2")`) and never change it casually —
+   changing it orphans all existing entries. It is bumped only on
+   incompatible storage format changes (Decision 31), which serves as the
+   "migration" strategy pre-1.0: the new version starts from an empty
+   cache and the old entries expire through normal eviction.
 
 7. **Eviction is two-axis**: 7-day-idle LRU AND quota-pressure LRU
    (10 GB/repo, shared with all other workflows). Verified: downloads through
@@ -814,6 +817,12 @@ continues from / interleaves with the Open Questions section above.
     cache beats upstream round-trips. Flags follow attic conventions:
     `--upstream-cache-filter` (opt-in skip), `--upstream-cache-key-name`
     (repeatable), `--no-closure` (hooked paths only).
+31. **Columnar manifest wire format, 16-byte chunk hashes** (post-Phase 6,
+    namespace bump to `hestia-2`). The naive encoding stored every chunk
+    hash twice and repeated field names and pack hashes per entry: 5.8 MB
+    stored for a 1333-path manifest. The wire form is now columnar and
+    chunk hashes are truncated to 16 bytes; same manifest is 2.2 MB. The
+    in-memory model and merge rules are unchanged.
 
 ## Mistakes Fixed from Earlier Draft
 

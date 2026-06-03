@@ -41,7 +41,10 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error("chunk hash mismatch: expected {expected}, got {actual}")]
-    HashMismatch { expected: Hash32, actual: Hash32 },
+    HashMismatch {
+        expected: ChunkHash,
+        actual: ChunkHash,
+    },
 
     #[error("invalid NAR event stream: {0}")]
     InvalidNar(String),
@@ -82,7 +85,7 @@ pub fn chunk_data(data: &Bytes) -> Vec<Chunk> {
     .map(|cut| {
         let slice = data.slice(cut.offset..cut.offset + cut.length);
         Chunk {
-            hash: Hash32::digest(&slice),
+            hash: ChunkHash::digest(&slice),
             data: slice,
         }
     })
@@ -628,7 +631,7 @@ pub fn extract_chunk(compressed: &[u8], expected: &ChunkHash) -> Result<Vec<u8>,
     if data.len() > MAX_CHUNK_SIZE as usize {
         return Err(Error::OversizedChunk);
     }
-    let actual = Hash32::digest(&data);
+    let actual = ChunkHash::digest(&data);
     if actual != *expected {
         return Err(Error::HashMismatch {
             expected: *expected,
@@ -702,7 +705,7 @@ mod tests {
         let chunks = chunk_data(&small);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].data, small);
-        assert_eq!(chunks[0].hash, Hash32::digest(&small));
+        assert_eq!(chunks[0].hash, ChunkHash::digest(&small));
     }
 
     #[test]
@@ -831,7 +834,7 @@ mod tests {
 
         // Even with the "correct" hash of the oversized payload, extraction
         // must fail: the size bound is enforced, not just integrity.
-        let expected = Hash32::digest(&bomb_payload);
+        let expected = ChunkHash::digest(&bomb_payload);
         assert!(matches!(
             extract_chunk(&frame, &expected),
             Err(Error::OversizedChunk)
@@ -847,7 +850,7 @@ mod tests {
         let pack = builder.finish();
 
         // Wrong expected hash -> HashMismatch.
-        let wrong_hash = Hash32::digest(b"something else");
+        let wrong_hash = ChunkHash::digest(b"something else");
         let result = extract_chunk(&pack.data, &wrong_hash);
         assert!(matches!(result, Err(Error::HashMismatch { .. })));
 

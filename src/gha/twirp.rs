@@ -19,12 +19,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::gha::{Error, blob};
 
-/// Cache `version` namespace: sha256 of "hestia-1".
+/// Cache `version` namespace: sha256 of "hestia-2".
 ///
-/// Per PLAN.md Critical Constraint 6 this is a namespace, not a format
-/// version. Changing it orphans every existing cache entry, so it must stay
-/// constant. A unit test verifies it really is sha256("hestia-1").
-pub const CACHE_VERSION: &str = "7a32118639289175533829e84c9aaa9fa781f6a5f1b18a9c8a6bd3642b39dd88";
+/// A namespace, not a format version (PLAN.md Critical Constraint 6).
+/// Changing it orphans every existing cache entry, so it is only bumped on
+/// incompatible storage format changes.
+pub const CACHE_VERSION: &str = "aa3f0c68abc7983158c10a1be8be9bbd7014211eee928dc266f9f0bb37e7be7a";
 
 const SERVICE_PATH: &str = "twirp/github.actions.results.api.v1.CacheService";
 
@@ -49,7 +49,7 @@ fn cache_version(salt: &str) -> String {
     if salt.is_empty() {
         return CACHE_VERSION.to_string();
     }
-    let digest = Sha256::digest(format!("hestia-1:{salt}"));
+    let digest = Sha256::digest(format!("hestia-2:{salt}"));
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -331,9 +331,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_version_is_sha256_of_hestia_1() {
+    fn cache_version_is_sha256_of_hestia_2() {
         use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(b"hestia-1");
+        let digest = Sha256::digest(b"hestia-2");
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(CACHE_VERSION, hex);
     }
