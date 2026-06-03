@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn gc_flags() {
-        // Defaults match the GC policy defaults from PLAN.md.
+        // Pin the default GC policy values.
         let cli = parse(&["hestia", "gc"]);
         let Command::Gc(args) = cli.command else {
             panic!("expected gc");

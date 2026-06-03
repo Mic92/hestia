@@ -175,10 +175,10 @@ pub struct PipelineContext {
     /// Where committed manifests are published for the substituter.
     ///
     /// Read-your-writes: the cache service's lookups are eventually
-    /// consistent (PLAN.md Decision 28), so re-loading the manifest right
-    /// after a commit can return a stale version that misses the paths
-    /// this very drain just pushed. Publishing the committed manifest
-    /// directly guarantees the substituter can serve them immediately.
+    /// consistent, so re-loading the manifest right after a commit can
+    /// return a stale version that misses the paths this very drain just
+    /// pushed. Publishing the committed manifest directly guarantees the
+    /// substituter can serve them immediately.
     pub publish: Option<ManifestStore>,
 }
 
@@ -234,9 +234,9 @@ impl PipelineContext {
         let load_started = std::time::Instant::now();
         let (loaded_version, loaded) = self.load_manifest_versioned().await?;
 
-        // Read-your-writes (PLAN.md Decision 28): cache lookups may lag
-        // behind this daemon's own commits, so fold in the manifest we are
-        // currently serving (it is at least as new as anything we wrote).
+        // Read-your-writes: cache lookups may lag behind this daemon's own
+        // commits, so fold in the manifest we are currently serving (it is
+        // at least as new as anything we wrote).
         let (known_version, known) = match &self.publish {
             Some(store) => store.versioned(),
             None => (0, Manifest::new()),
@@ -292,8 +292,8 @@ impl PipelineContext {
             root_paths.insert(hash);
 
             if let Some(existing) = current.paths.get(&hash) {
-                // Already stored: bump the push clock so PushTTL-based
-                // liveness keeps protecting it (PLAN.md liveness rule).
+                // Already stored: bump the push clock so push-TTL-based
+                // liveness keeps protecting it.
                 let mut entry = existing.clone();
                 entry.last_pushed = now;
                 bumped.insert(hash, entry);

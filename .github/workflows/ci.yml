@@ -40,14 +40,11 @@ jobs:
       - name: Assert package closures are complete
         run: nix build .# .#gha-real-tests --no-link
 
-  # Phase 0 milestone: prove that the action wrapper makes the GHA cache
-  # tokens visible to shell steps and that the results endpoint is reachable.
-  # If this job fails, the whole project needs rethinking (see PLAN.md,
-  # Critical Constraint 1).
-  #
-  # Phase 1 milestone: the real-API integration tests round-trip a blob
-  # through the actual GHA cache (Twirp reserve/finalize, Azure PUT/Range
-  # GET) and manage entries via the REST API.
+  # Proves the action wrapper makes the GHA cache tokens visible to shell
+  # steps and that the results endpoint is reachable. The real-API
+  # integration tests then round-trip a blob through the actual GHA cache
+  # (Twirp reserve/finalize, Azure PUT/Range GET) and manage entries via
+  # the REST API.
   token-probe:
     runs-on: ubuntu-latest
     # The build job pushes the gha-real-tests closure to the cache.

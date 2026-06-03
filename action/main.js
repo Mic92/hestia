@@ -2,8 +2,8 @@
 //
 // Runs as a JS action because the GHA cache tokens (ACTIONS_RUNTIME_TOKEN,
 // ACTIONS_RESULTS_URL) are only injected into the environment of JS actions,
-// never into `run:` steps (PLAN.md, Critical Constraint 1) -- and because
-// only JS actions get a native `post:` hook for the drain step.
+// never into `run:` steps -- and because only JS actions get a native
+// `post:` hook for the drain step.
 //
 // No npm dependencies on purpose: node builtins plus workflow commands
 // replace @actions/core, so the action needs no bundling step.

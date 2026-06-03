@@ -17,9 +17,9 @@
 //! `stale_skip_after` consecutive conflicts on the same index the writer
 //! assumes a crashed peer and skips over that index.
 //!
-//! Consistency model (verified against the real service, PLAN.md Decision
-//! 28): **reservations are strongly consistent** (two writers can never both
-//! reserve the same key) but **lookups are eventually consistent** (a
+//! Consistency model (verified against the real service): **reservations
+//! are strongly consistent** (two writers can never both reserve the same
+//! key) but **lookups are eventually consistent** (a
 //! just-finalized entry may not be returned by load() for a while). The
 //! conflict-retry loop therefore re-loads until it sees the version that
 //! blocked it; the stale-skip window must be comfortably larger than the
@@ -164,9 +164,9 @@ impl<'a> SaveMutable<'a> {
     ///
     /// Callers that know a version `floor` exists (because they committed
     /// it themselves) pass it here so that an eventually-consistent load
-    /// (PLAN.md Decision 28) — which may still return an older version —
-    /// does not make the writer reserve an index that is already taken and
-    /// spin in the conflict loop until the lookup catches up.
+    /// — which may still return an older version — does not make the
+    /// writer reserve an index that is already taken and spin in the
+    /// conflict loop until the lookup catches up.
     pub async fn save_with_floor<F>(&self, floor: u64, mut merge: F) -> Result<u64, Error>
     where
         F: FnMut(Option<&MutableEntry>) -> Result<Vec<u8>, Error>,

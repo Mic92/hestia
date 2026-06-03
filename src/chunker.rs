@@ -140,10 +140,9 @@ impl PackBuilder {
     /// Append an already-compressed chunk frame without recompressing it.
     ///
     /// Used by GC repack: frames are Range-read from source packs and copied
-    /// into new packs byte-identically (PLAN.md GC design: "Range-copy
-    /// verified zstd frames, no recompression"). The caller must have
-    /// verified that `frame` decompresses to data hashing to `hash` (see
-    /// [`extract_chunk`]). Returns whether the chunk was actually added
+    /// into new packs byte-identically, never recompressed. The caller must
+    /// have verified that `frame` decompresses to data hashing to `hash`
+    /// (see [`extract_chunk`]). Returns whether the chunk was actually added
     /// (duplicates are skipped).
     pub fn add_compressed(
         &mut self,

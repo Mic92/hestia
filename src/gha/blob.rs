@@ -1,7 +1,7 @@
 //! Azure blob transfers over pre-signed SAS URLs.
 //!
 //! The Twirp API hands out pre-signed upload/download URLs pointing at Azure
-//! Blob Storage. No Azure SDK is needed (PLAN.md, Critical Constraint 5):
+//! Blob Storage. No Azure SDK is needed:
 //!
 //! * Upload: single `PUT` with `x-ms-blob-type: BlockBlob` (works for blobs
 //!   up to 5000 MiB).

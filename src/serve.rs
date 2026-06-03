@@ -25,10 +25,10 @@
 //!   -> one final drain before returning
 //! ```
 //!
-//! Buffered paths live in memory only (PLAN.md "Hook: keep it minimal"):
-//! on ephemeral CI runners, a persistent queue would not survive the job
-//! either, and lost registrations self-correct (the path is rebuilt and
-//! re-registered next run).
+//! Buffered paths live in memory only: on ephemeral CI runners, a
+//! persistent queue would not survive the job either, and lost
+//! registrations self-correct (the path is rebuilt and re-registered next
+//! run).
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -113,9 +113,9 @@ impl DaemonState {
                 }
                 self.touch();
                 // The pipeline publishes the committed manifest into the
-                // shared ManifestStore itself (read-your-writes; reloading
-                // from the cache here could return a stale version, see
-                // PLAN.md Decision 28).
+                // shared ManifestStore itself; reloading from the cache here
+                // could return a stale version (lookups are eventually
+                // consistent).
                 Ok(stats)
             }
             Err(err) => {
@@ -171,8 +171,8 @@ impl Daemon {
     ) -> std::io::Result<Self> {
         // Committed manifests go straight into the substituter's store:
         // re-loading from the cache after a drain could return a stale
-        // version (eventual consistency, PLAN.md Decision 28) and make
-        // just-pushed paths unsubstitutable.
+        // version (lookups are eventually consistent) and make just-pushed
+        // paths unsubstitutable.
         pipeline.publish = Some(manifest_store);
 
         if let Some(parent) = socket.parent() {
@@ -326,7 +326,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             eprintln!(
                 "hestia serve: {err}\n\
                  hint: the GHA cache tokens are only visible to shell steps when the \
-                 hestia action wrapper exported them (see PLAN.md, Critical Constraint 1)"
+                 hestia action wrapper exported them"
             );
             return ExitCode::FAILURE;
         }
@@ -376,7 +376,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     let manifest_store = ManifestStore::new();
     match pipeline.load_manifest_versioned().await {
         // Recording the version makes drains start their reservations
-        // above it even when cache lookups lag (PLAN.md Decision 28).
+        // above it even when cache lookups lag.
         Ok((version, manifest)) => manifest_store.set_version(manifest, version),
         Err(err) => {
             eprintln!("hestia serve: cannot load the manifest, substituting nothing: {err}");
