@@ -49,6 +49,22 @@ in
     // {
       inherit cargoArtifacts;
       doCheck = false;
+      # Release binaries must run outside the nix store. Linux is static
+      # (musl); darwin must only link system libraries.
+      postInstall = lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+        # Rust std links libiconv, and nixpkgs' rustc resolves it to the
+        # nix store copy. Swap in the system one (shipped with macOS).
+        # The fixup phase re-signs the binary afterwards.
+        nix_libiconv=$(otool -L "$out/bin/hestia" | awk '/\/nix\/store\/.*libiconv/{print $1}')
+        if [ -n "$nix_libiconv" ]; then
+          install_name_tool -change "$nix_libiconv" /usr/lib/libiconv.2.dylib "$out/bin/hestia"
+        fi
+
+        if otool -L "$out/bin/hestia" | tail -n +2 | grep /nix/store; then
+          echo "error: hestia links against nix store paths" >&2
+          exit 1
+        fi
+      '';
       meta = {
         description = "Nix binary cache backed by the GitHub Actions cache (v2 API)";
         homepage = "https://github.com/Mic92/hestia";

@@ -15,8 +15,10 @@ When the job starts, the action:
    against GitHub's build attestations) or from a path you built yourself.
 3. Starts the hestia daemon: a post-build-hook listener plus a local
    substituter speaking the Nix binary cache protocol over HTTP.
-4. Wires both into `nix.conf` (`extra-substituters` with `?trusted=true`,
-   `post-build-hook`) and restarts the nix-daemon if there is one.
+4. Wires both into a private `nix.conf` (`extra-substituters` with
+   `?trusted=true`, `post-build-hook`) registered via `NIX_USER_CONF_FILES`.
+   No nix-daemon restart; on multi-user installs the runner user must be in
+   `trusted-users` for the hook to fire (GitHub-hosted runners are).
 
 When the job ends, a post step drains the daemon: everything that was built
 is chunked, packed, and uploaded, and the manifest is committed to the GHA

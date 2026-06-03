@@ -19,8 +19,15 @@ jobs:
   # the variables unset the dogfood step is skipped.
   #   HESTIA_DOGFOOD          "true"
   #   HESTIA_DOGFOOD_VERSION  release tag, e.g. "v0.1.0-alpha.4"
+  #
+  # macOS jobs do not dogfood yet: no release ships darwin binaries. Drop
+  # the runner.os conditions once one does.
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
     permissions:
       # GHA cache writes when dogfooding is enabled.
       actions: write
@@ -29,7 +36,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
       - name: Start hestia cache (dogfood)
-        if: vars.HESTIA_DOGFOOD == 'true'
+        if: vars.HESTIA_DOGFOOD == 'true' && runner.os == 'Linux'
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
@@ -131,7 +138,11 @@ jobs:
   # (locally built binary), nix.conf wiring, daemon readiness, post-build-hook
   # capture, manifest commit, and substitution back out of the cache.
   action-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
     # The build job pushes the package closure to the cache.
     needs: build
     permissions:
@@ -143,7 +154,7 @@ jobs:
       # Dogfood substituter, so the nix build below substitutes instead of
       # compiling (forks without the variables build from source).
       - name: Start hestia cache (dogfood)
-        if: vars.HESTIA_DOGFOOD == 'true'
+        if: vars.HESTIA_DOGFOOD == 'true' && runner.os == 'Linux'
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
@@ -186,9 +197,11 @@ jobs:
           curl -fsS "http://$HESTIA_LISTEN/$hash.narinfo"
 
           # Nix itself is the oracle: copy the path out of hestia into a
-          # fresh store.
+          # fresh store. Not /tmp: on macOS it is a symlink, which nix
+          # rejects for store parents.
+          fresh_store="$RUNNER_TEMP/fresh-store"
           nix copy --no-check-sigs \
             --from "http://$HESTIA_LISTEN" \
-            --to /tmp/fresh-store \
+            --to "$fresh_store" \
             "$path"
-          test -e "/tmp/fresh-store$path"
+          test -e "$fresh_store$path"

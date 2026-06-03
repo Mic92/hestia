@@ -12,6 +12,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 
@@ -43,14 +44,6 @@ function saveState(name, value) {
 function fail(message) {
   console.error(`::error::${message}`);
   process.exit(1);
-}
-
-/** Run a command, streaming output; throws on non-zero exit. */
-function run(command, args) {
-  const result = spawnSync(command, args, { stdio: 'inherit' });
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(' ')} exited with ${result.status}`);
-  }
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -135,10 +128,13 @@ async function installBinary(installDir) {
     fs.copyFileSync(binary, target);
   } else {
     const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch] || process.arch;
+    if (process.platform !== 'linux' && process.platform !== 'darwin') {
+      fail(`unsupported platform: ${process.platform}`);
+    }
     // GITHUB_ACTION_REPOSITORY points at the repo this action was loaded
     // from, so forks automatically download their own releases.
     const repo = process.env.GITHUB_ACTION_REPOSITORY || 'Mic92/hestia';
-    const assetName = `hestia-${arch}-linux`;
+    const assetName = `hestia-${arch}-${process.platform}`;
     const url = `https://github.com/${repo}/releases/download/${version}/${assetName}`;
     console.log(`hestia-cache: downloading ${url}`);
     const response = await fetch(url, { redirect: 'follow' });
@@ -177,50 +173,57 @@ function writeHookShim(installDir, hestiaBin, socket) {
  *                      come from hestia, everything else from upstream.
  * - fallback = true -> if a cached path disappears mid-job (LRU eviction),
  *                      Nix rebuilds instead of failing.
+ *
+ * The settings live in a private nix.conf registered via
+ * NIX_USER_CONF_FILES, not in /etc/nix/nix.conf: needs no sudo and no
+ * nix-daemon restart (restarting needs systemd or launchd, which
+ * self-hosted runners may not have). With a multi-user install, nix
+ * forwards settings from trusted users to the daemon, so the
+ * post-build-hook still fires; GitHub-hosted runners put the runner user
+ * in trusted-users.
  */
-function configureNix(listen, hookShim) {
-  const snippet =
-    '\n# --- added by the hestia-cache action ---\n' +
-    `extra-substituters = http://${listen}?trusted=true&priority=30\n` +
-    `post-build-hook = ${hookShim}\n` +
-    'fallback = true\n';
+function configureNix(installDir, listen, hookShim) {
+  const conf = path.join(installDir, 'nix.conf');
+  fs.writeFileSync(
+    conf,
+    '# written by the hestia-cache action\n' +
+      `extra-substituters = http://${listen}?trusted=true&priority=30\n` +
+      `post-build-hook = ${hookShim}\n` +
+      'fallback = true\n'
+  );
 
-  const systemConf = '/etc/nix/nix.conf';
-  if (fs.existsSync(systemConf)) {
-    // Multi-user install (GitHub-hosted runners): the nix-daemon reads
-    // /etc/nix/nix.conf and must be restarted to pick up the hook.
-    appendPrivileged(systemConf, snippet);
-    restartNixDaemon();
-  } else {
-    // Single-user install: per-user configuration is enough.
-    const userConfDir = path.join(process.env.HOME || '/root', '.config', 'nix');
-    fs.mkdirSync(userConfDir, { recursive: true });
-    fs.appendFileSync(path.join(userConfDir, 'nix.conf'), snippet);
-  }
+  // Prepend to the search path so existing user configuration stays active.
+  const home = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+  const dirs = (process.env.XDG_CONFIG_DIRS || '/etc/xdg').split(':');
+  const defaults = [home, ...dirs].map((dir) => path.join(dir, 'nix', 'nix.conf')).join(':');
+  const existing = process.env.NIX_USER_CONF_FILES || defaults;
+  exportVariable('NIX_USER_CONF_FILES', `${conf}:${existing}`);
+
+  warnIfHookCannotFire();
 }
 
-/** Append to a root-owned file: direct write if permitted, sudo tee otherwise. */
-function appendPrivileged(file, content) {
+/**
+ * The post-build-hook only fires when nix accepts it from this user:
+ * single-user installs (writable store) or members of trusted-users.
+ */
+function warnIfHookCannotFire() {
   try {
-    fs.appendFileSync(file, content);
-    return;
+    fs.accessSync('/nix/store', fs.constants.W_OK);
+    return; // single-user install: no daemon involved
   } catch {
-    // Not writable by this user; fall through to sudo.
+    // Multi-user: the daemon only honors the hook for trusted users.
   }
-  const tee = spawnSync('sudo', ['tee', '-a', file], {
-    input: content,
-    stdio: ['pipe', 'ignore', 'inherit'],
-  });
-  if (tee.status !== 0) {
-    fail(`cannot write ${file} (tried direct write and sudo tee)`);
+  const show = spawnSync('nix', ['config', 'show', 'trusted-users'], { encoding: 'utf8' });
+  if (show.status !== 0) {
+    return; // cannot determine; stay quiet
   }
-}
-
-function restartNixDaemon() {
-  const isActive = spawnSync('systemctl', ['is-active', '--quiet', 'nix-daemon']);
-  if (isActive.status === 0) {
-    console.log('hestia-cache: restarting nix-daemon to pick up nix.conf changes');
-    run('sudo', ['systemctl', 'restart', 'nix-daemon']);
+  const trusted = show.stdout.trim().split(/\s+/);
+  const user = os.userInfo().username;
+  if (!trusted.includes(user) && !trusted.includes('*')) {
+    console.log(
+      `::warning::hestia-cache: ${user} is not in nix trusted-users; ` +
+        'the post-build-hook cannot fire and built paths will not be cached'
+    );
   }
 }
 
@@ -303,7 +306,7 @@ async function main() {
 
   const hestiaBin = await installBinary(installDir);
   const hookShim = writeHookShim(installDir, hestiaBin, socket);
-  configureNix(listen, hookShim);
+  configureNix(installDir, listen, hookShim);
   startDaemon(hestiaBin, listen, socket, logFile);
   await waitForReadiness(listen, logFile);
 

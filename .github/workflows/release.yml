@@ -28,6 +28,8 @@ jobs:
             system: x86_64-linux
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
+          - runner: macos-latest
+            system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
     permissions:
       # GHA cache writes when dogfooding is enabled.
@@ -51,13 +53,10 @@ jobs:
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
-      - name: Build static binary
+      - name: Build release binary
         run: nix build .#
       - name: Prepare release asset
-        run: |
-          set -euo pipefail
-          install -m755 result/bin/hestia "hestia-${{ matrix.system }}"
-          sha256sum "hestia-${{ matrix.system }}" | tee "hestia-${{ matrix.system }}.sha256"
+        run: install -m755 result/bin/hestia "hestia-${{ matrix.system }}"
       # Publish build provenance so the hestia-cache action can verify
       # downloaded binaries against GitHub's attestation API instead of
       # requiring users to pin a sha256.
@@ -68,9 +67,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: hestia-${{ matrix.system }}
-          path: |
-            hestia-${{ matrix.system }}
-            hestia-${{ matrix.system }}.sha256
+          path: hestia-${{ matrix.system }}
           if-no-files-found: error
 
   release:
@@ -98,10 +95,8 @@ jobs:
           esac
 
           # Draft release: usage snippet + auto-generated changelog, pruned
-          # by hand before publishing. The checksums table is for manual
-          # verification (the action checks build attestations).
-          sha256_x86_64=$(cut -d' ' -f1 hestia-x86_64-linux.sha256)
-          sha256_aarch64=$(cut -d' ' -f1 hestia-aarch64-linux.sha256)
+          # by hand before publishing. Binaries are verified via build
+          # attestations (gh attestation verify), so no checksums.
           cat > notes.md <<EOF
           This is alpha software. The cache format and behavior can change
           between releases; a format change means the cache starts out empty
@@ -114,13 +109,6 @@ jobs:
             with:
               version: ${tag}
           \`\`\`
-
-          ## Checksums (SHA-256)
-
-          | Asset | Digest |
-          |---|---|
-          | hestia-x86_64-linux | \`${sha256_x86_64}\` |
-          | hestia-aarch64-linux | \`${sha256_aarch64}\` |
           EOF
 
           gh release create "$tag" \
