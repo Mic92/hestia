@@ -36,7 +36,7 @@ jobs:
       - uses: NixOS/nix-installer-action@main
       - uses: Mic92/hestia/action@main
         with:
-          version: v0.1.0-alpha.6
+          version: v0.1.0-alpha.7
       - run: nix build .#
 ```
 
