@@ -91,6 +91,15 @@ if [[ -z $run_id ]]; then
 fi
 gh run watch "$run_id" --exit-status
 
+# Dogfooding needs a published release; draft assets are not downloadable.
+echo
+echo "draft release created:"
+gh release view "$tag" --json url --jq .url
+echo "edit the notes and publish it; waiting..."
+while [[ "$(gh release view "$tag" --json isDraft --jq .isDraft)" == "true" ]]; do
+  sleep 10
+done
+
 # Point CI dogfooding at the new release. Downloads are verified via build
 # attestations, so only the version variable is needed.
 gh variable set HESTIA_DOGFOOD_VERSION --body "$tag"

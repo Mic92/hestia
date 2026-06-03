@@ -132,9 +132,9 @@ jobs:
             *-*) prerelease=(--prerelease) ;;
           esac
 
-          # Release notes: copy-paste usage snippet; --generate-notes appends
-          # the changelog below it. The checksums table is for manual
-          # verification only (the action checks the build attestations).
+          # Draft release: usage snippet + auto-generated changelog, pruned
+          # by hand before publishing. The checksums table is for manual
+          # verification (the action checks build attestations).
           sha256_x86_64=$(cut -d' ' -f1 hestia-x86_64-linux.sha256)
           sha256_aarch64=$(cut -d' ' -f1 hestia-aarch64-linux.sha256)
           cat > notes.md <<EOF
@@ -163,5 +163,6 @@ jobs:
             --title "$tag" \
             --notes-file notes.md \
             --generate-notes \
+            --draft \
             "${prerelease[@]}" \
             hestia-*
