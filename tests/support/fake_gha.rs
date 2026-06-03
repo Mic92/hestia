@@ -30,6 +30,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -615,7 +616,8 @@ impl FakeGha {
         TwirpClient::new(http.clone(), &self.base_url, "fake-runtime-token")
     }
 
-    /// REST client pointed at this fake.
+    /// REST client pointed at this fake. The fake never rate-limits, so
+    /// request pacing is disabled to keep tests fast.
     pub fn rest(&self, http: &reqwest::Client) -> RestClient {
         RestClient::new(
             http.clone(),
@@ -623,6 +625,7 @@ impl FakeGha {
             &self.repo,
             "fake-github-token",
         )
+        .with_pacing(Duration::ZERO, Duration::from_millis(50))
     }
 
     /// Simulate LRU eviction of `key` (entry and blob disappear).

@@ -9,14 +9,18 @@
 //!   and duplicates entries.
 //! * `total_count` is server-controlled data; pagination termination must
 //!   not depend on it ever being consistent with the returned pages.
+//! * Mutating requests trip GitHub's secondary rate limit when sent
+//!   back-to-back (GC deletes dozens of entries in one sweep). The client
+//!   must pace them and retry rate-limited responses.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Query, State};
-use axum::response::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use serde_json::json;
 
@@ -150,6 +154,165 @@ async fn start_github_like(entries: Vec<Entry>, concurrent_downloads: bool) -> S
         .route("/repos/{owner}/{repo}/actions/caches", get(list_handler))
         .with_state(state);
     start_server(router).await
+}
+
+/// A cache endpoint that rate-limits the first `rate_limited_requests`
+/// calls the way GitHub's secondary rate limit does (403 + Retry-After +
+/// a "secondary rate limit" message), and records when each request
+/// arrived.
+struct RateLimitedServer {
+    rate_limited_requests: usize,
+    requests: Vec<Instant>,
+}
+
+impl RateLimitedServer {
+    /// Returns the rate-limit response if this request should be limited.
+    fn admit(&mut self) -> Option<Response> {
+        self.requests.push(Instant::now());
+        if self.requests.len() > self.rate_limited_requests {
+            return None;
+        }
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                [("retry-after", "1")],
+                Json(json!({
+                    "message": "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+                    "documentation_url": "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api#about-secondary-rate-limits",
+                })),
+            )
+                .into_response(),
+        )
+    }
+}
+
+fn single_entry_listing(key: &str) -> Json<serde_json::Value> {
+    Json(json!({
+        "total_count": 1,
+        "actions_caches": [{
+            "id": 1,
+            "ref": "refs/heads/main",
+            "key": key,
+            "version": "v",
+            "created_at": format_timestamp(1_000),
+            "last_accessed_at": format_timestamp(1_000),
+            "size_in_bytes": 1,
+        }],
+    }))
+}
+
+async fn rate_limited_delete_handler(
+    State(state): State<Arc<Mutex<RateLimitedServer>>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(limited) = state.lock().unwrap().admit() {
+        return limited;
+    }
+    let key = params.get("key").cloned().unwrap_or_default();
+    single_entry_listing(&key).into_response()
+}
+
+async fn rate_limited_list_handler(State(state): State<Arc<Mutex<RateLimitedServer>>>) -> Response {
+    if let Some(limited) = state.lock().unwrap().admit() {
+        return limited;
+    }
+    single_entry_listing("pack-listed").into_response()
+}
+
+async fn start_rate_limited_server(
+    rate_limited_requests: usize,
+) -> (String, Arc<Mutex<RateLimitedServer>>) {
+    let state = Arc::new(Mutex::new(RateLimitedServer {
+        rate_limited_requests,
+        requests: Vec::new(),
+    }));
+    let router = Router::new()
+        .route(
+            "/repos/{owner}/{repo}/actions/caches",
+            get(rate_limited_list_handler).delete(rate_limited_delete_handler),
+        )
+        .with_state(state.clone());
+    (start_server(router).await, state)
+}
+
+#[tokio::test]
+async fn delete_retries_after_secondary_rate_limit() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (url, state) = start_rate_limited_server(1).await;
+        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
+            .with_pacing(Duration::ZERO, Duration::from_millis(100));
+
+        // GitHub answered the first DELETE with a secondary rate limit
+        // error; the client must wait and retry instead of failing GC.
+        let deleted = rest.delete_by_key("pack-rate-limited").await.unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(state.lock().unwrap().requests.len(), 2);
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn list_retries_after_secondary_rate_limit() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (url, state) = start_rate_limited_server(1).await;
+        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
+            .with_pacing(Duration::ZERO, Duration::from_millis(100));
+
+        // Reads hit the same secondary rate limit as writes when GC pages
+        // through a large cache; they must retry too.
+        let listed = rest.list_caches("pack-").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(state.lock().unwrap().requests.len(), 2);
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn rate_limiting_that_never_lifts_is_an_error_not_a_hang() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (url, _state) = start_rate_limited_server(usize::MAX).await;
+        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
+            .with_pacing(Duration::ZERO, Duration::from_millis(10));
+
+        let err = rest.delete_by_key("pack-never").await.unwrap_err();
+        assert!(
+            err.to_string().contains("403"),
+            "error should carry the HTTP status: {err}"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn mutating_requests_are_paced() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (url, state) = start_rate_limited_server(0).await;
+        let interval = Duration::from_millis(300);
+        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
+            .with_pacing(interval, Duration::from_secs(1));
+
+        for i in 0..3 {
+            rest.delete_by_key(&format!("pack-{i}")).await.unwrap();
+        }
+
+        // Three deletes, two enforced gaps. Checking the gap between
+        // consecutive server-side arrivals (not total elapsed time) so a
+        // slow first request cannot mask missing pacing.
+        let requests = state.lock().unwrap().requests.clone();
+        assert_eq!(requests.len(), 3);
+        for pair in requests.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap >= interval - Duration::from_millis(50),
+                "deletes arrived {gap:?} apart, expected at least {interval:?}"
+            );
+        }
+    })
+    .await
+    .expect("test timed out");
 }
 
 #[tokio::test]

@@ -11,7 +11,11 @@
 //!
 //! The workflow needs `permissions: actions: write` for deletion.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use serde::Deserialize;
+use tokio::time::Instant;
 
 use crate::gha::Error;
 
@@ -23,6 +27,17 @@ pub const ENV_GITHUB_REPOSITORY: &str = "GITHUB_REPOSITORY";
 pub const ENV_GITHUB_API_URL: &str = "GITHUB_API_URL";
 
 const PER_PAGE: u32 = 100;
+
+/// GitHub asks for at least one second between mutating requests:
+/// <https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api>
+const MUTATION_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Wait before retrying a rate-limited request that carried no Retry-After
+/// header (GitHub documents "at least one minute").
+const RATE_LIMIT_FALLBACK_WAIT: Duration = Duration::from_secs(60);
+
+/// Give up after this many rate-limited responses for a single request.
+const RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
 
 /// Build the caches collection URL for a repository.
 fn caches_url(api_url: &str, repo: &str) -> String {
@@ -162,6 +177,11 @@ pub struct RestClient {
     api_url: String,
     repo: String,
     token: String,
+    mutation_interval: Duration,
+    rate_limit_fallback_wait: Duration,
+    /// When the last mutating request was sent. Shared across clones so
+    /// pacing holds globally, not per handle.
+    last_mutation: Arc<tokio::sync::Mutex<Option<Instant>>>,
 }
 
 impl RestClient {
@@ -176,7 +196,21 @@ impl RestClient {
             api_url: api_url.into(),
             repo: repo.into(),
             token: token.into(),
+            mutation_interval: MUTATION_INTERVAL,
+            rate_limit_fallback_wait: RATE_LIMIT_FALLBACK_WAIT,
+            last_mutation: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    /// Override the request pacing (tests use short intervals).
+    pub fn with_pacing(
+        mut self,
+        mutation_interval: Duration,
+        rate_limit_fallback_wait: Duration,
+    ) -> Self {
+        self.mutation_interval = mutation_interval;
+        self.rate_limit_fallback_wait = rate_limit_fallback_wait;
+        self
     }
 
     /// Build a client from `GITHUB_TOKEN` / `GITHUB_REPOSITORY`
@@ -213,19 +247,62 @@ impl RestClient {
             .header(reqwest::header::USER_AGENT, "hestia")
     }
 
-    async fn check<T: serde::de::DeserializeOwned>(
+    /// Hold back a mutating request until `mutation_interval` has passed
+    /// since the previous one.
+    async fn pace_mutation(&self) {
+        let mut last = self.last_mutation.lock().await;
+        if let Some(at) = *last {
+            tokio::time::sleep_until(at + self.mutation_interval).await;
+        }
+        *last = Some(Instant::now());
+    }
+
+    /// Send a request and decode the response, waiting and retrying when
+    /// GitHub rate-limits it. `mutating` requests are additionally paced.
+    ///
+    /// Rate limits answer 403 or 429; a Retry-After header or a "rate
+    /// limit" message distinguishes them from a real permission error.
+    async fn send<T: serde::de::DeserializeOwned>(
+        &self,
         url: &str,
-        response: reqwest::Response,
+        request: reqwest::RequestBuilder,
+        mutating: bool,
     ) -> Result<T, Error> {
-        let status = response.status();
-        if status.is_success() {
-            Ok(response.json().await?)
-        } else {
-            Err(Error::Status {
-                status: status.as_u16(),
-                url: url.to_string(),
-                body: response.text().await.unwrap_or_default(),
-            })
+        let mut attempts = 0;
+        loop {
+            if mutating {
+                self.pace_mutation().await;
+            }
+            let response = request
+                .try_clone()
+                .expect("cache API requests have no streaming body")
+                .send()
+                .await?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(response.json().await?);
+            }
+
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs);
+            let body = response.text().await.unwrap_or_default();
+
+            let rate_limited = (status == reqwest::StatusCode::FORBIDDEN
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+                && (retry_after.is_some() || body.to_lowercase().contains("rate limit"));
+            attempts += 1;
+            if !rate_limited || attempts >= RATE_LIMIT_MAX_ATTEMPTS {
+                return Err(Error::Status {
+                    status: status.as_u16(),
+                    url: url.to_string(),
+                    body,
+                });
+            }
+            tokio::time::sleep(retry_after.unwrap_or(self.rate_limit_fallback_wait)).await;
         }
     }
 
@@ -252,8 +329,7 @@ impl RestClient {
             if !key_prefix.is_empty() {
                 request = request.query(&[("key", key_prefix)]);
             }
-            let response = request.send().await?;
-            let list: CacheList = Self::check(&url, response).await?;
+            let list: CacheList = self.send(&url, request, false).await?;
             // Termination must not depend on `total_count` ever becoming
             // consistent with the returned pages: an empty page means there
             // is nothing more to fetch, whatever the server claims.
@@ -273,17 +349,15 @@ impl RestClient {
     /// error and returns an empty list (GC idempotence).
     pub async fn delete_by_key(&self, key: &str) -> Result<Vec<CacheEntry>, Error> {
         let url = self.caches_url();
-        let response = self
+        let request = self
             .request(reqwest::Method::DELETE, &url)
-            .query(&[("key", key)])
-            .send()
-            .await?;
-        // GitHub returns 404 when nothing matched the key.
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(Vec::new());
+            .query(&[("key", key)]);
+        match self.send(&url, request, true).await {
+            Ok(CacheList { actions_caches, .. }) => Ok(actions_caches),
+            // GitHub returns 404 when nothing matched the key.
+            Err(Error::Status { status: 404, .. }) => Ok(Vec::new()),
+            Err(err) => Err(err),
         }
-        let list: CacheList = Self::check(&url, response).await?;
-        Ok(list.actions_caches)
     }
 }
 
