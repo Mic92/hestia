@@ -491,7 +491,10 @@ impl<'de> Deserialize<'de> for Blob {
                 Ok(Blob(v))
             }
         }
-        deserializer.deserialize_bytes(Visitor)
+        // deserialize_byte_buf, not deserialize_bytes: ciborium's
+        // deserialize_bytes rejects byte strings larger than its scratch
+        // buffer (4 KiB), and hash columns are megabytes.
+        deserializer.deserialize_byte_buf(Visitor)
     }
 }
 
@@ -898,6 +901,30 @@ mod tests {
         let manifest = sample_manifest();
         let encoded = manifest.encode().unwrap();
         let decoded = Manifest::decode(&encoded).unwrap();
+        assert_eq!(manifest, decoded);
+    }
+
+    #[test]
+    fn large_manifest_round_trip() {
+        // Regression: ciborium's deserialize_bytes rejects byte strings
+        // larger than its 4 KiB scratch buffer ("invalid type: bytes,
+        // expected bytes"). The columnar hash blobs exceed that on any
+        // real manifest, so use enough chunks to cross the threshold.
+        let mut manifest = sample_manifest();
+        let pack = Hash32::digest(b"big pack");
+        for i in 0u32..1000 {
+            manifest.chunks.insert(
+                ChunkHash::digest(i.to_le_bytes()),
+                ChunkLocation {
+                    pack,
+                    offset: u64::from(i) * 100,
+                    compressed_size: 100,
+                    uncompressed_size: 150,
+                    repacks_survived: 0,
+                },
+            );
+        }
+        let decoded = Manifest::decode(&manifest.encode().unwrap()).unwrap();
         assert_eq!(manifest, decoded);
     }
 
