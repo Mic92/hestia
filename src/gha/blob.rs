@@ -9,8 +9,10 @@
 //!
 //! SAS URLs expire. On 401/403 the caller-provided refresh callback is asked
 //! for a fresh URL (a new Twirp round-trip) and the transfer is retried once.
+//! Transient failures (5xx, dropped connections) are retried with backoff.
 
 use std::ops::Range;
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -21,6 +23,12 @@ const BLOB_TYPE: &str = "BlockBlob";
 
 /// Azure storage API version header (matches what actions/toolkit sends).
 const API_VERSION: &str = "2020-04-08";
+
+/// Retries for transient failures (503 ServerBusy, dropped connections).
+const TRANSIENT_RETRIES: u32 = 3;
+
+/// First retry delay; doubles per attempt.
+const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Format a half-open byte range as an HTTP `Range` header value
 /// (inclusive on both ends per RFC 9110).
@@ -119,8 +127,10 @@ pub async fn get(
     Ok(body)
 }
 
-/// Like [`put`], but when the SAS URL has expired (401/403), ask `refresh`
-/// for a fresh URL and retry once.
+/// Like [`put`], but recovers from the two failure classes a pre-signed
+/// transfer can hit: expired SAS URLs (401/403, ask `refresh` for a fresh
+/// URL once) and transient failures (5xx, dropped connections; retried
+/// with backoff).
 pub async fn put_with_refresh<F>(
     http: &reqwest::Client,
     url: &str,
@@ -130,17 +140,26 @@ pub async fn put_with_refresh<F>(
 where
     F: AsyncFnOnce() -> Result<String, Error>,
 {
-    match put(http, url, data.clone()).await {
-        Err(Error::Status { status, .. }) if url_expired(status) => {
-            let fresh_url = refresh().await?;
-            put(http, &fresh_url, data).await
+    let mut url = url.to_string();
+    let mut refresh = Some(refresh);
+    let mut transient_left = TRANSIENT_RETRIES;
+    let mut delay = TRANSIENT_RETRY_DELAY;
+    loop {
+        match put(http, &url, data.clone()).await {
+            Err(Error::Status { status, .. }) if url_expired(status) && refresh.is_some() => {
+                url = refresh.take().expect("checked above")().await?;
+            }
+            Err(err) if is_transient(&err) && transient_left > 0 => {
+                transient_left -= 1;
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            result => return result,
         }
-        result => result,
     }
 }
 
-/// Like [`get`], but when the SAS URL has expired (401/403), ask `refresh`
-/// for a fresh URL and retry once.
+/// Like [`get`], but with the same recovery as [`put_with_refresh`].
 pub async fn get_with_refresh<F>(
     http: &reqwest::Client,
     url: &str,
@@ -150,12 +169,22 @@ pub async fn get_with_refresh<F>(
 where
     F: AsyncFnOnce() -> Result<String, Error>,
 {
-    match get(http, url, range.clone()).await {
-        Err(Error::Status { status, .. }) if url_expired(status) => {
-            let fresh_url = refresh().await?;
-            get(http, &fresh_url, range).await
+    let mut url = url.to_string();
+    let mut refresh = Some(refresh);
+    let mut transient_left = TRANSIENT_RETRIES;
+    let mut delay = TRANSIENT_RETRY_DELAY;
+    loop {
+        match get(http, &url, range.clone()).await {
+            Err(Error::Status { status, .. }) if url_expired(status) && refresh.is_some() => {
+                url = refresh.take().expect("checked above")().await?;
+            }
+            Err(err) if is_transient(&err) && transient_left > 0 => {
+                transient_left -= 1;
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            result => return result,
         }
-        result => result,
     }
 }
 
