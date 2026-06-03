@@ -51,43 +51,8 @@ jobs:
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
-      - name: System diagnostics
-        run: |
-          uname -a
-          nproc
-          free -h
-          swapon --show || true
-          df -h
       - name: Build static binary
-        # The arm64 runner has died with "The runner has received a
-        # shutdown signal" in every release run so far: 60-130s after job
-        # start, across three Azure regions (eastus2, westus2, westus3),
-        # once even before any build had started. Stream kernel messages,
-        # memory/disk headroom, and Azure scheduled events (IMDS) during
-        # the build, so the next death shows whether the cause is OOM,
-        # disk exhaustion, or VM preemption.
-        run: |
-          sudo dmesg --follow --nopager 2>/dev/null | sed 's/^/[dmesg] /' &
-          (
-            while true; do
-              mem=$(awk '/MemAvailable/{printf "%.1f", $2/1048576}' /proc/meminfo)
-              disk=$(df -BG --output=avail / | tail -1 | tr -d ' G')
-              load=$(cut -d' ' -f1-3 /proc/loadavg)
-              echo "[monitor $(date -u +%H:%M:%S)] mem_avail=${mem}G disk_avail=${disk}G load=${load}"
-              # Azure maintenance/preemption notice for this VM, if any.
-              ev=$(curl -sf --max-time 2 -H Metadata:true \
-                "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01" || true)
-              case "$ev" in
-                "" | *'"Events":[]'*) ;;
-                *) echo "[monitor] AZURE SCHEDULED EVENT: $ev" ;;
-              esac
-              sleep 10
-            done
-          ) &
-          # Background monitors hold stdout open; kill them when the build
-          # exits or the step would hang forever.
-          trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
-          nix build .#static
+        run: nix build .#static
       - name: Prepare release asset
         run: |
           set -euo pipefail
