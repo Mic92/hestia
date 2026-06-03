@@ -48,10 +48,8 @@ jobs:
       # fast, seed main's scope once by running this workflow via
       # workflow_dispatch (dry run on main) after the nixpkgs pin or the
       # toolchain changes.
-      # macOS is not dogfooded yet: no published release ships darwin
-      # binaries. Drop the runner.os gate after the next release.
       - name: Start hestia cache (dogfood)
-        if: vars.HESTIA_DOGFOOD == 'true' && runner.os == 'Linux'
+        if: vars.HESTIA_DOGFOOD == 'true'
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
