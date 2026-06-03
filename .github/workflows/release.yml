@@ -138,7 +138,9 @@ jobs:
           sha256_x86_64=$(cut -d' ' -f1 hestia-x86_64-linux.sha256)
           sha256_aarch64=$(cut -d' ' -f1 hestia-aarch64-linux.sha256)
           cat > notes.md <<EOF
-          > ⚠️ **Alpha software**: APIs, cache format, and behavior may change without notice.
+          This is alpha software. The cache format and behavior can change
+          between releases; a format change means the cache starts out empty
+          after an upgrade.
 
           ## Usage
 
