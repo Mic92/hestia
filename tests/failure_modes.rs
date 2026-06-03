@@ -448,8 +448,8 @@ async fn concurrent_serve_daemons_merge_without_losing_paths() {
 
 #[tokio::test]
 async fn drained_paths_are_substitutable_despite_lookup_lag() {
-    // The real cache service is eventually consistent (PLAN.md Decision
-    // 28): right after a drain commits manifest m#N, lookups may still
+    // The real cache service is eventually consistent: right after a
+    // drain commits manifest m#N, lookups may still
     // return m#N-1 (or nothing). Three guarantees under that lag:
     //
     // 1. paths pushed by THIS daemon are substitutable immediately

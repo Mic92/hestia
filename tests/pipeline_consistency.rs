@@ -1,5 +1,5 @@
 //! Regression tests for write-pipeline correctness under eventually
-//! consistent cache lookups (PLAN.md Decision 28).
+//! consistent cache lookups.
 //!
 //! The real GHA cache service can return *non-monotonic* lookup results: a
 //! prefix lookup may return manifest version N, and a later lookup (from

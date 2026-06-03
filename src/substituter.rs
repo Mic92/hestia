@@ -16,7 +16,7 @@
 //!   corrupt data.
 //!
 //! Responses are unsigned: the action configures the store URL with
-//! `?trusted=true` (PLAN.md, Critical Constraint 4).
+//! `?trusted=true`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -110,9 +110,9 @@ impl ManifestStore {
     }
 
     /// Replace the served manifest, recording the SaveMutable index it came
-    /// from. The version is what the pipeline uses for read-your-writes
-    /// (PLAN.md Decision 28): it merges this manifest into every commit
-    /// base and never reserves an index at or below it.
+    /// from. The version is what the pipeline uses for read-your-writes:
+    /// it merges this manifest into every commit base and never reserves an
+    /// index at or below it.
     pub fn set_version(&self, manifest: Manifest, version: u64) {
         *self.inner.write().expect("manifest lock poisoned") =
             Arc::new(ManifestView::new(manifest, version));
@@ -463,7 +463,7 @@ fn narinfo_for_entry(store_dir: &StoreDir, entry: &PathEntry, hash: &str) -> Vec
         registration_time: None,
         nar_size: entry.nar_size,
         ultimate: false,
-        // Unsigned: the store URL carries ?trusted=true (PLAN.md).
+        // Unsigned: the store URL carries ?trusted=true.
         signatures: BTreeSet::new(),
         ca: entry.ca.as_deref().and_then(|ca| ca.parse().ok()),
         store_dir: store_dir.clone(),

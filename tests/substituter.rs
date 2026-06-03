@@ -421,8 +421,8 @@ async fn nar_round_trips_with_matching_hash() {
 #[tokio::test]
 async fn nix_copy_substitutes_into_fresh_store() {
     timed(async {
-        // THE key test (PLAN.md Testing Strategy layer 3): nix itself copies a
-        // closure out of hestia into an empty store and the contents come out
+        // The key end-to-end test: nix itself copies a closure out of
+        // hestia into an empty store and the contents come out
         // byte-identical.
         let Some(store) = ScratchStore::create() else {
             return;

@@ -1,6 +1,6 @@
 //! `hestia gc`: mark/sweep garbage collection over the GHA cache.
 //!
-//! Runs as a scheduled workflow on the default branch (PLAN.md, Phase 5).
+//! Runs as a scheduled workflow on the default branch.
 //! The flow is split into a read-only **plan** (which doubles as `--dry-run`
 //! output) and an **execute** phase made of individually resumable steps:
 //!
@@ -60,7 +60,7 @@ pub enum Error {
     Chunker(#[from] chunker::Error),
 }
 
-/// GC policy knobs (defaults from PLAN.md / the handoff design).
+/// GC policy knobs.
 #[derive(Debug, Clone)]
 pub struct GcPolicy {
     /// Unreachable paths are kept this long after they were last reachable.
@@ -1013,7 +1013,7 @@ pub async fn run(args: &GcArgs) -> ExitCode {
             eprintln!(
                 "hestia gc: {err}\n\
                  hint: the GHA cache tokens are only visible to shell steps when the \
-                 hestia action wrapper exported them (see PLAN.md, Critical Constraint 1)"
+                 hestia action wrapper exported them"
             );
             return ExitCode::FAILURE;
         }

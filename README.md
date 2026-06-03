@@ -103,8 +103,6 @@ Roots are how hestia decides what is still alive. They are unrelated to
 GitHub's own cache access scoping (who may read or write entries, see
 [Security](#security)), which applies on top.
 
-The full architecture and design rationale live in [PLAN.md](PLAN.md).
-
 ## Configuration reference
 
 The action takes care of all of this; the tables below are only relevant if
@@ -225,9 +223,6 @@ $ nix flake check                    # everything CI runs: fmt, clippy, tests, b
 $ nix build .#                       # the hestia binary
 $ nix build .#static                 # static (musl) release binary
 ```
-
-Architecture, design decisions, and the full implementation plan live in
-[PLAN.md](PLAN.md).
 
 ## License
 

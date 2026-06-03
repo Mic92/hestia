@@ -2,8 +2,8 @@
 //! in the GHA cache for a repository.
 //!
 //! Stored as the SaveMutable entry family `m#N` (see `gha::savemutable`).
-//! Schema follows PLAN.md; all structs ignore unknown fields on decode so
-//! the format can grow without breaking older readers (forward compat).
+//! All structs ignore unknown fields on decode so the format can grow
+//! without breaking older readers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -280,8 +280,7 @@ pub struct Root {
 pub struct Manifest {
     pub paths: BTreeMap<PathHash, PathEntry>,
     pub chunks: BTreeMap<ChunkHash, ChunkLocation>,
-    /// Packs keyed by hash (deviation from PLAN.md's `Vec<PackRef>`: a map
-    /// makes dedup-by-hash the natural merge operation).
+    /// Packs keyed by hash, so dedup-by-hash is the natural merge operation.
     pub packs: BTreeMap<PackHash, PackInfo>,
     /// Roots keyed by "branch-system", e.g. "main-x86_64-linux".
     pub roots: BTreeMap<String, Root>,

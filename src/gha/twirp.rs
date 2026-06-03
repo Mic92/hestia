@@ -21,9 +21,8 @@ use crate::gha::{Error, blob};
 
 /// Cache `version` namespace: sha256 of "hestia-2".
 ///
-/// A namespace, not a format version (PLAN.md Critical Constraint 6).
-/// Changing it orphans every existing cache entry, so it is only bumped on
-/// incompatible storage format changes.
+/// A namespace, not a format version. Changing it orphans every existing
+/// cache entry, so it is only bumped on incompatible storage format changes.
 pub const CACHE_VERSION: &str = "aa3f0c68abc7983158c10a1be8be9bbd7014211eee928dc266f9f0bb37e7be7a";
 
 const SERVICE_PATH: &str = "twirp/github.actions.results.api.v1.CacheService";
