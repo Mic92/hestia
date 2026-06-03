@@ -80,6 +80,23 @@ jobs:
             exit 1
           fi
           echo "Both cache tokens captured successfully."
+      - name: Download newest manifest (temporary)
+        run: |
+          set -euo pipefail
+          version="7a32118639289175533829e84c9aaa9fa781f6a5f1b18a9c8a6bd3642b39dd88"
+          url=$(curl -sf -X POST \
+            "$ACTIONS_RESULTS_URL/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL" \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"key\":\"m#\",\"restore_keys\":[\"m#\"],\"version\":\"$version\"}" |
+            jq -r '.signed_download_url')
+          curl -sfo manifest.zst "$url"
+          ls -l manifest.zst
+      - uses: actions/upload-artifact@v7
+        with:
+          name: manifest
+          path: manifest.zst
+          if-no-files-found: error
       - name: Probe cache results endpoint
         run: |
           set -euo pipefail
