@@ -81,9 +81,11 @@ async fn real_blob_round_trip_range_read_and_delete() {
     let Reservation::Created { upload_url } = twirp.create_cache_entry(&key).await.unwrap() else {
         panic!("fresh unique key reported as already existing");
     };
-    blob::put(&http, &upload_url, Bytes::from(data.clone()))
-        .await
-        .unwrap();
+    blob::put_with_refresh(&http, &upload_url, Bytes::from(data.clone()), async || {
+        Ok(upload_url.clone())
+    })
+    .await
+    .unwrap();
     twirp
         .finalize_upload(&key, data.len() as u64)
         .await
@@ -106,7 +108,9 @@ async fn real_blob_round_trip_range_read_and_delete() {
         panic!("just-finalized entry not found after {PROPAGATION_TIMEOUT:?}");
     };
     assert_eq!(matched_key, key);
-    let downloaded = blob::get(&http, &url, None).await.unwrap();
+    let downloaded = blob::get_with_refresh(&http, &url, None, async || Ok(url.clone()))
+        .await
+        .unwrap();
     assert_eq!(
         downloaded.as_ref(),
         data.as_slice(),
@@ -114,11 +118,15 @@ async fn real_blob_round_trip_range_read_and_delete() {
     );
 
     // Range read (chunk access pattern).
-    let chunk = blob::get(&http, &url, Some(1000..2000)).await.unwrap();
+    let chunk = blob::get_with_refresh(&http, &url, Some(1000..2000), async || Ok(url.clone()))
+        .await
+        .unwrap();
     assert_eq!(chunk.as_ref(), &data[1000..2000], "range read differs");
 
     // 1-byte read (GC LRU touch).
-    let touch = blob::get(&http, &url, Some(0..1)).await.unwrap();
+    let touch = blob::get_with_refresh(&http, &url, Some(0..1), async || Ok(url.clone()))
+        .await
+        .unwrap();
     assert_eq!(touch.len(), 1);
 
     // REST: the entry shows up in a prefix list. The REST view lags behind
@@ -176,9 +184,14 @@ async fn real_miss_and_restore_key_prefix() {
         else {
             panic!("fresh key {key} already exists");
         };
-        blob::put(&http, &upload_url, Bytes::from(payload.clone()))
-            .await
-            .unwrap();
+        blob::put_with_refresh(
+            &http,
+            &upload_url,
+            Bytes::from(payload.clone()),
+            async || Ok(upload_url.clone()),
+        )
+        .await
+        .unwrap();
         twirp
             .finalize_upload(&key, payload.len() as u64)
             .await
@@ -205,7 +218,9 @@ async fn real_miss_and_restore_key_prefix() {
         panic!("prefix restore lookup missed after {PROPAGATION_TIMEOUT:?}");
     };
     assert_eq!(matched_key, expected_key, "newest entry must win");
-    let data = blob::get(&http, &url, None).await.unwrap();
+    let data = blob::get_with_refresh(&http, &url, None, async || Ok(url.clone()))
+        .await
+        .unwrap();
     assert_eq!(data.as_ref(), b"payload v2");
 
     // Cleanup.

@@ -1,5 +1,5 @@
 //! Regression tests for the Azure blob client (`gha::blob`) against
-//! servers that mishandle `Range` requests.
+//! servers that mishandle `Range` requests or fail transiently.
 //!
 //! `blob::get(url, Some(range))` promises to return exactly the requested
 //! bytes. Callers build chunk extraction on that promise:
@@ -12,13 +12,21 @@
 //!
 //! Both failure modes must surface as clean errors from `blob::get`, never
 //! as silently wrong data.
+//!
+//! Azure also fails transiently (503 ServerBusy, dropped connections). The
+//! `*_with_refresh` transfer functions every production caller uses must
+//! retry those instead of failing the drain or GC run.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use bytes::Bytes;
 
 use hestia::gha::blob;
 
@@ -70,6 +78,103 @@ async fn start_server() -> String {
         axum::serve(listener, router).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+/// A server that answers 503 ServerBusy a fixed number of times before
+/// succeeding, the way Azure behaves under load.
+async fn busy_then_ok(
+    State(remaining): State<Arc<AtomicUsize>>,
+    method: axum::http::Method,
+) -> impl IntoResponse {
+    if remaining
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, b"ServerBusy".to_vec());
+    }
+    if method == axum::http::Method::PUT {
+        (StatusCode::CREATED, Vec::new())
+    } else {
+        (StatusCode::OK, BLOB.to_vec())
+    }
+}
+
+/// Start a server whose blob endpoint is busy for the first `busy` requests,
+/// returning the request counter.
+async fn start_busy_server(busy: usize) -> (String, Arc<AtomicUsize>) {
+    let remaining = Arc::new(AtomicUsize::new(busy));
+    let router = Router::new()
+        .route("/blob", get(busy_then_ok).put(busy_then_ok))
+        .with_state(remaining.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub listener");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (format!("http://{addr}"), remaining)
+}
+
+/// Refresh callback that must not be called: 503 is not a URL expiry.
+async fn no_refresh() -> Result<String, hestia::gha::Error> {
+    panic!("refresh must only be called for 401/403, not for transient errors");
+}
+
+#[tokio::test]
+async fn upload_retries_transient_server_errors() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (base, _) = start_busy_server(2).await;
+        let http = reqwest::Client::new();
+        let url = format!("{base}/blob");
+
+        blob::put_with_refresh(&http, &url, Bytes::from_static(b"data"), no_refresh)
+            .await
+            .expect("two 503s then success must not fail the upload");
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn download_retries_transient_server_errors() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (base, _) = start_busy_server(2).await;
+        let http = reqwest::Client::new();
+        let url = format!("{base}/blob");
+
+        let data = blob::get_with_refresh(&http, &url, None, no_refresh)
+            .await
+            .expect("two 503s then success must not fail the download");
+        assert_eq!(data.as_ref(), &BLOB[..]);
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn permanent_server_errors_fail_after_bounded_retries() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (base, remaining) = start_busy_server(usize::MAX).await;
+        let http = reqwest::Client::new();
+        let url = format!("{base}/blob");
+
+        let err = blob::put_with_refresh(&http, &url, Bytes::from_static(b"data"), no_refresh)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("503"),
+            "error should carry the HTTP status: {err}"
+        );
+        // Bounded: a permanently busy server must not be hammered forever.
+        let requests = usize::MAX - remaining.load(Ordering::SeqCst);
+        assert!(
+            (2..=8).contains(&requests),
+            "expected a small bounded number of attempts, got {requests}"
+        );
+    })
+    .await
+    .expect("test timed out");
 }
 
 #[tokio::test]
