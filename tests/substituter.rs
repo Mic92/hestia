@@ -561,58 +561,46 @@ async fn narinfo_hits_join_the_root_at_next_drain() {
 }
 
 #[tokio::test]
-async fn prefetch_serves_nar_without_additional_pack_reads() {
+async fn second_nar_request_reuses_cached_chunks() {
     timed(async {
         let Some(store) = ScratchStore::create() else {
             return;
         };
-        let fixture = store.add_fixture("prefetch", 101);
+        let fixture = store.add_fixture("cache-reuse", 101);
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
         push_paths(&fake, &http, &store, &[&fixture]).await;
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
-        // The narinfo hit must trigger the background prefetch.
         let response = substituter.narinfo(&http, &fixture).await;
         assert_eq!(response.status(), 200);
         let narinfo = parse_narinfo(&response.text().await.unwrap());
 
-        // Wait until the prefetch finishes (pack downloads appear and stop
-        // growing).
-        let mut last_count = 0;
-        let mut stable_for = 0;
-        for _ in 0..200 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let count = pack_download_count(&fake);
-            if count > 0 && count == last_count {
-                stable_for += 1;
-                if stable_for >= 4 {
-                    break;
-                }
-            } else {
-                stable_for = 0;
-            }
-            last_count = count;
-        }
-        let downloads_after_prefetch = pack_download_count(&fake);
-        assert!(
-            downloads_after_prefetch > 0,
-            "narinfo hit must trigger a chunk prefetch"
-        );
-
-        // The NAR request is served entirely from prefetched chunks: not a
-        // single additional pack read.
+        // First NAR request fetches chunks from packs.
         let response = substituter.get(&http, &narinfo["URL"]).await;
         assert_eq!(response.status(), 200);
         let nar = response.bytes().await.unwrap();
         let (expected_hash, _) = store.nar_hash_oracle(&fixture).unwrap();
         assert_eq!(Hash32::digest(&nar), expected_hash);
 
+        let downloads_after_first = pack_download_count(&fake);
+        assert!(
+            downloads_after_first > 0,
+            "first NAR request must fetch from packs"
+        );
+
+        // Second NAR request for the same path must be served entirely
+        // from the in-memory chunk cache — no additional pack reads.
+        let response = substituter.get(&http, &narinfo["URL"]).await;
+        assert_eq!(response.status(), 200);
+        let nar = response.bytes().await.unwrap();
+        assert_eq!(Hash32::digest(&nar), expected_hash);
+
         assert_eq!(
             pack_download_count(&fake),
-            downloads_after_prefetch,
-            "NAR must be served from prefetched data, without new pack reads"
+            downloads_after_first,
+            "second NAR request must reuse cached chunks, no new pack reads"
         );
     })
     .await;

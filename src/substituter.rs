@@ -5,8 +5,7 @@
 //! * `GET /nix-cache-info` — store dir, mass-query flag, priority.
 //! * `GET /{hash}.narinfo` — manifest lookup; a hit is recorded in the
 //!   [`AccessLog`] (narinfo hits are the liveness signal: accessed paths
-//!   join this run's GC root) and triggers a background chunk prefetch so
-//!   the NAR request that follows is fast.
+//!   join this run's GC root).
 //! * `GET /nar/{narhash}.nar` — chunks are fetched from packs (batched
 //!   Range requests, parallel across packs, signed URLs cached and
 //!   refreshed on 403), the NAR is synthesized from the manifest tree, and
@@ -15,12 +14,17 @@
 //!   so Nix falls through to the next substituter — never partial or
 //!   corrupt data.
 //!
+//! A semaphore caps concurrent NAR fetches so parallel narinfo queries
+//! from Nix (`WantMassQuery: 1`) do not flood the GHA cache API.
+//!
 //! Responses are unsigned: the action configures the store URL with
 //! `?trusted=true`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+use tokio::sync::Semaphore;
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -54,9 +58,15 @@ const PRIORITY: u32 = 30;
 /// backstop for when this estimate is wrong.
 const PACK_URL_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// Upper bound for decompressed chunks kept in memory (prefetch + reuse
-/// across NAR requests). Oldest chunks are dropped first.
+/// Upper bound for decompressed chunks kept in memory across NAR requests.
+/// Oldest chunks are dropped first.
 const CHUNK_CACHE_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Maximum number of NAR downloads served concurrently.  Each NAR fetch
+/// may issue multiple GHA cache API calls (one per pack); capping
+/// concurrency prevents hitting the API rate limit when Nix requests many
+/// paths at once.
+const MAX_CONCURRENT_NAR_FETCHES: usize = 8;
 
 /// How many times a pack Range read is retried after a transient failure
 /// (connection drop, timeout, 5xx) before the whole NAR request gives up
@@ -187,10 +197,10 @@ struct ChunkFetcher {
     http: reqwest::Client,
     /// Signed download URLs per pack, with issue time (TTL-based reuse).
     url_cache: Mutex<HashMap<PackHash, (String, Instant)>>,
-    /// Decompressed chunks (filled by prefetch and NAR requests).
+    /// Decompressed chunks (filled by NAR requests).
     chunk_cache: Mutex<ChunkCache>,
-    /// Per-path serialization: a prefetch and a NAR request for the same
-    /// path must not fetch the same chunks twice.
+    /// Per-path serialization: concurrent NAR requests for the same path
+    /// must not fetch the same chunks twice.
     path_locks: Mutex<HashMap<PathHash, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -286,8 +296,8 @@ impl ChunkFetcher {
         path: PathHash,
         entry: &PathEntry,
     ) -> Result<BTreeMap<ChunkHash, Bytes>, FetchError> {
-        // Serialize per path so concurrent prefetch + NAR request for the
-        // same path do the work once.
+        // Serialize per path so concurrent NAR requests for the same
+        // path do the work once.
         let lock = self.path_lock(path);
         let _guard = lock.lock().await;
 
@@ -385,6 +395,7 @@ pub struct Substituter {
     access_log: AccessLog,
     fetcher: ChunkFetcher,
     activity_hook: Option<ActivityHook>,
+    nar_semaphore: Arc<Semaphore>,
 }
 
 impl Substituter {
@@ -401,6 +412,7 @@ impl Substituter {
             access_log,
             fetcher: ChunkFetcher::new(twirp, http),
             activity_hook: None,
+            nar_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_NAR_FETCHES)),
         }
     }
 
@@ -423,23 +435,6 @@ impl Substituter {
     fn touch(&self) {
         if let Some(hook) = &self.activity_hook {
             hook();
-        }
-    }
-
-    /// Fetch a path's chunks into the cache (background prefetch).
-    async fn prefetch(self: Arc<Self>, path: PathHash) {
-        let view = self.manifest.view();
-        let Some(entry) = view.manifest.paths.get(&path) else {
-            return;
-        };
-        if let Err(err) = self
-            .fetcher
-            .fetch_path_chunks(&view.manifest, path, entry)
-            .await
-        {
-            // Prefetch is best-effort; the NAR request will report the
-            // failure to Nix as a 404.
-            eprintln!("hestia substituter: prefetch of {path} failed: {err}");
         }
     }
 }
@@ -499,10 +494,6 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
     // run's GC root at the next drain.
     state.access_log.record(path_hash);
 
-    // Start fetching the chunks now so the NAR request that (very likely)
-    // follows is served from memory.
-    tokio::spawn(Arc::clone(&state).prefetch(path_hash));
-
     let body = narinfo_for_entry(&state.store_dir, entry, hash_str);
     ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], body).into_response()
 }
@@ -554,6 +545,12 @@ async fn nar(
     // without re-requesting the narinfo, so recording only narinfo hits
     // would let GC collect paths that are actively being substituted.
     state.access_log.record(path_hash);
+
+    // Cap concurrent fetches — each NAR pull may issue several Twirp +
+    // Range calls and Nix fires all requests at once (WantMassQuery: 1).
+    let Ok(_permit) = state.nar_semaphore.acquire().await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
 
     // Fetch all chunks; any failure means 404 (Nix rebuilds or falls
     // through), never partial data.
