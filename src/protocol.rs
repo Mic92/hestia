@@ -79,13 +79,18 @@ pub struct DrainStats {
     /// (everything before chunking starts), in milliseconds.
     #[serde(default)]
     pub load_ms: u64,
-    /// Time spent chunking and verifying new paths, in milliseconds.
+    /// Producer time spent chunking and verifying new paths, in
+    /// milliseconds. Chunk, pack, and upload run pipelined, so these
+    /// stage times overlap and do not sum to the drain duration.
     #[serde(default)]
     pub chunk_ms: u64,
-    /// Time spent compressing chunks into packs, in milliseconds.
+    /// Producer time spent compressing chunks into packs, in milliseconds
+    /// (excludes waiting for upload backpressure).
     #[serde(default)]
     pub pack_ms: u64,
-    /// Time spent uploading packs, in milliseconds.
+    /// Wall time of the pipelined chunk/pack/upload section, in
+    /// milliseconds. Uploads overlap the CPU stages, so this is an upper
+    /// bound on upload time (throughput derived from it is a lower bound).
     #[serde(default)]
     pub upload_ms: u64,
     /// Time spent committing the manifest, in milliseconds.

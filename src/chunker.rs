@@ -186,6 +186,53 @@ impl PackBuilder {
     }
 }
 
+/// A chunk compressed into its pack frame, ready for
+/// [`PackBuilder::add_compressed`].
+#[derive(Debug)]
+pub struct CompressedChunk {
+    pub hash: ChunkHash,
+    pub frame: Vec<u8>,
+    pub uncompressed_size: u32,
+}
+
+/// Compress chunks in parallel across CPU cores, preserving order.
+///
+/// zstd is the dominant CPU cost of a drain; spreading one path's chunks
+/// over all cores shortens the producer's critical path.
+/// Blocking: call via `spawn_blocking` from async code.
+pub fn compress_chunks(chunks: Vec<Chunk>) -> Result<Vec<CompressedChunk>, Error> {
+    let compress_one = |chunk: &Chunk| -> Result<CompressedChunk, Error> {
+        Ok(CompressedChunk {
+            hash: chunk.hash,
+            frame: zstd::encode_all(chunk.data.as_ref(), ZSTD_LEVEL)?,
+            uncompressed_size: chunk.data.len() as u32,
+        })
+    };
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(chunks.len());
+    if workers <= 1 {
+        return chunks.iter().map(compress_one).collect();
+    }
+    // Static partitioning balances well: CDC keeps chunk sizes near the
+    // average, so equal-count slices carry roughly equal work.
+    let per_worker = chunks.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .chunks(per_worker)
+            .map(|slice| scope.spawn(move || slice.iter().map(compress_one).collect()))
+            .collect();
+        let mut out = Vec::with_capacity(chunks.len());
+        for handle in handles {
+            let frames: Result<Vec<CompressedChunk>, Error> =
+                handle.join().expect("compression worker panicked");
+            out.extend(frames?);
+        }
+        Ok(out)
+    })
+}
+
 /// A finished pack blob ready for upload.
 #[derive(Debug, Clone)]
 pub struct Pack {

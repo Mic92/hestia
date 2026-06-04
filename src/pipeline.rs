@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::chunker::{self, PackBuilder, chunk_path, nar_hash_from_chunks};
+use crate::chunker::{self, PackBuilder, chunk_path, compress_chunks, nar_hash_from_chunks};
 use crate::gha::Error as GhaError;
 use crate::gha::savemutable::SaveMutable;
 use crate::gha::twirp::{Reservation, TwirpClient};
@@ -186,9 +186,6 @@ pub struct PipelineContext {
 struct PreparedPath {
     hash: PathHash,
     entry: PathEntry,
-    /// This path's chunks that exist in neither the manifest nor an earlier
-    /// prepared path of the same batch.
-    new_chunks: Vec<chunker::Chunk>,
 }
 
 impl PipelineContext {
@@ -304,99 +301,127 @@ impl PipelineContext {
             to_push.push((path, info));
         }
 
-        let mut prepared: Vec<PreparedPath> = Vec::new();
-        // Chunks of earlier prepared paths in this batch (cross-path dedup).
-        let mut batch_chunks: BTreeSet<crate::manifest::ChunkHash> = BTreeSet::new();
-
         stats.load_ms = load_started.elapsed().as_millis() as u64;
 
-        let chunk_started = std::time::Instant::now();
-        for (path, info) in to_push {
-            let chunked = chunk_path(&path).await?;
-            let chunk_map = chunked.chunk_map();
+        // Pipelined chunk → compress → pack → upload: the producer chunks
+        // paths sequentially, compresses their new chunks in parallel
+        // across cores, and seals packs at the target size; sealed packs
+        // flow through a bounded channel to the uploader, so network
+        // transfer overlaps with the CPU work for later paths.
+        let (pack_tx, pack_rx) = tokio::sync::mpsc::channel::<chunker::Pack>(2);
 
-            // Integrity gate: the chunked representation must reproduce the
-            // NAR hash Nix recorded for this path. A mismatch means hestia
-            // would serve corrupt data; never upload it.
-            let (nar_hash, nar_size) = nar_hash_from_chunks(&chunked.tree, &chunk_map).await?;
-            if nar_hash != info.nar_hash || nar_size != info.nar_size {
-                eprintln!(
-                    "hestia: NOT uploading {path}: chunked NAR hash {nar_hash} (size {nar_size}) \
-                     does not match the store's record {} (size {}); \
-                     this indicates a chunker bug or store corruption",
-                    info.nar_hash, info.nar_size
-                );
-                stats.failed_verification += 1;
-                continue;
-            }
+        let producer = async {
+            let mut prepared: Vec<PreparedPath> = Vec::new();
+            // Chunks of earlier prepared paths in this batch (cross-path dedup).
+            let mut batch_chunks: BTreeSet<crate::manifest::ChunkHash> = BTreeSet::new();
+            let mut builder = PackBuilder::new();
 
-            let new_chunks: Vec<chunker::Chunk> = chunked
-                .chunks
-                .into_iter()
-                .filter(|chunk| {
-                    !current.chunks.contains_key(&chunk.hash) && batch_chunks.insert(chunk.hash)
-                })
-                .collect();
+            'paths: for (path, info) in to_push {
+                let chunk_started = std::time::Instant::now();
+                let chunked = chunk_path(&path).await?;
+                let chunk_map = chunked.chunk_map();
 
-            prepared.push(PreparedPath {
-                hash: info.path_hash(),
-                entry: PathEntry {
-                    references: info.references_without_self(),
-                    store_path: info.store_path,
-                    nar_hash,
-                    nar_size,
-                    ca: info.ca,
-                    deriver: info.deriver,
-                    tree: chunked.tree,
-                    last_reachable: 0,
-                    last_pushed: now,
-                },
-                new_chunks,
-            });
-        }
-
-        stats.chunk_ms = chunk_started.elapsed().as_millis() as u64;
-
-        let mut delta = Manifest::new();
-
-        // Pack: seal a pack whenever it reaches the target size, so a large
-        // drain produces several packs that can upload concurrently.
-        let pack_started = std::time::Instant::now();
-        let mut packs: Vec<chunker::Pack> = Vec::new();
-        let mut builder = PackBuilder::new();
-        for path in &prepared {
-            for chunk in &path.new_chunks {
-                builder.add(chunk)?;
-                if builder.compressed_size() >= self.pack_target_size {
-                    packs.push(std::mem::take(&mut builder).finish());
+                // Integrity gate: the chunked representation must reproduce
+                // the NAR hash Nix recorded for this path. A mismatch means
+                // hestia would serve corrupt data; never upload it.
+                let (nar_hash, nar_size) = nar_hash_from_chunks(&chunked.tree, &chunk_map).await?;
+                stats.chunk_ms += chunk_started.elapsed().as_millis() as u64;
+                if nar_hash != info.nar_hash || nar_size != info.nar_size {
+                    eprintln!(
+                        "hestia: NOT uploading {path}: chunked NAR hash {nar_hash} (size \
+                         {nar_size}) does not match the store's record {} (size {}); \
+                         this indicates a chunker bug or store corruption",
+                        info.nar_hash, info.nar_size
+                    );
+                    stats.failed_verification += 1;
+                    continue;
                 }
+
+                let new_chunks: Vec<chunker::Chunk> = chunked
+                    .chunks
+                    .into_iter()
+                    .filter(|chunk| {
+                        !current.chunks.contains_key(&chunk.hash) && batch_chunks.insert(chunk.hash)
+                    })
+                    .collect();
+
+                let mut pack_started = std::time::Instant::now();
+                let frames = tokio::task::spawn_blocking(move || compress_chunks(new_chunks))
+                    .await
+                    .expect("compression task panicked")?;
+                for frame in frames {
+                    builder.add_compressed(frame.hash, &frame.frame, frame.uncompressed_size);
+                    if builder.compressed_size() >= self.pack_target_size {
+                        let pack = std::mem::take(&mut builder).finish();
+                        // Pause the pack timer across the send: a full
+                        // channel blocks on upload backpressure, which must
+                        // not be booked as packing time.
+                        stats.pack_ms += pack_started.elapsed().as_millis() as u64;
+                        if pack_tx.send(pack).await.is_err() {
+                            // Uploader gone: it failed, and try_join below
+                            // reports its error; stop producing.
+                            break 'paths;
+                        }
+                        pack_started = std::time::Instant::now();
+                    }
+                }
+                stats.pack_ms += pack_started.elapsed().as_millis() as u64;
+
+                prepared.push(PreparedPath {
+                    hash: info.path_hash(),
+                    entry: PathEntry {
+                        references: info.references_without_self(),
+                        store_path: info.store_path,
+                        nar_hash,
+                        nar_size,
+                        ca: info.ca,
+                        deriver: info.deriver,
+                        tree: chunked.tree,
+                        last_reachable: 0,
+                        last_pushed: now,
+                    },
+                });
             }
-        }
-        if !builder.is_empty() {
-            packs.push(builder.finish());
-        }
-        stats.new_chunks = packs.iter().map(|pack| pack.chunks.len()).sum();
-        stats.pack_ms = pack_started.elapsed().as_millis() as u64;
+            if !builder.is_empty() {
+                // A send failure means the uploader failed; try_join below
+                // reports its error, the producer's result is discarded.
+                let _ = pack_tx.send(builder.finish()).await;
+            }
+            // pack_tx drops here, ending the consumer's stream.
+            drop(pack_tx);
+            Ok::<_, Error>(prepared)
+        };
 
         let upload_started = std::time::Instant::now();
-        let upload_futures: Vec<_> = packs
-            .iter()
-            .map(|pack| async move {
-                let uploaded = upload_pack(&self.twirp, &self.http, pack).await?;
-                Ok::<_, GhaError>((uploaded, pack.data.len() as u64))
-            })
-            .collect();
-        let uploads: Vec<(bool, u64)> = futures_util::stream::iter(upload_futures)
-            .buffer_unordered(UPLOAD_CONCURRENCY)
-            .try_collect()
-            .await?;
+        let consumer = async {
+            let pack_stream = futures_util::stream::unfold(pack_rx, |mut rx| async move {
+                rx.recv().await.map(|pack| (pack, rx))
+            });
+            pack_stream
+                .map(|pack| async move {
+                    let uploaded = upload_pack(&self.twirp, &self.http, &pack).await?;
+                    Ok::<_, Error>((uploaded, pack))
+                })
+                .buffer_unordered(UPLOAD_CONCURRENCY)
+                .try_collect::<Vec<(bool, chunker::Pack)>>()
+                .await
+        };
+
+        let (prepared, uploads) = tokio::try_join!(producer, consumer)?;
+        // Stage times overlap now: chunk/pack are producer busy times,
+        // upload is the wall time of the whole pipelined section.
         stats.upload_ms = upload_started.elapsed().as_millis() as u64;
-        for (uploaded, size) in uploads {
+
+        let mut delta = Manifest::new();
+        let mut packs: Vec<chunker::Pack> = Vec::new();
+        for (uploaded, pack) in uploads {
             if uploaded {
                 stats.packs_uploaded += 1;
-                stats.bytes_uploaded += size;
+                stats.bytes_uploaded += pack.data.len() as u64;
             }
+            packs.push(pack);
         }
+        stats.new_chunks = packs.iter().map(|pack| pack.chunks.len()).sum();
 
         for pack in &packs {
             for (chunk_hash, location) in pack.locations() {
