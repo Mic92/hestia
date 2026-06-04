@@ -70,8 +70,11 @@ jobs:
         uses: ./action
         with:
           version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
-      # No binary/version input: token-capture-only mode (must stay tested).
+      # Explicitly empty binary/version: token-capture-only mode (must
+      # stay tested). version defaults to "latest" when omitted.
       - uses: ./action
+        with:
+          version: ""
       - name: Assert cache tokens are visible to shell steps
         run: |
           set -euo pipefail
