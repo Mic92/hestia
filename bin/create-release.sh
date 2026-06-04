@@ -49,13 +49,10 @@ fi
 # packages read it via importTOML); cargo syncs Cargo.lock.
 sed -i -e "0,/^version = \".*\"\$/s//version = \"${version}\"/" Cargo.toml
 nix develop --command cargo update --package hestia
-# Release examples in the documentation reference the latest tag.
-sed -i -e "s/version: v[0-9][^\"' ]*/version: ${tag}/" README.md action/README.md
-
 branch="release-${version}"
 git branch -D "$branch" 2>/dev/null || true
 git checkout -b "$branch"
-git add Cargo.toml Cargo.lock README.md action/README.md
+git add Cargo.toml Cargo.lock
 git commit -m "release: bump version to ${version}"
 git push --force-with-lease origin "$branch"
 

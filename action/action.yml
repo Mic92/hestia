@@ -20,10 +20,11 @@ inputs:
   version:
     description: >
       Hestia release tag to download from GitHub releases
-      (e.g. "v0.1.0-alpha.4"). The downloaded binary is verified against
-      GitHub's build provenance attestations before it runs.
+      (e.g. "v0.1.0-alpha.4"), or "latest" to auto-resolve the newest
+      release.  The downloaded binary is verified against GitHub's build
+      provenance attestations before it runs.
     required: false
-    default: ""
+    default: "latest"
   github-token:
     description: >
       Token for the attestation API lookup that verifies downloaded release
@@ -64,8 +65,8 @@ inputs:
     required: false
     default: "false"
 
-# If neither `binary` nor `version` is set, the action only captures and
-# exports the cache tokens (ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL).
+# If both `binary` and `version` are explicitly empty, the action only
+# captures and exports the cache tokens (ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL).
 # That mode exists for setups that run hestia themselves -- for example
 # hestia's own integration tests against the real cache API.
 

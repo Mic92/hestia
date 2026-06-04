@@ -37,8 +37,6 @@ jobs:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
       - uses: Mic92/hestia/action@main
-        with:
-          version: v0.1.0-alpha.9
       - run: nix build .#
 ```
 

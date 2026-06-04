@@ -117,16 +117,44 @@ async function verifyAttestation(repo, assetName, digest, token) {
   console.log(`hestia-cache: attestation verified for ${assetName} (sha256:${digest})${builtBy}`);
 }
 
+/**
+ * Resolve "latest" to the actual tag name of the newest GitHub release.
+ * Falls back to the GitHub API for the repository this action was loaded
+ * from, so forks resolve their own releases.
+ */
+async function resolveVersion(version) {
+  if (version !== 'latest') return version;
+  const repo = process.env.GITHUB_ACTION_REPOSITORY || 'Mic92/hestia';
+  // /releases/latest skips prereleases, so list recent releases and pick
+  // the first published (non-draft) entry.
+  const url = `https://api.github.com/repos/${repo}/releases?per_page=10`;
+  const headers = { Accept: 'application/vnd.github+json' };
+  const token = getInput('github-token');
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    fail(`failed to resolve latest release: HTTP ${response.status} from ${url}`);
+  }
+  const releases = (await response.json()).filter((r) => !r.draft);
+  if (!releases.length) {
+    fail(`no published releases found for ${repo}`);
+  }
+  const tag = releases[0].tag_name;
+  console.log(`hestia-cache: resolved 'latest' to ${tag}`);
+  return tag;
+}
+
 /** Install the hestia binary into installDir; returns its path. */
 async function installBinary(installDir) {
   const target = path.join(installDir, 'hestia');
   const binary = getInput('binary');
-  const version = getInput('version');
+  let version = getInput('version');
 
   if (binary) {
     console.log(`hestia-cache: installing from local binary ${binary}`);
     fs.copyFileSync(binary, target);
   } else {
+    version = await resolveVersion(version);
     const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch] || process.arch;
     if (process.platform !== 'linux' && process.platform !== 'darwin') {
       fail(`unsupported platform: ${process.platform}`);
