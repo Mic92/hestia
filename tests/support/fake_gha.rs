@@ -88,6 +88,9 @@ struct Inner {
     /// When set, download lookups pretend the newest matching entry does
     /// not exist yet (simulates the real service's eventual consistency).
     stale_lookups: bool,
+    /// Per-request blob transfer throttle (latency, bytes/s), for local
+    /// benchmarks that emulate Azure transfer characteristics.
+    blob_throttle: Option<(Duration, u64)>,
 }
 
 impl Inner {
@@ -295,6 +298,15 @@ struct SigQuery {
     sig: String,
 }
 
+/// Sleep for the configured throttle: fixed latency plus size/bandwidth.
+async fn apply_throttle(state: &AppState, bytes: u64) {
+    let throttle = state.inner.lock().unwrap().blob_throttle;
+    if let Some((latency, bytes_per_sec)) = throttle {
+        let transfer = Duration::from_secs_f64(bytes as f64 / bytes_per_sec as f64);
+        tokio::time::sleep(latency + transfer).await;
+    }
+}
+
 async fn blob_put(
     State(state): State<AppState>,
     Path(id): Path<u64>,
@@ -302,6 +314,7 @@ async fn blob_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    apply_throttle(&state, body.len() as u64).await;
     let inner = state.inner.lock().unwrap();
     if !inner.valid_sigs.contains(&query.sig) {
         return (StatusCode::FORBIDDEN, "signature expired").into_response();
@@ -360,53 +373,62 @@ async fn blob_get(
     Query(query): Query<SigQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let mut inner = state.inner.lock().unwrap();
-    if !inner.valid_sigs.contains(&query.sig) {
-        return (StatusCode::FORBIDDEN, "signature expired").into_response();
-    }
-    let Some(position) = inner.entries.iter().position(|e| e.id == id) else {
-        return (StatusCode::NOT_FOUND, "no such blob").into_response();
-    };
-    let path = inner.blob_path(id);
-    let Ok(data) = std::fs::read(&path) else {
-        return (StatusCode::NOT_FOUND, "blob not uploaded").into_response();
-    };
+    // Block scope: the std mutex guard must end before the throttle await
+    // (explicit drop() does not satisfy the async Send analysis).
+    let (status, payload, drop_mid_body) = {
+        let mut inner = state.inner.lock().unwrap();
+        if !inner.valid_sigs.contains(&query.sig) {
+            return (StatusCode::FORBIDDEN, "signature expired").into_response();
+        }
+        let Some(position) = inner.entries.iter().position(|e| e.id == id) else {
+            return (StatusCode::NOT_FOUND, "no such blob").into_response();
+        };
+        let path = inner.blob_path(id);
+        let Ok(data) = std::fs::read(&path) else {
+            return (StatusCode::NOT_FOUND, "blob not uploaded").into_response();
+        };
 
-    // Downloads bump the LRU clock (verified against the real service).
-    let now = inner.tick();
-    inner.entries[position].last_accessed_at = now;
+        // Downloads bump the LRU clock (verified against the real service).
+        let now = inner.tick();
+        inner.entries[position].last_accessed_at = now;
 
-    // Record the download for tests that assert fetch behavior.
-    let request = BlobRequest {
-        key: inner.entries[position].key.clone(),
-        range: headers
+        // Record the download for tests that assert fetch behavior.
+        let request = BlobRequest {
+            key: inner.entries[position].key.clone(),
+            range: headers
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        };
+        inner.blob_requests.push(request);
+
+        // Connection-drop injection (Azure timeout simulation).
+        let drop_mid_body = if inner.blob_read_failures > 0 {
+            inner.blob_read_failures -= 1;
+            true
+        } else {
+            false
+        };
+
+        match headers
             .get(header::RANGE)
             .and_then(|v| v.to_str().ok())
-            .map(str::to_string),
-    };
-    inner.blob_requests.push(request);
-
-    // Connection-drop injection (Azure timeout simulation).
-    let drop_mid_body = if inner.blob_read_failures > 0 {
-        inner.blob_read_failures -= 1;
-        true
-    } else {
-        false
-    };
-
-    match headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| parse_range(v, data.len() as u64))
-    {
-        // Range requested but unsatisfiable.
-        Some(None) => (StatusCode::RANGE_NOT_SATISFIABLE, "bad range").into_response(),
-        Some(Some((start, end))) => {
-            let slice = data[start as usize..=end as usize].to_vec();
-            blob_response(StatusCode::PARTIAL_CONTENT, slice, drop_mid_body)
+            .map(|v| parse_range(v, data.len() as u64))
+        {
+            // Range requested but unsatisfiable.
+            Some(None) => {
+                return (StatusCode::RANGE_NOT_SATISFIABLE, "bad range").into_response();
+            }
+            Some(Some((start, end))) => (
+                StatusCode::PARTIAL_CONTENT,
+                data[start as usize..=end as usize].to_vec(),
+                drop_mid_body,
+            ),
+            None => (StatusCode::OK, data, drop_mid_body),
         }
-        None => blob_response(StatusCode::OK, data, drop_mid_body),
-    }
+    };
+    apply_throttle(&state, payload.len() as u64).await;
+    blob_response(status, payload, drop_mid_body)
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +581,7 @@ impl FakeGha {
             creates_until_quota: None,
             blob_read_failures: 0,
             stale_lookups: false,
+            blob_throttle: None,
         }));
         let state = AppState {
             inner: Arc::clone(&inner),
@@ -584,6 +607,9 @@ impl FakeGha {
             )
             .route("/test/fail-blob-reads/{reads}", post(test_fail_blob_reads))
             .route("/test/stale-lookups/{on}", post(test_stale_lookups))
+            // Pack blobs reach the production target size (64 MiB), far
+            // beyond axum's 2 MiB default body limit.
+            .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
             .with_state(state);
 
         let task = tokio::spawn(async move {
@@ -607,6 +633,12 @@ impl FakeGha {
     /// Set the fake's clock (unix seconds). Subsequent operations record
     /// `created_at` / `last_accessed_at` values just after this instant,
     /// which lets GC tests simulate days passing.
+    /// Throttle blob transfers: fixed latency plus `bytes_per_sec`
+    /// bandwidth per request, to emulate Azure for local benchmarks.
+    pub fn set_blob_throttle(&self, latency: Duration, bytes_per_sec: u64) {
+        self.inner.lock().unwrap().blob_throttle = Some((latency, bytes_per_sec));
+    }
+
     pub fn set_clock(&self, unix_seconds: u64) {
         self.inner.lock().unwrap().clock = unix_seconds;
     }

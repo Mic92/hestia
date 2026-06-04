@@ -132,6 +132,24 @@ impl ScratchStore {
     /// symlink, empty file) and add it to the store.
     ///
     /// Same `name` + `seed` always produces the same store path.
+    /// Like [`Self::add_fixture`], but with a blob of `bytes` pseudo-random
+    /// bytes; benchmarks use this to build workloads of arbitrary size.
+    pub fn add_fixture_sized(&self, name: &str, seed: u64, bytes: usize) -> PathBuf {
+        let fixture = self.dir.path().join(format!("fixture-{name}"));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let mut blob = Vec::with_capacity(bytes);
+        let mut state = seed | 1;
+        while blob.len() < bytes {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            blob.extend_from_slice(&state.to_le_bytes());
+        }
+        blob.truncate(bytes);
+        std::fs::write(fixture.join("blob"), &blob).unwrap();
+        self.add_path(&fixture)
+    }
+
     pub fn add_fixture(&self, name: &str, seed: u64) -> PathBuf {
         let fixture = self.dir.path().join(format!("fixture-{name}"));
         std::fs::create_dir_all(fixture.join("bin")).unwrap();
