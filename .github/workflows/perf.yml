@@ -5,6 +5,15 @@ name: Perf
 
 on:
   workflow_dispatch:
+    inputs:
+      workload:
+        description: >
+          Workload size: "small" is a few package closures (~200 MiB),
+          "iso" builds a NixOS installer ISO closure (several GiB) to
+          stress-test drain and substitution throughput.
+        type: choice
+        options: [small, iso]
+        default: small
 
 permissions:
   contents: read
@@ -51,13 +60,29 @@ jobs:
           sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
           perf --version
       - name: Build workload
-        # The closure of a few real nixpkgs packages (~120 paths, ~500 MiB).
         # Substituted paths never trigger the post-build-hook, so the roots
         # go to the daemon via the hook command.
         run: |
-          nix build --inputs-from . \
-            nixpkgs#python3 nixpkgs#git nixpkgs#nodejs -o ./workload
+          case "${{ inputs.workload }}" in
+            iso)
+              nix build --inputs-from . --impure --expr '
+                let nixpkgs = builtins.getFlake "nixpkgs"; in
+                (nixpkgs.lib.nixosSystem {
+                  system = "x86_64-linux";
+                  modules = [
+                    (nixpkgs.outPath
+                     + "/nixos/modules/installer/cd-dvd/installation-cd-minimal.nix")
+                  ];
+                }).config.system.build.isoImage' \
+                -o ./workload
+              ;;
+            *)
+              nix build --inputs-from . \
+                nixpkgs#python3 nixpkgs#git nixpkgs#nodejs -o ./workload
+              ;;
+          esac
           readarray -t roots < <(readlink -f ./workload*)
+          nix path-info -Sh "${roots[@]}"
           "$HESTIA_BIN" hook --socket "$HESTIA_SOCKET" "${roots[@]}"
       # Push direction: chunking, packing, uploading, manifest commit.
       - name: Profile the drain
