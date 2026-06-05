@@ -35,6 +35,14 @@ pub const MAX_CHUNK_SIZE: u32 = 256 * 1024;
 /// percent.
 const ZSTD_LEVEL: i32 = 3;
 
+/// Largest zstd window log accepted when decoding chunk frames.
+///
+/// Frames produced at [`ZSTD_LEVEL`] declare a window log of 21; anything
+/// larger in pack data is corrupt or malicious. Pinned together with
+/// [`ZSTD_LEVEL`]: raising the level can raise the declared window log,
+/// which would make existing extraction reject legitimate frames.
+const MAX_CHUNK_WINDOW_LOG: u32 = 21;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("I/O or compression error: {0}")]
@@ -674,9 +682,15 @@ async fn write_nar<W: tokio::io::AsyncWrite + Unpin>(
 pub fn extract_chunk(compressed: &[u8], expected: &ChunkHash) -> Result<Vec<u8>, Error> {
     use std::io::Read as _;
     let mut data = Vec::new();
+    let mut decoder = zstd::Decoder::with_buffer(compressed)?;
+    // Reject oversized declared windows at header parse time: a crafted
+    // frame in untrusted pack data could otherwise force a large window
+    // allocation (up to 128 MiB with libzstd's default cap) before any
+    // output is read.
+    decoder.window_log_max(MAX_CHUNK_WINDOW_LOG)?;
     // Read at most one byte past the limit: enough to detect oversize
     // without buffering the full payload.
-    zstd::Decoder::with_buffer(compressed)?
+    decoder
         .take(u64::from(MAX_CHUNK_SIZE) + 1)
         .read_to_end(&mut data)?;
     if data.len() > MAX_CHUNK_SIZE as usize {
@@ -890,6 +904,35 @@ mod tests {
             extract_chunk(&frame, &expected),
             Err(Error::OversizedChunk)
         ));
+    }
+
+    #[test]
+    fn extract_chunk_rejects_oversized_window_declarations() {
+        // A crafted frame can declare a huge decoder window in its header,
+        // forcing libzstd to allocate it before any output is read. Such
+        // frames must fail at header parse time, without the allocation.
+        let payload = test_data(1024, 6);
+        let mut encoder = zstd::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.window_log(MAX_CHUNK_WINDOW_LOG + 3).unwrap();
+        // Streaming without a pledged content size forces the frame header
+        // to carry the window descriptor.
+        std::io::Write::write_all(&mut encoder, &payload).unwrap();
+        let frame = encoder.finish().unwrap();
+
+        let expected = ChunkHash::digest(&payload);
+        assert!(matches!(
+            extract_chunk(&frame, &expected),
+            Err(Error::Io(_))
+        ));
+
+        // Frames produced the production way (compress_chunks at
+        // ZSTD_LEVEL) still extract fine, up to the largest chunk size.
+        let big = test_data(MAX_CHUNK_SIZE as usize, 8);
+        for data in [payload, big] {
+            let expected = ChunkHash::digest(&data);
+            let normal = zstd::encode_all(data.as_ref(), ZSTD_LEVEL).unwrap();
+            assert_eq!(extract_chunk(&normal, &expected).unwrap(), data);
+        }
     }
 
     #[test]
