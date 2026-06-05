@@ -44,12 +44,10 @@ pub const ENV_VERSION_SALT: &str = "HESTIA_CACHE_VERSION_SALT";
 /// [`CACHE_VERSION`] when `salt` is empty, sha256("hestia-2:<salt>")
 /// otherwise.
 fn cache_version(salt: &str) -> String {
-    use sha2::{Digest, Sha256};
     if salt.is_empty() {
         return CACHE_VERSION.to_string();
     }
-    let digest = Sha256::digest(format!("hestia-2:{salt}"));
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    crate::manifest::Hash32::digest(format!("hestia-2:{salt}")).to_hex()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -336,9 +334,7 @@ mod tests {
 
     #[test]
     fn cache_version_is_sha256_of_hestia_2() {
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(b"hestia-2");
-        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = crate::manifest::Hash32::digest(b"hestia-2").to_hex();
         assert_eq!(CACHE_VERSION, hex);
     }
 
