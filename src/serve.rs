@@ -503,7 +503,13 @@ async fn handle_connection(
 /// until SIGTERM/SIGINT.
 pub async fn run(args: &ServeArgs) -> ExitCode {
     // GHA cache credentials (injected by the hestia action wrapper).
-    let http = reqwest::Client::new();
+    // Connect timeout only: a total request timeout would break large
+    // pack uploads/downloads, but a connection that cannot even be
+    // established should fail fast instead of hanging a drain or fetch.
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("building the HTTP client failed");
     let twirp = match TwirpClient::from_env(http.clone()) {
         Ok(twirp) => twirp,
         Err(err) => {
