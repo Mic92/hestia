@@ -60,7 +60,10 @@ pub struct ServeArgs {
     #[arg(
         long = "upstream-cache-key-name",
         value_name = "KEY_NAME",
-        default_value = "cache.nixos.org-1"
+        default_value = "cache.nixos.org-1",
+        // Without the filter flag the names are discarded; rejecting the
+        // combination beats silently ignoring an explicit configuration.
+        requires = "upstream_cache_filter"
     )]
     pub upstream_cache_key_names: Vec<String>,
 
@@ -186,6 +189,21 @@ mod tests {
             ]
         );
         assert_eq!(args.db_path, PathBuf::from("/custom/db.sqlite"));
+    }
+
+    #[test]
+    fn upstream_key_names_require_the_filter_flag() {
+        // Without `requires`, an explicit key name would parse fine and be
+        // silently discarded by serve::run's empty-filter branch.
+        assert!(
+            Cli::try_parse_from([
+                "hestia",
+                "serve",
+                "--upstream-cache-key-name",
+                "company-cache-1",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

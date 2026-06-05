@@ -1,9 +1,10 @@
 //! Upstream-signature filtering.
 //!
-//! Hestia only stores locally-built paths. Anything carrying a signature
-//! from a trusted upstream cache (cache.nixos.org by default) is already
-//! served by that cache and would only waste GHA cache quota, so the write
-//! pipeline skips it.
+//! Opt-in (`hestia serve --upstream-cache-filter`): when enabled, anything
+//! carrying a signature from a trusted upstream cache (cache.nixos.org by
+//! default) is already served by that cache and would only waste GHA cache
+//! quota, so the write pipeline skips it. By default the filter is off and
+//! everything is cached, upstream-served paths included.
 //!
 //! The check is on the signature's *key name* only — no cryptographic
 //! verification. That is deliberate: a forged signature name in the local
