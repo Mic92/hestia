@@ -30,7 +30,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: write          # GHA cache writes
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
@@ -41,9 +40,13 @@ jobs:
 Everything built in your workflow gets cached; later runs (and PRs) pull
 from the cache instead of rebuilding.
 
+Build jobs need no extra permissions: cache uploads authenticate with the
+runner-injected `ACTIONS_RUNTIME_TOKEN`, which the `permissions:` block
+does not scope.
+
 You will also want a daily GC workflow on the default branch to stay within
 the cache quota; copy [`.github/workflows/gc.yml`](.github/workflows/gc.yml)
-for that.
+for that (its REST cache deletes are what need `actions: write`).
 
 See [Configuration](#configuration) for all action inputs.
 
