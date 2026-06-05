@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-// Re-exports so integration tests and later phases can build trees without
+// Re-exports so integration tests and other modules can build trees without
 // depending on harmonia crates directly.
 pub use harmonia_file_core::{Directory, FileSystemObject, FileTree, Regular, Symlink};
 pub use harmonia_store_path::{StorePath, StorePathHash};

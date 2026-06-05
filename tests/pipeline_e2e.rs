@@ -83,7 +83,7 @@ async fn pushes_paths_end_to_end() {
     assert_eq!(manifest.paths.len(), 3);
 
     // The fixture entry's NAR hash/size match nix's record (this is what
-    // narinfo responses will serve in Phase 4).
+    // narinfo responses serve).
     let fixture_entry = &manifest.paths[&path_hash_of(&fixture)];
     assert_eq!(fixture_entry.nar_hash, expected_hash, "nar_hash mismatch");
     assert_eq!(fixture_entry.nar_size, expected_size, "nar_size mismatch");
@@ -362,7 +362,7 @@ async fn invalid_and_malformed_paths_are_skipped_without_failing_the_drain() {
 
 #[tokio::test]
 async fn accessed_paths_join_the_root_without_store_queries() {
-    // The AccessLog interface (substituter integration, Phase 4): accessed
+    // The AccessLog interface (substituter integration): accessed
     // paths must end up in the root even though they are never queried,
     // chunked, or uploaded. Needs no Nix store at all.
     let fake = FakeGha::start().await;

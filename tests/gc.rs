@@ -1022,7 +1022,7 @@ async fn crash_between_any_two_execute_steps_never_loses_live_paths() {
 }
 
 // ---------------------------------------------------------------------------
-// 30-day simulation (the Phase 5 milestone)
+// 30-day GC convergence simulation
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

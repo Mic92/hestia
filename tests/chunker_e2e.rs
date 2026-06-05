@@ -1,5 +1,5 @@
 //! End-to-end tests for the chunker against real filesystem trees and real
-//! store paths (Phase 2 milestone):
+//! store paths:
 //!
 //! 1. Walk a path with harmonia's NAR dumper, chunk all files, pack them,
 //!    and rebuild every file byte-identical from the pack buffer.
@@ -219,7 +219,7 @@ async fn nar_hash_matches_nix_store_dump_for_fixture() {
 
 #[tokio::test]
 async fn nar_hash_matches_nix_path_info_for_real_store_path() {
-    // The Phase 2 milestone check: our NAR serialization must agree with
+    // The key check: our NAR serialization must agree with
     // Nix's own database record for a real store path.
     let Some(store_path) = find_real_store_path() else {
         eprintln!("skipping: no real /nix/store path available");

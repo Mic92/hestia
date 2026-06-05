@@ -62,7 +62,7 @@ serde_json = "1"
 sha2 = "0.11"
 
 # Harmonia crates (not on crates.io; pinned to a specific rev)
-# Dropped after Phase 2/3 scope decisions (re-add when needed):
+# Harmonia crates intentionally not used (re-add when needed):
 #   harmonia-store-remote        -> path info comes from direct store
 #                                    database reads (harmonia-store-db),
 #                                    which works without a running daemon
