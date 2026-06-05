@@ -8,7 +8,14 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+
+/// Responses are a single small JSON object (at most a [`DrainStats`]), so
+/// cap the line read: the default socket lives under world-writable /tmp,
+/// and a hostile or buggy listener squatting there must not be able to make
+/// the client buffer an unbounded line in memory (mirrors the daemon-side
+/// MAX_REQUEST_BYTES cap in serve.rs).
+const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -171,7 +178,10 @@ pub async fn roundtrip(socket: &Path, request: &Request) -> Result<Response, Err
     stream.get_mut().flush().await?;
 
     let mut response_line = String::new();
-    let read = stream.read_line(&mut response_line).await?;
+    let read = (&mut stream)
+        .take(MAX_RESPONSE_BYTES)
+        .read_line(&mut response_line)
+        .await?;
     if read == 0 {
         return Err(Error::ConnectionClosed);
     }
@@ -270,6 +280,33 @@ mod tests {
             serde_json::from_str(r#"{"ok":true,"buffered":1,"future_field":[1,2,3]}"#).unwrap();
         assert!(response.ok);
         assert_eq!(response.buffered, Some(1));
+    }
+
+    #[tokio::test]
+    async fn roundtrip_caps_response_size() {
+        // A squatter on the socket path streaming newline-free bytes must
+        // produce a bounded error, not an unbounded allocation.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hook.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncWriteExt as _;
+            let garbage = vec![b'x'; 64 * 1024];
+            // Well past MAX_RESPONSE_BYTES, never a newline.
+            for _ in 0..64 {
+                if stream.write_all(&garbage).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let result = roundtrip(&socket, &Request::Status).await;
+        assert!(
+            matches!(result, Err(Error::Json(_))),
+            "capped read must surface as a parse error, got {result:?}"
+        );
+        server.abort();
     }
 
     #[tokio::test]
