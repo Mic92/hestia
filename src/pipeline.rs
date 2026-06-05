@@ -391,7 +391,11 @@ impl PipelineContext {
                 prepared.push(PreparedPath {
                     hash: info.path_hash(),
                     entry: PathEntry {
-                        references: info.references_without_self(),
+                        // Verbatim, including any self-reference: this list
+                        // becomes the narinfo References line, and stripping
+                        // self would diverge substituted clients' store
+                        // metadata from the builder's.
+                        references: info.references,
                         store_path: info.store_path,
                         nar_hash,
                         nar_size,

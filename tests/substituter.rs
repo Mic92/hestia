@@ -346,12 +346,6 @@ async fn narinfo_matches_nix_path_info_oracle() {
                     .to_string_lossy()
                     .into_owned()
             })
-            .filter(|name| {
-                // The oracle includes the self-reference for toFile paths;
-                // narinfo convention is to list it too, but hestia stores
-                // references without self (the manifest drops self-edges).
-                *name != top.file_name().unwrap().to_string_lossy()
-            })
             .collect();
         oracle_refs.sort();
         let mut actual_refs: Vec<String> = narinfo["References"]

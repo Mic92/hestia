@@ -57,17 +57,6 @@ impl PathInfo {
     pub fn path_hash(&self) -> PathHash {
         PathHash::from_store_path(&self.store_path)
     }
-
-    /// All referenced store paths, excluding the self-reference (the
-    /// manifest reachability walk treats self-edges as no-ops anyway, but
-    /// dropping them keeps entries smaller).
-    pub fn references_without_self(&self) -> Vec<StorePath> {
-        self.references
-            .iter()
-            .filter(|reference| **reference != self.store_path)
-            .cloned()
-            .collect()
-    }
 }
 
 /// Result of looking up one path string.
