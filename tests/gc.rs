@@ -107,6 +107,57 @@ async fn dry_run_plans_but_changes_nothing() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn repack_splits_output_at_pack_target_size() {
+    timed(async {
+        let fake = FakeGha::start().await;
+        let http = client();
+        let sim = SimCache::new(&fake, &http);
+
+        // Six volatile packs of ~40 KB each, all live. Odd seeds:
+        // test_data does `seed | 1`, so consecutive seeds collide.
+        fake.set_clock(T0);
+        let paths: Vec<SimPath> = (0..6)
+            .map(|i| SimPath::new(&format!("lib-{i}"), 2 * i + 1, 40_000))
+            .collect();
+        for path in &paths {
+            sim.push("main", std::slice::from_ref(path), &paths, T0)
+                .await;
+        }
+        assert_eq!(sim.manifest().await.packs.len(), 6);
+
+        // Consolidation must not produce one giant pack: ~240 KB of live
+        // chunks against a 100 KB target splits into multiple packs.
+        let t1 = T0 + DAY;
+        fake.set_clock(t1);
+        let policy = GcPolicy {
+            max_volatile_packs: 2,
+            pack_target_size: 100_000,
+            ..GcPolicy::default()
+        };
+        let report = sim.gc(policy).run(false, t1).await.expect("gc run failed");
+
+        assert!(
+            report.packs_uploaded >= 2,
+            "240 KB of repacked chunks must split at the 100 KB target \
+             (uploaded {} pack(s))",
+            report.packs_uploaded
+        );
+        let manifest = sim.manifest().await;
+        for (pack, info) in &manifest.packs {
+            assert!(
+                info.size < 150_000,
+                "pack {pack} is {} bytes, beyond target + one chunk",
+                info.size
+            );
+        }
+        for path in &paths {
+            assert!(manifest.paths.contains_key(&path.path_hash()));
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn repack_copies_live_chunks_and_deletes_old_pack_after_commit() {
     timed(async {
         let fake = FakeGha::start().await;

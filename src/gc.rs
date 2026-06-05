@@ -74,7 +74,7 @@ pub struct GcPolicy {
     pub touch_age: u64,
     /// Packs whose live-byte ratio falls below this get repacked.
     pub min_liveness: f64,
-    /// Volatile (tier-0) packs above this count get consolidated into one.
+    /// Volatile (tier-0) packs above this count get consolidated.
     pub max_volatile_packs: usize,
     /// Chunks surviving this many repacks are promoted to the stable tier.
     pub stable_threshold: u32,
@@ -82,6 +82,8 @@ pub struct GcPolicy {
     /// a concurrent push may have uploaded them without having committed its
     /// manifest yet.
     pub min_age: u64,
+    /// Repack output packs are sealed at this compressed size.
+    pub pack_target_size: u64,
 }
 
 impl Default for GcPolicy {
@@ -95,6 +97,7 @@ impl Default for GcPolicy {
             max_volatile_packs: 4,
             stable_threshold: 2,
             min_age: SECS_PER_HOUR,
+            pack_target_size: crate::pipeline::PACK_TARGET_SIZE,
         }
     }
 }
@@ -794,38 +797,58 @@ impl GcContext {
                         if builder.add_compressed(copy.chunk, frame, decompressed.len() as u32) {
                             survived.insert(copy.chunk, copy.from.repacks_survived + 1);
                         }
+                        // A consolidation job can span many source packs;
+                        // seal at the target size instead of producing one
+                        // giant pack.
+                        if builder.compressed_size() >= self.policy.pack_target_size {
+                            let full = std::mem::replace(&mut builder, PackBuilder::new());
+                            self.upload_repacked(full, job.tier, plan.now, &survived, &mut output)
+                                .await?;
+                        }
                     }
                 }
                 sources_read.insert(source);
             }
 
-            if builder.is_empty() {
-                continue;
-            }
-            let pack = builder.finish();
-            upload_pack(&self.twirp, &self.http, &pack).await?;
-            output.uploaded += pack.data.len() as u64;
-            output.packs.insert(
-                pack.hash,
-                PackInfo {
-                    size: pack.data.len() as u64,
-                    created: plan.now,
-                    tier: job.tier,
-                },
-            );
-            for (chunk, location) in pack.locations() {
-                output.locations.insert(
-                    chunk,
-                    ChunkLocation {
-                        repacks_survived: survived[&chunk],
-                        ..location
-                    },
-                );
+            if !builder.is_empty() {
+                self.upload_repacked(builder, job.tier, plan.now, &survived, &mut output)
+                    .await?;
             }
             output.replaced.extend(sources_read);
         }
 
         Ok(output)
+    }
+
+    async fn upload_repacked(
+        &self,
+        builder: PackBuilder,
+        tier: u8,
+        now: u64,
+        survived: &BTreeMap<ChunkHash, u32>,
+        output: &mut RepackOutput,
+    ) -> Result<(), Error> {
+        let pack = builder.finish();
+        upload_pack(&self.twirp, &self.http, &pack).await?;
+        output.uploaded += pack.data.len() as u64;
+        output.packs.insert(
+            pack.hash,
+            PackInfo {
+                size: pack.data.len() as u64,
+                created: now,
+                tier,
+            },
+        );
+        for (chunk, location) in pack.locations() {
+            output.locations.insert(
+                chunk,
+                ChunkLocation {
+                    repacks_survived: survived[&chunk],
+                    ..location
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Execute step 2 of 6: 1-byte Range reads to reset the LRU clock of
