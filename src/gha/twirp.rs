@@ -41,7 +41,7 @@ pub const ENV_RUNTIME_TOKEN: &str = "ACTIONS_RUNTIME_TOKEN";
 /// workflow sets this to the run id.
 pub const ENV_VERSION_SALT: &str = "HESTIA_CACHE_VERSION_SALT";
 
-/// [`CACHE_VERSION`] when `salt` is empty, sha256("hestia-1:<salt>")
+/// [`CACHE_VERSION`] when `salt` is empty, sha256("hestia-2:<salt>")
 /// otherwise.
 fn cache_version(salt: &str) -> String {
     use sha2::{Digest, Sha256};
