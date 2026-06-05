@@ -170,8 +170,10 @@ enum FetchError {
     Chunker(#[from] chunker::Error),
 }
 
-/// Decompressed chunks kept in memory, evicted oldest-first once over
-/// budget.
+/// Decompressed chunks kept in memory, evicted least-recently-used first
+/// once over budget: chunks shared across paths (dedup) and repeated NAR
+/// requests keep hitting early-inserted chunks, so insertion-order
+/// eviction would drop the hot set first.
 #[derive(Default)]
 struct ChunkCache {
     chunks: HashMap<ChunkHash, Bytes>,
@@ -180,8 +182,15 @@ struct ChunkCache {
 }
 
 impl ChunkCache {
-    fn get(&self, hash: &ChunkHash) -> Option<Bytes> {
-        self.chunks.get(hash).cloned()
+    fn get(&mut self, hash: &ChunkHash) -> Option<Bytes> {
+        let data = self.chunks.get(hash).cloned()?;
+        // Move-to-back on hit (entry counts are small enough for the
+        // linear scan): a hit must postpone eviction.
+        if let Some(position) = self.order.iter().position(|entry| entry == hash) {
+            let entry = self.order.remove(position).expect("position is valid");
+            self.order.push_back(entry);
+        }
+        Some(data)
     }
 
     fn insert(&mut self, hash: ChunkHash, data: Bytes) {
@@ -332,7 +341,7 @@ impl ChunkFetcher {
         let mut result: BTreeMap<ChunkHash, Bytes> = BTreeMap::new();
         let mut missing: BTreeMap<PackHash, Vec<(ChunkHash, ChunkLocation)>> = BTreeMap::new();
         {
-            let cache = self.chunk_cache.lock().expect("chunk cache poisoned");
+            let mut cache = self.chunk_cache.lock().expect("chunk cache poisoned");
             for chunk in needed {
                 if let Some(data) = cache.get(&chunk) {
                     result.insert(chunk, data);
@@ -774,6 +783,21 @@ mod tests {
         );
         assert!(cache.get(&ChunkHash::digest([2])).is_some(), "newest kept");
         assert!(cache.total <= CHUNK_CACHE_BUDGET);
+    }
+
+    #[test]
+    fn chunk_cache_hits_refresh_recency() {
+        let mut cache = ChunkCache::default();
+        let big = Bytes::from(vec![0u8; 100 * 1024 * 1024]);
+        cache.insert(ChunkHash::digest([0]), big.clone());
+        cache.insert(ChunkHash::digest([1]), big.clone());
+        assert!(cache.get(&ChunkHash::digest([0])).is_some());
+        cache.insert(ChunkHash::digest([2]), big.clone());
+        assert!(cache.get(&ChunkHash::digest([0])).is_some(), "hit kept");
+        assert!(
+            cache.get(&ChunkHash::digest([1])).is_none(),
+            "least recently used evicted"
+        );
     }
 
     #[test]
