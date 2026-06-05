@@ -59,6 +59,12 @@ pub enum Error {
 
     #[error("chunk verification failed during repack: {0}")]
     Chunker(#[from] chunker::Error),
+
+    #[error(
+        "manifest lookup returned nothing, but {0} manifest version entries exist in the \
+         REST listing; refusing to plan against a possibly stale empty view"
+    )]
+    ManifestLookupInconsistent(usize),
 }
 
 /// GC policy knobs.
@@ -722,10 +728,29 @@ impl GcContext {
     }
 
     /// Load the current manifest, or an empty one if none exists yet.
+    ///
+    /// A lookup miss is cross-checked against the REST listing: the Twirp
+    /// lookup is eventually consistent, and planning against a falsely
+    /// empty manifest would orphan-delete the entire pack store. The miss
+    /// is only trusted when the REST listing shows no manifest versions
+    /// either.
     pub async fn load_manifest(&self) -> Result<Manifest, Error> {
         match self.save_mutable().load().await? {
             Some(entry) => Ok(Manifest::decode(&entry.data)?),
-            None => Ok(Manifest::new()),
+            None => {
+                let prefix = format!("{}#", self.manifest_prefix);
+                let versions = self
+                    .rest
+                    .list_caches(&prefix)
+                    .await?
+                    .iter()
+                    .filter(|entry| entry.version == self.twirp.version())
+                    .count();
+                if versions > 0 {
+                    return Err(Error::ManifestLookupInconsistent(versions));
+                }
+                Ok(Manifest::new())
+            }
         }
     }
 

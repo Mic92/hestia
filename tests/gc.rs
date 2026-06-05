@@ -649,6 +649,56 @@ async fn evicted_pack_heals_and_repush_restores_the_path() {
 }
 
 // ---------------------------------------------------------------------------
+// Manifest lookup consistency
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stale_manifest_lookup_aborts_gc_instead_of_wiping_the_cache() {
+    timed(async {
+        let fake = FakeGha::start().await;
+        let http = client();
+        let sim = SimCache::new(&fake, &http);
+
+        let app = SimPath::new("the-app", 1, 60_000);
+        fake.set_clock(T0);
+        sim.push(
+            "main",
+            std::slice::from_ref(&app),
+            std::slice::from_ref(&app),
+            T0,
+        )
+        .await;
+        let packs_before = sim.stored_pack_keys().await;
+        assert!(!packs_before.is_empty());
+
+        // Twirp manifest lookups go stale (eventual consistency): the
+        // committed m#1 is not returned. GC must not interpret this as "no
+        // manifest exists" - against an empty view every pack older than
+        // min_age is an orphan and the whole pack store would be deleted.
+        fake.set_stale_lookups(&http, true).await;
+        let t1 = T0 + 2 * HOUR;
+        fake.set_clock(t1);
+        let result = sim.gc(GcPolicy::default()).run(false, t1).await;
+        assert!(
+            result.is_err(),
+            "GC must refuse to run against a manifest lookup miss while \
+             manifest version entries exist, got {result:?}"
+        );
+        assert_eq!(
+            sim.stored_pack_keys().await,
+            packs_before,
+            "no pack may be deleted on an inconsistent manifest view"
+        );
+
+        // Once the lookup catches up, GC works again and the path is intact.
+        fake.set_stale_lookups(&http, false).await;
+        sim.gc(GcPolicy::default()).run(false, t1).await.unwrap();
+        sim.assert_readable(&[&app]).await;
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // Cache version namespaces
 // ---------------------------------------------------------------------------
 
