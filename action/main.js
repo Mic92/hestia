@@ -421,6 +421,7 @@ async function main() {
   saveState('socket', socket);
   saveState('serveLog', logFile);
   saveState('drainTimeout', getInput('drain-timeout') || '300');
+  saveState('daemonPid', String(daemonPid));
 }
 
 main().catch((error) => {

@@ -49,6 +49,21 @@ function main() {
   if (drain.status !== 0) {
     console.error('::error::hestia drain failed; the paths built by this job were not cached');
   }
+
+  // The daemon is spawned detached and never exits on its own; on
+  // persistent self-hosted runners it would outlive the job, holding its
+  // port and a revoked runtime token. SIGTERM triggers a graceful final
+  // drain before exit.
+  const pid = parseInt(getState('daemonPid'), 10);
+  if (pid > 0) {
+    try {
+      process.kill(pid, 'SIGTERM');
+      console.log(`hestia-cache: daemon (pid ${pid}) terminated`);
+    } catch {
+      // Already gone.
+    }
+  }
+
   return drain.status === null ? 1 : drain.status;
 }
 
