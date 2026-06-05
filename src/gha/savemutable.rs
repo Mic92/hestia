@@ -18,9 +18,15 @@
 //! assumes a crashed peer and skips over that index.
 //!
 //! Consistency model (verified against the real service): **reservations
-//! are strongly consistent** (two writers can never both reserve the same
-//! key) but **lookups are eventually consistent** (a
-//! just-finalized entry may not be returned by load() for a while). The
+//! are strongly consistent within a ref scope** (two writers in the same
+//! scope can never both reserve the same key) but **lookups are eventually
+//! consistent** (a
+//! just-finalized entry may not be returned by load() for a while).
+//! Cache entry uniqueness is per (key, version, ref scope): writers in
+//! different scopes (a PR job and a default-branch job) can both reserve
+//! and finalize the same key. Their lineages fork; the PR-scoped fork is
+//! discarded with its branch (see "PR scope isolation" in the README), so
+//! the no-lost-writes merge guarantee below is scope-local. The
 //! conflict-retry loop therefore re-loads until it sees the version that
 //! blocked it; the stale-skip window must be comfortably larger than the
 //! observed propagation lag, otherwise lag would be misdiagnosed as a
