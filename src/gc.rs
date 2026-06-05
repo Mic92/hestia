@@ -700,13 +700,18 @@ impl GcContext {
         }
     }
 
-    /// REST-list all `pack-*` cache entries.
+    /// REST-list all `pack-*` cache entries in GC's own cache version
+    /// namespace. The listing is prefix-based and version-blind, so it
+    /// also returns same-key entries of other namespaces (salted runs,
+    /// foreign workflows): not ours to delete as orphans, and they must
+    /// not mask an eviction of our own entry during reconcile.
     pub async fn observe_packs(&self) -> Result<Vec<PackObservation>, Error> {
         Ok(self
             .rest
             .list_caches("pack-")
             .await?
             .iter()
+            .filter(|entry| entry.version == self.twirp.version())
             .map(PackObservation::from_entry)
             .collect())
     }
@@ -1015,6 +1020,10 @@ impl GcContext {
         let entries = self.rest.list_caches(&prefix).await?;
         let indexed: Vec<(u64, &CacheEntry)> = entries
             .iter()
+            // Another namespace's m#N sequence restarts at 1; letting its
+            // (possibly higher) indices into `newest` would make GC delete
+            // this namespace's live manifest head.
+            .filter(|entry| entry.version == self.twirp.version())
             .filter_map(|entry| {
                 let index: u64 = entry.key.strip_prefix(&prefix)?.parse().ok()?;
                 Some((index, entry))

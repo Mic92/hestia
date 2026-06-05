@@ -649,6 +649,74 @@ async fn evicted_pack_heals_and_repush_restores_the_path() {
 }
 
 // ---------------------------------------------------------------------------
+// Cache version namespaces
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn gc_never_deletes_packs_of_another_cache_version_namespace() {
+    timed(async {
+        let fake = FakeGha::start().await;
+        let http = client();
+        let sim = SimCache::new(&fake, &http);
+
+        // A salted perf run (HESTIA_CACHE_VERSION_SALT) lives in its own
+        // Twirp version namespace but shares the prefix-based REST listing
+        // with production.
+        let salted = SimCache {
+            http: http.clone(),
+            twirp: fake.twirp(&http).with_version_salt("perf-run"),
+            rest: fake.rest(&http),
+        };
+
+        let prod_path = SimPath::new("prod-app", 1, 60_000);
+        let perf_path = SimPath::new("perf-app", 3, 60_000);
+        fake.set_clock(T0);
+        sim.push(
+            "main",
+            std::slice::from_ref(&prod_path),
+            std::slice::from_ref(&prod_path),
+            T0,
+        )
+        .await;
+        salted
+            .push(
+                "main",
+                std::slice::from_ref(&perf_path),
+                std::slice::from_ref(&perf_path),
+                T0,
+            )
+            .await;
+
+        let salted_manifest = salted.manifest().await;
+        let salted_pack = chunk_locations_of(&salted_manifest, &perf_path)[0].pack;
+
+        // Production GC two hours later (the salted entries are past
+        // min_age). The salted pack is referenced only by the salted
+        // namespace's manifest, which production GC cannot read - it must
+        // not be judged a production orphan. Manifest `m#N` entries are
+        // not covered by this isolation: REST deletion is by key across
+        // versions.
+        let t1 = T0 + 2 * HOUR;
+        fake.set_clock(t1);
+        let report = sim.gc(GcPolicy::default()).run(false, t1).await.unwrap();
+
+        assert_eq!(
+            report.orphans_deleted, 0,
+            "another namespace's packs are not production orphans: {:?}",
+            report.plan.orphan_keys
+        );
+        assert!(
+            sim.stored_pack_keys()
+                .await
+                .contains(&pack_cache_key(&salted_pack)),
+            "the salted namespace's pack must survive production GC"
+        );
+        sim.assert_readable(&[&prod_path]).await;
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // GC vs concurrent push
 // ---------------------------------------------------------------------------
 

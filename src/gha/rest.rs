@@ -144,6 +144,12 @@ pub fn format_timestamp(seconds: u64) -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheEntry {
     pub key: String,
+    /// Cache `version` namespace the entry was created under (the value the
+    /// Twirp client sent with CreateCacheEntry). Lets GC distinguish its own
+    /// entries from same-key entries of other namespaces (salted runs,
+    /// foreign workflows): the listing itself is version-blind.
+    #[serde(default)]
+    pub version: String,
     #[serde(default)]
     pub last_accessed_at: String,
     #[serde(default)]

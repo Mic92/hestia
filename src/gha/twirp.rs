@@ -170,6 +170,11 @@ impl TwirpClient {
         Ok(Self::new(http, url, token).with_version_salt(&salt))
     }
 
+    /// The cache `version` namespace this client writes and reads.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
     /// Switch to the cache namespace derived from `salt` (no-op for an
     /// empty salt). See [`ENV_VERSION_SALT`].
     pub fn with_version_salt(mut self, salt: &str) -> Self {
