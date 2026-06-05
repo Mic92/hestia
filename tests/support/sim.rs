@@ -230,6 +230,7 @@ impl SimCache {
             Root {
                 paths: closure.iter().map(SimPath::path_hash).collect(),
                 updated: now,
+                run_id: None,
             },
         );
 

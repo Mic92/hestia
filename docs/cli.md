@@ -54,4 +54,5 @@ Always exits 0 (a failing post-build-hook would fail the build).
 | `GITHUB_REPOSITORY` | gc | `owner/repo`, set automatically in workflows. |
 | `GITHUB_API_URL` | gc | REST API base URL (override for GHES). |
 | `GITHUB_REF_NAME` | serve | Default for `--branch`. |
+| `GITHUB_RUN_ID` | serve | Roots written by the same workflow run merge by union (matrix legs); different runs replace each other's root. |
 | `OUT_PATHS` | hook | Set by Nix when invoking the post-build-hook. |

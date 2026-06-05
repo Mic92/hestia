@@ -1344,6 +1344,7 @@ mod tests {
                 Root {
                     paths: paths.iter().map(|seed| path_hash(*seed)).collect(),
                     updated,
+                    run_id: None,
                 },
             );
             self
@@ -2116,6 +2117,7 @@ mod tests {
             Root {
                 paths: [path_hash(1), path_hash(3)].into_iter().collect(),
                 updated: NOW,
+                run_id: None,
             },
         );
 

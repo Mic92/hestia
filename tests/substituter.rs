@@ -538,9 +538,10 @@ async fn narinfo_hits_join_the_root_at_next_drain() {
         );
 
         // A later drain (no new pushed paths) replaces the root with
-        // pushed ∪ accessed. Use a timestamp outside the root union window so
-        // the new root *replaces* the old one instead of merging with it.
-        let ctx = pipeline_context(&fake, &http, store.database());
+        // pushed ∪ accessed. A different run id makes the new root
+        // *replace* the old one instead of merging with it.
+        let mut ctx = pipeline_context(&fake, &http, store.database());
+        ctx.run_id = Some("another-run".to_string());
         let later = now_unix() + 3600;
         let stats = ctx
             .run(BTreeSet::new(), substituter.access_log.snapshot(), later)

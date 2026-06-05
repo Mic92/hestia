@@ -15,10 +15,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub use harmonia_file_core::{Directory, FileSystemObject, FileTree, Regular, Symlink};
 pub use harmonia_store_path::{StorePath, StorePathHash};
 
-/// Window inside which two root updates are considered concurrent and get
-/// unioned instead of newest-wins (10 minutes).
-pub(crate) const ROOT_UNION_WINDOW_SECS: u64 = 600;
-
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to encode manifest: {0}")]
@@ -269,6 +265,10 @@ pub struct Root {
     /// When this root was last replaced (unix seconds).
     #[serde(default)]
     pub updated: u64,
+    /// Workflow run that wrote this root (`$GITHUB_RUN_ID`); `None` for
+    /// local builds and manifests written before this field existed.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// The top-level manifest document.
@@ -381,15 +381,16 @@ impl PackInfo {
 impl Root {
     /// Merge two versions of the same root.
     ///
-    /// Roots updated within [`ROOT_UNION_WINDOW_SECS`] of each other are
-    /// concurrent (e.g. matrix jobs of one workflow): union their paths.
-    /// Otherwise the newer root replaces the older one -- that is what makes
-    /// old closures unreachable and therefore collectable.
+    /// Roots from the same workflow run are concurrent (matrix legs of one
+    /// workflow, which can drain hours apart): union their paths.
+    /// Otherwise the newer root replaces the older one -- that is what
+    /// makes old closures unreachable and therefore collectable.
     fn merge(a: Self, b: Self) -> Self {
-        if a.updated.abs_diff(b.updated) <= ROOT_UNION_WINDOW_SECS {
+        if a.run_id.is_some() && a.run_id == b.run_id {
             Root {
                 paths: a.paths.into_iter().chain(b.paths).collect(),
                 updated: a.updated.max(b.updated),
+                run_id: a.run_id,
             }
         } else if a.updated > b.updated {
             a
@@ -929,6 +930,7 @@ mod tests {
             Root {
                 paths: BTreeSet::from([path_hash(1), path_hash(2)]),
                 updated: 5000,
+                run_id: None,
             },
         );
         manifest
@@ -1288,25 +1290,41 @@ mod tests {
     }
 
     #[test]
-    fn merge_roots_unions_within_window_replaces_outside() {
-        let make_root = |paths: &[u8], updated: u64| Root {
+    fn merge_roots_unions_same_run_replaces_other_runs() {
+        let make_root = |paths: &[u8], updated: u64, run_id: Option<&str>| Root {
             paths: paths.iter().map(|&seed| path_hash(seed)).collect(),
             updated,
+            run_id: run_id.map(str::to_string),
         };
 
-        // Within 10 minutes: union (concurrent matrix jobs).
-        let merged = Root::merge(make_root(&[1, 2], 1000), make_root(&[3], 1000 + 599));
+        // Same workflow run: union, however far apart the drains are.
+        let merged = Root::merge(
+            make_root(&[1, 2], 1000, Some("run-1")),
+            make_root(&[3], 1000 + 7200, Some("run-1")),
+        );
         assert_eq!(merged.paths.len(), 3);
-        assert_eq!(merged.updated, 1599);
+        assert_eq!(merged.updated, 8200);
+        assert_eq!(merged.run_id.as_deref(), Some("run-1"));
 
-        // Outside 10 minutes: newer replaces older (old closure dies).
-        let merged = Root::merge(make_root(&[1, 2], 1000), make_root(&[3], 1000 + 601));
+        // Different run: newer replaces, even seconds later.
+        let merged = Root::merge(
+            make_root(&[1, 2], 1000, Some("run-1")),
+            make_root(&[3], 1001, Some("run-2")),
+        );
         assert_eq!(merged.paths.len(), 1);
         assert!(merged.paths.contains(&path_hash(3)));
 
-        // Order independence of replacement.
-        let merged = Root::merge(make_root(&[3], 1000 + 601), make_root(&[1, 2], 1000));
+        // No run id (local builds): never union.
+        let merged = Root::merge(make_root(&[1, 2], 1000, None), make_root(&[3], 1001, None));
         assert_eq!(merged.paths.len(), 1);
+
+        // Order independence of replacement.
+        let merged = Root::merge(
+            make_root(&[3], 1001, Some("run-2")),
+            make_root(&[1, 2], 1000, Some("run-1")),
+        );
+        assert_eq!(merged.paths.len(), 1);
+        assert!(merged.paths.contains(&path_hash(3)));
     }
 
     #[test]
@@ -1332,6 +1350,7 @@ mod tests {
             Root {
                 paths: BTreeSet::from([path_hash(1), path_hash(98)]), // 98: evicted root member
                 updated: 0,
+                run_id: None,
             },
         );
 
@@ -1360,6 +1379,7 @@ mod tests {
             Root {
                 paths: BTreeSet::from([path_hash(1)]),
                 updated: 0,
+                run_id: None,
             },
         );
         assert_eq!(manifest.reachable().len(), 2);
@@ -1379,6 +1399,7 @@ mod tests {
             Root {
                 paths: BTreeSet::from([path_hash(1)]),
                 updated: 0,
+                run_id: None,
             },
         );
 
@@ -1485,8 +1506,17 @@ mod tests {
             (
                 proptest::collection::btree_set(arb_path_hash(), 0..4),
                 0u64..3000,
+                prop_oneof![
+                    Just(None),
+                    Just(Some("run-1".to_string())),
+                    Just(Some("run-2".to_string())),
+                ],
             )
-                .prop_map(|(paths, updated)| Root { paths, updated })
+                .prop_map(|(paths, updated, run_id)| Root {
+                    paths,
+                    updated,
+                    run_id,
+                })
         }
 
         fn arb_manifest() -> impl Strategy<Value = Manifest> {
@@ -1504,10 +1534,11 @@ mod tests {
                 })
         }
 
-        /// Manifest without roots: `Root::merge`'s concurrency window makes
-        /// root merging inherently order-dependent for 3+ way merges (a
-        /// documented limitation), so the associativity law is stated for
-        /// the path/chunk/pack maps only.
+        /// Manifest without roots: `Root::merge` mixes union (same run)
+        /// and replacement (different run), which is inherently
+        /// order-dependent for 3+ way merges (a documented limitation), so
+        /// the associativity law is stated for the path/chunk/pack maps
+        /// only.
         fn arb_rootless_manifest() -> impl Strategy<Value = Manifest> {
             arb_manifest().prop_map(|mut manifest| {
                 manifest.roots.clear();
