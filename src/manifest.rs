@@ -301,6 +301,12 @@ impl PathEntry {
 
     /// Merge two entries describing the same store path.
     fn merge(a: Self, b: Self) -> Self {
+        // Identical entries are the common case (drain commits merge
+        // near-identical manifests on every retry); skip the tie-break
+        // below, which clones and CBOR-serializes both entries.
+        if a == b {
+            return a;
+        }
         // Deterministic winner: newer push wins, nar_hash as tie-break, the
         // CBOR encoding of the remaining content as the final tie-break.
         //
@@ -311,8 +317,9 @@ impl PathEntry {
         // concurrent jobs push within the same second routinely). Without a
         // total order the merge would not be commutative, and the surviving
         // entry would depend on which concurrent writer wins the
-        // SaveMutable race.
-        fn order_key(entry: &PathEntry) -> (u64, NarHash, Vec<u8>) {
+        // SaveMutable race. The expensive encoding is computed only on a
+        // (last_pushed, nar_hash) tie.
+        fn content_key(entry: &PathEntry) -> Vec<u8> {
             // The clocks are folded with max() below; exclude them from the
             // content tie-break so that folding never changes an entry's
             // ordering (this keeps the merge associative as well).
@@ -324,13 +331,15 @@ impl PathEntry {
             // the same code path Manifest::encode uses); a failure would
             // only weaken the tie-break, never panic.
             let _ = ciborium::into_writer(&content, &mut encoded);
-            (entry.last_pushed, entry.nar_hash, encoded)
+            encoded
         }
-        let (mut winner, loser) = if order_key(&a) >= order_key(&b) {
-            (a, b)
-        } else {
-            (b, a)
+        let quick_key = |entry: &PathEntry| (entry.last_pushed, entry.nar_hash);
+        let a_wins = match quick_key(&a).cmp(&quick_key(&b)) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => content_key(&a) >= content_key(&b),
         };
+        let (mut winner, loser) = if a_wins { (a, b) } else { (b, a) };
         // Clocks advance monotonically across both histories.
         winner.last_reachable = winner.last_reachable.max(loser.last_reachable);
         winner.last_pushed = winner.last_pushed.max(loser.last_pushed);
