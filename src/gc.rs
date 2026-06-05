@@ -840,8 +840,17 @@ impl GcContext {
         output: &mut RepackOutput,
     ) -> Result<(), Error> {
         let pack = builder.finish();
-        upload_pack(&self.twirp, &self.http, &pack).await?;
-        output.uploaded += pack.data.len() as u64;
+        if upload_pack(&self.twirp, &self.http, &pack).await? {
+            output.uploaded += pack.data.len() as u64;
+        } else {
+            // CAS no-op: the pack already existed, so nothing was
+            // transferred and the LRU clock was not reset by an upload.
+            // Touch it so the pack does not idle into the 7-day eviction
+            // while still referenced.
+            if let Some(url) = self.pack_url(&pack.hash).await? {
+                blob::get(&self.http, &url, Some(0..1)).await?;
+            }
+        }
         output.packs.insert(
             pack.hash,
             PackInfo {
@@ -1503,8 +1512,10 @@ mod tests {
         assert_eq!(plan.repack_jobs.len(), 1);
         assert_eq!(plan.repack_jobs[0].copies.len(), 5);
         assert_eq!(plan.delete_packs.len(), 5);
-        // Consolidating multiple packs always produces new content, so the
-        // CAS trap does not apply here.
+        // A multi-source consolidation can still reproduce a source pack
+        // byte-identically (the builder seals at the same target size the
+        // pipeline used); that case is handled at upload time, where the
+        // already-exists result triggers an LRU touch instead.
     }
 
     #[test]

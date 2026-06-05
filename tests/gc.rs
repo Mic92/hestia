@@ -231,6 +231,58 @@ async fn repack_copies_live_chunks_and_deletes_old_pack_after_commit() {
 }
 
 #[tokio::test]
+async fn repack_hitting_existing_pack_counts_no_upload_and_touches_it() {
+    timed(async {
+        let fake = FakeGha::start().await;
+        let http = client();
+        let sim = SimCache::new(&fake, &http);
+
+        // Same mostly-dead-pack scenario as the repack test above.
+        let big = SimPath::new("big-app", 1, 200_000);
+        let small = SimPath::new("small-lib", 2, 40_000);
+        fake.set_clock(T0);
+        sim.push(
+            "main",
+            &[big.clone(), small.clone()],
+            &[big.clone(), small.clone()],
+            T0,
+        )
+        .await;
+
+        let t1 = T0 + 20 * DAY;
+        fake.set_clock(t1);
+        sim.push("main", &[], std::slice::from_ref(&small), t1)
+            .await;
+
+        // A previous GC run crashed after uploading its repack output: the
+        // re-run reproduces the identical pack and hits the CAS
+        // already-exists path. Simulate by executing the same plan twice.
+        let gc = sim.gc(GcPolicy::default());
+        let (_, _, plan) = gc.plan(t1).await.unwrap();
+        let first = gc.execute_repacks(&plan).await.unwrap();
+        assert_eq!(first.packs.len(), 1);
+        assert!(first.uploaded > 0);
+        let new_pack = *first.packs.keys().next().unwrap();
+
+        let second = gc.execute_repacks(&plan).await.unwrap();
+        assert_eq!(
+            second.packs.keys().collect::<Vec<_>>(),
+            first.packs.keys().collect::<Vec<_>>(),
+            "the repack output is deterministic"
+        );
+        assert_eq!(
+            second.uploaded, 0,
+            "a dedup-skipped upload must not be counted as uploaded"
+        );
+        assert!(
+            one_byte_reads(&fake, &pack_cache_key(&new_pack)) >= 1,
+            "a dedup-skipped upload must touch the existing pack instead"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn truncated_pack_fails_repack_with_an_error_not_a_panic() {
     timed(async {
         let fake = FakeGha::start().await;
