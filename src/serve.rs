@@ -280,19 +280,23 @@ impl Daemon {
 /// Serve one client connection: JSON request lines, JSON response lines.
 async fn handle_connection(state: &DaemonState, stream: UnixStream) -> std::io::Result<()> {
     let mut stream = BufReader::new(stream);
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
         // Bound how much one request line may buffer: `take` makes
-        // `read_line` stop at the cap as if the stream had ended there.
+        // `read_until` stop at the cap as if the stream had ended there.
+        // Raw bytes, not `read_line`: that validates UTF-8 over the
+        // accumulated buffer and would error out before the oversize and
+        // malformed-request responses below get a chance to be sent (e.g.
+        // when the cap lands inside a multi-byte character).
         let read = (&mut stream)
             .take(MAX_REQUEST_BYTES)
-            .read_line(&mut line)
+            .read_until(b'\n', &mut line)
             .await?;
         if read == 0 {
             return Ok(()); // client hung up
         }
-        if read as u64 == MAX_REQUEST_BYTES && !line.ends_with('\n') {
+        if read as u64 == MAX_REQUEST_BYTES && line.last() != Some(&b'\n') {
             // The cap was hit before a newline: oversized request. Answer
             // with an error and drop the connection (the rest of the line
             // is still in flight, so there is no way to resync to the next
@@ -305,6 +309,9 @@ async fn handle_connection(state: &DaemonState, stream: UnixStream) -> std::io::
             stream.get_mut().flush().await?;
             return Ok(());
         }
+        // Lossy conversion: invalid UTF-8 falls into the malformed-request
+        // arm via the serde parse error instead of killing the connection.
+        let line = String::from_utf8_lossy(&line);
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => state.handle_request(request).await,
             Err(err) => Response::error(format!("malformed request: {err}")),

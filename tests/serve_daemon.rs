@@ -386,6 +386,54 @@ async fn oversized_hook_request_is_rejected_with_bounded_memory() {
 }
 
 #[tokio::test]
+async fn non_utf8_hook_request_gets_a_malformed_request_response() {
+    // Clients on the hook socket are not necessarily hestia: a stray
+    // process can write arbitrary bytes. Invalid UTF-8 must reach the
+    // documented "malformed request" error response instead of tearing the
+    // connection down without an answer.
+    let test = async {
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hook.sock");
+
+        let daemon = RunningDaemon::start(
+            socket.clone(),
+            None,
+            pipeline_context(&fake, &http, StoreDatabase::new("/nonexistent/db.sqlite")),
+        )
+        .await;
+
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connecting to hook socket failed");
+        // Invalid UTF-8 (0xC3 with no continuation byte), newline-terminated.
+        stream
+            .write_all(b"\xc3garbage\n")
+            .await
+            .expect("writing garbage failed");
+
+        let mut response = vec![0u8; 4096];
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut response))
+            .await
+            .expect("daemon must answer, not hang")
+            .expect("reading response failed");
+        let text = String::from_utf8_lossy(&response[..read]);
+        assert!(
+            text.contains("\"ok\":false") && text.contains("malformed request"),
+            "non-UTF-8 garbage must get the malformed-request error, got: {text:?}"
+        );
+
+        drop(stream);
+        let _ = daemon.stop().await;
+    };
+    tokio::time::timeout(Duration::from_secs(30), test)
+        .await
+        .expect("test timed out");
+}
+
+#[tokio::test]
 async fn drain_cli_binary_reports_stats_and_exits_zero() {
     let Some(store) = ScratchStore::create() else {
         return;
