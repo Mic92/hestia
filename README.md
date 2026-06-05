@@ -181,7 +181,7 @@ rebuilt.
 ```console
 $ nix develop -c cargo test          # unit + integration tests (fake GHA backend)
 $ nix develop -c cargo clippy --all-targets -- -D warnings
-$ nix fmt                            # treefmt (rustfmt, nixfmt, prettier, ...)
+$ nix fmt                            # treefmt (rustfmt, nixfmt, taplo, ...)
 $ nix flake check                    # everything CI runs: fmt, clippy, tests, build
 $ nix build .#                       # the hestia binary (static musl on Linux)
 ```
