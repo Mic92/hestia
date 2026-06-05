@@ -4,6 +4,7 @@ on:
 jobs:
   auto-merge-dependency-updates:
     runs-on: ubuntu-slim
+    if: github.actor == 'dependabot[bot]'
     permissions:
       contents: write
       pull-requests: write
@@ -11,4 +12,4 @@ jobs:
       group: "auto-merge:${{ github.head_ref }}"
       cancel-in-progress: true
     steps:
-      - uses: Mic92/auto-merge@main
+      - uses: Mic92/auto-merge@e1f544e0f9a0128013e1c37c6d70fd32c2cf0f32 # main
