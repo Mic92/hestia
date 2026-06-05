@@ -775,8 +775,8 @@ async fn transient_blob_failure_is_retried_transparently() {
         let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
-        // Request the NAR directly (not via narinfo) so the background
-        // prefetch cannot race with the injected failure.
+        // Request the NAR directly: the narinfo round-trip is irrelevant
+        // here, the injected failure targets the pack Range read.
         let entry = &manifest.paths[&path_hash_of(&fixture)];
         let nar_url = format!("nar/{}.nar", entry.nar_hash.to_hex());
 

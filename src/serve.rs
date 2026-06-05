@@ -19,7 +19,7 @@
 //!   drain   -> run the write pipeline over buffered + accessed paths
 //!              -> refresh the served manifest
 //!   status  -> report buffered count
-//!   narinfo -> record access, prefetch chunks
+//!   narinfo -> record access
 //!   nar     -> serve chunks fetched from packs
 //! exit on: shutdown signal (SIGTERM/SIGINT) or idle timeout
 //!   -> one final drain before returning

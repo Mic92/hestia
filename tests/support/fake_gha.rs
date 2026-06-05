@@ -61,7 +61,8 @@ struct Entry {
 }
 
 /// One recorded blob download (used by tests asserting fetch behavior,
-/// e.g. "prefetched chunks are not fetched twice").
+/// e.g. that repeated NAR requests reuse cached chunks instead of
+/// re-reading packs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobRequest {
     /// Cache key of the entry the blob belongs to (e.g. `pack-<hex>`).
