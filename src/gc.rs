@@ -161,8 +161,11 @@ pub struct RepackJob {
 
 impl RepackJob {
     /// Compressed bytes that must be Range-read from source packs. Frames
-    /// are copied without recompression, so this is also the size of the
-    /// output pack.
+    /// are copied without recompression, so this is also the total size of
+    /// the output packs (the job seals and uploads a pack each time it
+    /// reaches [`GcPolicy::pack_target_size`]). The actual output can be
+    /// smaller when a source pack disappeared mid-run and its chunks were
+    /// skipped.
     pub fn download_bytes(&self) -> u64 {
         self.copies
             .iter()
