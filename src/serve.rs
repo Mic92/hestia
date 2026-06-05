@@ -197,8 +197,9 @@ impl Daemon {
     /// Bind the hook socket and assemble the daemon.
     ///
     /// The socket's parent directory is created if missing. An existing
-    /// socket file is removed first (leftover from a previous daemon that
-    /// did not shut down cleanly).
+    /// socket file is removed first — but only after probing it: if a
+    /// daemon still answers on it, binding would silently sever that
+    /// daemon from all of its clients, so the bind is refused instead.
     pub fn bind(
         socket: &Path,
         idle_exit: Option<Duration>,
@@ -214,6 +215,15 @@ impl Daemon {
 
         if let Some(parent) = socket.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "another daemon is already serving {}; refusing to take over its socket",
+                    socket.display()
+                ),
+            ));
         }
         match std::fs::remove_file(socket) {
             Ok(()) => {}
@@ -440,6 +450,20 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 
     let manifest_store = ManifestStore::new();
 
+    // Bind the substituter port before touching the hook socket: if the
+    // port is taken (most likely by another hestia serve with default
+    // flags), failing here must leave that daemon's socket alone.
+    let listener = match tokio::net::TcpListener::bind(&args.listen).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!(
+                "hestia serve: cannot bind substituter address {}: {err}",
+                args.listen
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
     let idle_exit = args.idle_exit.map(Duration::from_secs);
     let daemon = match Daemon::bind(
         &args.socket,
@@ -468,16 +492,6 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         http.clone(),
     )
         .with_activity_hook(daemon.activity_hook());
-    let listener = match tokio::net::TcpListener::bind(&args.listen).await {
-        Ok(listener) => listener,
-        Err(err) => {
-            eprintln!(
-                "hestia serve: cannot bind substituter address {}: {err}",
-                args.listen
-            );
-            return ExitCode::FAILURE;
-        }
-    };
     let substituter_task = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, substituter.into_router()).await {
             eprintln!("hestia serve: substituter server failed: {err}");
@@ -536,6 +550,10 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     let result = daemon.run(shutdown).await;
     load_task.abort();
     substituter_task.abort();
+    // Remove the socket file: a leftover socket at the fixed default path
+    // makes later hook invocations connect to a dead endpoint and makes
+    // the next daemon's takeover look like a crash recovery.
+    let _ = std::fs::remove_file(&args.socket);
     match result {
         Ok(stats) => {
             eprintln!(
