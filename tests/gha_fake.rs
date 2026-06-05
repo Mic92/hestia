@@ -289,6 +289,31 @@ async fn savemutable_skips_stale_reservation() {
 }
 
 #[tokio::test]
+async fn savemutable_load_stays_consistent_across_url_refresh() {
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let twirp = fake.twirp(&http);
+
+    store_entry(&twirp, &http, "m#1", b"manifest v1").await;
+    store_entry(&twirp, &http, "m#2", b"manifest v2").await;
+
+    // The first lookup lags (returns m#1) and its signed URL is born dead,
+    // so the download 403s and the refresh path re-resolves — by which time
+    // the lookup has caught up to m#2. Whatever load() returns, key, index
+    // and data must describe the same version: a m#1 label on m#2 bytes
+    // under-reports the version and recreates the conflict spin the
+    // save floor exists to prevent.
+    fake.set_stale_lookups_for(&http, 1).await;
+    fake.dead_sigs(&http, 1).await;
+
+    let save = SaveMutable::new(&twirp, &http, "m");
+    let entry = save.load().await.unwrap().expect("entry exists");
+    assert_eq!(entry.data.as_ref(), b"manifest v2");
+    assert_eq!(entry.key, "m#2", "label must match the downloaded bytes");
+    assert_eq!(entry.index, 2, "index must match the downloaded bytes");
+}
+
+#[tokio::test]
 async fn savemutable_recovers_from_many_consecutive_dead_reservations() {
     let fake = FakeGha::start().await;
     let http = reqwest::Client::new();

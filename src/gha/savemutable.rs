@@ -134,11 +134,19 @@ impl<'a> SaveMutable<'a> {
         let index = parse_index(&self.prefix, &matched_key)?;
 
         // The signed URL was just issued, but refresh anyway if it raced
-        // with an expiry.
+        // with an expiry. The refresh re-runs the prefix lookup, which may
+        // resolve to a *newer* version (a concurrent writer finalized in
+        // between), so the refreshed key must replace the original one:
+        // key, index and data must always describe the same version.
         let twirp = self.twirp;
+        let refreshed_key = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let refreshed_in = std::sync::Arc::clone(&refreshed_key);
         let data = blob::get_with_refresh(self.http, &url, None, async move || {
             match twirp.get_download_url(&prefix, &[prefix.as_str()]).await? {
-                DownloadUrl::Hit { url, .. } => Ok(url),
+                DownloadUrl::Hit { url, matched_key } => {
+                    *refreshed_in.lock().expect("not poisoned") = Some(matched_key);
+                    Ok(url)
+                }
                 DownloadUrl::Miss => Err(Error::InvalidResponse(format!(
                     "entry {prefix:?} disappeared while downloading"
                 ))),
@@ -146,11 +154,15 @@ impl<'a> SaveMutable<'a> {
         })
         .await?;
 
-        Ok(Some(MutableEntry {
-            key: matched_key,
-            index,
-            data,
-        }))
+        let (key, index) = match refreshed_key.lock().expect("not poisoned").take() {
+            Some(key) => {
+                let index = parse_index(&self.prefix, &key)?;
+                (key, index)
+            }
+            None => (matched_key, index),
+        };
+
+        Ok(Some(MutableEntry { key, index, data }))
     }
 
     /// Save a new version produced by `merge`.
