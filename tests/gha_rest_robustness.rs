@@ -134,6 +134,39 @@ async fn empty_pages_handler() -> Json<serde_json::Value> {
     }))
 }
 
+/// A listing endpoint whose `total_count` underreports the entries it
+/// actually serves (an eventually consistent counter, or one shrunk by
+/// concurrent deletions). Pagination termination must come from an empty
+/// page, never from trusting the counter.
+async fn understated_total_count_handler(
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let per_page: usize = params
+        .get("per_page")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let page: usize = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let page_entries: Vec<serde_json::Value> = (0..150usize)
+        .skip((page - 1) * per_page)
+        .take(per_page)
+        .map(|i| {
+            json!({
+                "id": i,
+                "ref": "refs/heads/main",
+                "key": format!("pack-{i:03}"),
+                "version": "v",
+                "created_at": format_timestamp(1_000 + i as u64),
+                "last_accessed_at": format_timestamp(1_000 + i as u64),
+                "size_in_bytes": 1,
+            })
+        })
+        .collect();
+    Json(json!({
+        "total_count": 1,
+        "actions_caches": page_entries,
+    }))
+}
+
 async fn start_server(router: Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -348,6 +381,30 @@ async fn pagination_returns_every_entry_despite_concurrent_lru_reordering() {
             listed.len(),
             expected.len(),
             "pagination duplicated entries"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn pagination_does_not_trust_an_understated_total_count() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let router = Router::new().route(
+            "/repos/{owner}/{repo}/actions/caches",
+            get(understated_total_count_handler),
+        );
+        let url = start_server(router).await;
+        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token");
+
+        // GC treats packs missing from this listing as evicted and drops
+        // the paths referencing them, so ending the listing early on a
+        // stale counter loses live data.
+        let listed = rest.list_caches("pack-").await.unwrap();
+        assert_eq!(
+            listed.len(),
+            150,
+            "listing must continue past a lying total_count until an empty page"
         );
     })
     .await
