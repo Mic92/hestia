@@ -83,7 +83,7 @@ pub struct SaveMutable<'a> {
     retry_delay: Duration,
     /// Give up after this many conflicting save attempts.
     max_attempts: u32,
-    /// Skip over an index after this many consecutive conflicts on it
+    /// Skip over an index after this many conflicts on it
     /// (crashed-writer recovery).
     stale_skip_after: u32,
 }
@@ -180,8 +180,11 @@ impl<'a> SaveMutable<'a> {
         let mut attempts: u32 = 0;
         // Indexes at or below this are blocked by (presumably crashed) writers.
         let mut skip_through: u64 = floor;
-        let mut last_conflict: Option<u64> = None;
-        let mut conflict_streak: u32 = 0;
+        // Conflicts are counted per index, not as a single consecutive
+        // streak: eventually consistent loads can oscillate between two
+        // versions (non-monotonic reads), and a streak that resets on every
+        // index change would never reach the stale-skip threshold.
+        let mut conflicts: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
 
         loop {
             let current = self.load().await?;
@@ -200,22 +203,19 @@ impl<'a> SaveMutable<'a> {
                 }
                 Reservation::AlreadyExists => {
                     attempts += 1;
-                    if attempts >= self.max_attempts {
-                        return Err(Error::Conflict { key, attempts });
-                    }
-                    if last_conflict == Some(index) {
-                        conflict_streak += 1;
-                    } else {
-                        last_conflict = Some(index);
-                        conflict_streak = 1;
-                    }
-                    if conflict_streak >= self.stale_skip_after {
+                    let streak = conflicts.entry(index).or_insert(0);
+                    *streak += 1;
+                    if *streak >= self.stale_skip_after {
                         // Nobody finalized this index after several waits:
                         // assume the writer holding the reservation crashed
                         // and skip over it.
                         skip_through = index;
-                        last_conflict = None;
-                        conflict_streak = 0;
+                        conflicts.remove(&index);
+                    } else if attempts >= self.max_attempts {
+                        // Checked only when no skip fired: an attempt that
+                        // skips a dead index is progress, not grounds for
+                        // giving up, however many conflicts preceded it.
+                        return Err(Error::Conflict { key, attempts });
                     }
                     tokio::time::sleep(self.retry_delay).await;
                 }
