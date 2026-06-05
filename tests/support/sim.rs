@@ -240,7 +240,14 @@ impl SimCache {
                         .map_err(|err| GhaError::InvalidResponse(err.to_string()))?,
                     None => Manifest::new(),
                 };
-                base.merge(delta.clone())
+                // Mirror production's drain commit (pipeline.rs): fold the
+                // drain-start snapshot in as well, because the dedup
+                // decisions above were based on it and `existing` can be a
+                // stale read. This merge is also how a drain racing GC can
+                // resurrect GC-dropped paths, so the GC suite's dangling-
+                // reference checks depend on the sim performing it too.
+                base.merge(current.clone())
+                    .merge(delta.clone())
                     .encode()
                     .map_err(|err| GhaError::InvalidResponse(err.to_string()))
             })
