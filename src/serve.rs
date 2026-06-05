@@ -357,13 +357,14 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     let system = args.system.clone().unwrap_or_else(pipeline::current_system);
 
     let store_dir = store.store_dir().clone();
+    let root_key = pipeline::root_key(&branch, &system);
     let pipeline = PipelineContext {
         twirp: twirp.clone(),
         http: http.clone(),
         store,
         upstream,
         expand_closure: !args.no_closure,
-        root_key: pipeline::root_key(&branch, &system),
+        root_key: root_key.clone(),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         pack_target_size: pipeline::PACK_TARGET_SIZE,
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.
@@ -448,11 +449,9 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     };
 
     eprintln!(
-        "hestia serve: hook socket {}, substituter http://{} (root key: {}-{})",
+        "hestia serve: hook socket {}, substituter http://{} (root key: {root_key})",
         args.socket.display(),
         args.listen,
-        branch,
-        system
     );
 
     // SIGTERM (runner shutdown) and SIGINT (^C) both trigger drain + exit.
