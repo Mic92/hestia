@@ -555,6 +555,9 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         upstream,
         expand_closure: !args.no_closure,
         root_key: root_key.clone(),
+        run_id: std::env::var("GITHUB_RUN_ID")
+            .ok()
+            .filter(|id| !id.is_empty()),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         pack_target_size: pipeline::PACK_TARGET_SIZE,
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.

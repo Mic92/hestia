@@ -95,6 +95,10 @@ detected (override with `--system`). Anything reachable from a root survives
 garbage collection; everything else is deleted once it falls out of the push
 grace period.
 
+Matrix jobs of one workflow run share their root: their closures are
+unioned, however far apart the jobs finish. A new run replaces the root, so
+old closures become collectable.
+
 Pull requests get their own roots (`123/merge-x86_64-linux`), so a PR cannot
 evict paths the default branch still needs. Roots that stop being updated
 (merged PRs, deleted branches) expire after `--root-ttl` (14 days by

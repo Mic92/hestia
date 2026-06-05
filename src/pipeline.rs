@@ -177,6 +177,8 @@ pub struct PipelineContext {
     pub expand_closure: bool,
     /// Manifest root key, e.g. `main-x86_64-linux`.
     pub root_key: String,
+    /// Workflow run id (`$GITHUB_RUN_ID`); see [`Root::merge`].
+    pub run_id: Option<String>,
     /// SaveMutable family prefix (always [`MANIFEST_PREFIX`] in production;
     /// tests use distinct prefixes to isolate scenarios).
     pub manifest_prefix: String,
@@ -507,15 +509,18 @@ impl PipelineContext {
             Root {
                 paths: root_paths,
                 updated: now,
+                run_id: self.run_id.clone(),
             },
         );
 
         // Skip commits that would only refresh the root's `updated` clock:
         // the access log is never cleared and the SIGTERM final drain runs
         // unconditionally, so otherwise every job that substituted a path
-        // burns a redundant manifest version at teardown. Only skip while
-        // the committed clock is recent: it drives root-TTL liveness in GC
-        // and must still be refreshed on long-lived daemons.
+        // burns a redundant manifest version at teardown. Only skip when
+        // the committed root comes from this very run: a CI job lives far
+        // shorter than the root TTL, so the stale clock cannot expire the
+        // root. Without a run id (local builds) always commit, because the
+        // clock drives root-TTL liveness in GC.
         let refresh_only = {
             let mut probe = current.clone().merge(delta.clone());
             match (
@@ -523,8 +528,7 @@ impl PipelineContext {
                 current.roots.get(&self.root_key),
             ) {
                 (Some(probed), Some(committed))
-                    if now.saturating_sub(committed.updated)
-                        <= crate::manifest::ROOT_UNION_WINDOW_SECS =>
+                    if self.run_id.is_some() && committed.run_id == self.run_id =>
                 {
                     probed.updated = committed.updated;
                     probe == current

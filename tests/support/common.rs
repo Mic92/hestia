@@ -45,6 +45,7 @@ pub fn pipeline_context_with(
         upstream: UpstreamFilter::default(),
         expand_closure: true,
         root_key: TEST_ROOT_KEY.to_string(),
+        run_id: Some("test-run".to_string()),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         pack_target_size: PACK_TARGET_SIZE,
         publish: None,
