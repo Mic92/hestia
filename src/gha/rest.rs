@@ -367,13 +367,14 @@ impl RestClient {
             }
             let list: CacheList = self.send(&url, request, false).await?;
             // Termination must not depend on `total_count` ever becoming
-            // consistent with the returned pages: an empty page means there
-            // is nothing more to fetch, whatever the server claims.
-            if list.actions_caches.is_empty() {
-                return Ok(entries);
-            }
+            // consistent with the returned pages: the counter can be stale
+            // or shrunk by concurrent deletions while later pages still
+            // hold entries. A short page (fewer than requested) is the only
+            // trustworthy end marker: it means nothing exists past this
+            // offset right now, whatever the server claims.
+            let received = list.actions_caches.len();
             entries.extend(list.actions_caches);
-            if entries.len() as u64 >= list.total_count {
+            if received < PER_PAGE as usize {
                 return Ok(entries);
             }
             page += 1;
