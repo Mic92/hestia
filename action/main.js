@@ -63,6 +63,36 @@ function fail(message) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// On GitHub Enterprise Server, GITHUB_ACTION_REPOSITORY names a repo on the
+// instance; hardcoding public hosts would leak the instance token to
+// api.github.com and let a same-named public repo supply the binary.
+const apiBase = process.env.GITHUB_API_URL || 'https://api.github.com';
+const serverBase = process.env.GITHUB_SERVER_URL || 'https://github.com';
+
+/**
+ * Compare release tags like v0.1.0-alpha.10: dot/dash segments compared
+ * numerically where numeric, with a release outranking its prereleases.
+ */
+function compareTags(a, b) {
+  const parse = (t) =>
+    t
+      .replace(/^v/, '')
+      .split(/[.-]/)
+      .map((p) => (/^\d+$/.test(p) ? Number(p) : p));
+  const pa = parse(a);
+  const pb = parse(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i];
+    const y = pb[i];
+    if (x === y) continue;
+    if (x === undefined) return 1; // 1.0.0 > 1.0.0-alpha.1
+    if (y === undefined) return -1;
+    if (typeof x !== typeof y) return typeof x === 'number' ? -1 : 1;
+    return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
 /** Ask the kernel for a free TCP port on the loopback interface. */
 function pickFreePort() {
   return new Promise((resolve, reject) => {
@@ -106,7 +136,7 @@ function captureTokens() {
  * download relies on.
  */
 async function verifyAttestation(repo, assetName, digest, token) {
-  const url = `https://api.github.com/repos/${repo}/attestations/sha256:${digest}`;
+  const url = `${apiBase}/repos/${repo}/attestations/sha256:${digest}`;
   const headers = {
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
@@ -153,8 +183,10 @@ async function resolveVersion(version) {
   if (version !== 'latest') return version;
   const repo = process.env.GITHUB_ACTION_REPOSITORY || 'Mic92/hestia';
   // /releases/latest skips prereleases, so list recent releases and pick
-  // the first published (non-draft) entry.
-  const url = `https://api.github.com/repos/${repo}/releases?per_page=10`;
+  // the highest published (non-draft) version. The list endpoint orders by
+  // creation date, so a hotfix for an older line would otherwise downgrade
+  // every 'latest' consumer.
+  const url = `${apiBase}/repos/${repo}/releases?per_page=10`;
   const headers = { Accept: 'application/vnd.github+json' };
   const token = getInput('github-token');
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -166,6 +198,7 @@ async function resolveVersion(version) {
   if (!releases.length) {
     fail(`no published releases found for ${repo}`);
   }
+  releases.sort((a, b) => compareTags(b.tag_name, a.tag_name));
   const tag = releases[0].tag_name;
   console.log(`hestia-cache: resolved 'latest' to ${tag}`);
   return tag;
@@ -197,7 +230,7 @@ async function installBinary(installDir) {
     // from, so forks automatically download their own releases.
     const repo = process.env.GITHUB_ACTION_REPOSITORY || 'Mic92/hestia';
     const assetName = `hestia-${arch}-${process.platform}`;
-    const url = `https://github.com/${repo}/releases/download/${version}/${assetName}`;
+    const url = `${serverBase}/${repo}/releases/download/${version}/${assetName}`;
     console.log(`hestia-cache: downloading ${url}`);
     const response = await fetch(url, { redirect: 'follow' });
     if (!response.ok) {
