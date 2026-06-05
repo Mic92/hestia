@@ -33,7 +33,7 @@ use crate::chunker::{
 use crate::cli::GcArgs;
 use crate::drain::human_bytes;
 use crate::gha::rest::{CacheEntry, RestClient};
-use crate::gha::savemutable::SaveMutable;
+use crate::gha::savemutable::{MutableEntry, SaveMutable};
 use crate::gha::twirp::{DownloadUrl, TwirpClient};
 use crate::gha::{Error as GhaError, blob};
 use crate::manifest::{
@@ -530,8 +530,7 @@ pub fn plan(
                     // 0 means no REST timestamp parsed: the idle time is
                     // unknown, so do not force a touch (mirrors the
                     // `created == 0` orphan guard).
-                    *last_accessed != 0
-                        && now.saturating_sub(*last_accessed) > policy.touch_age
+                    *last_accessed != 0 && now.saturating_sub(*last_accessed) > policy.touch_age
                 })
         })
         .map(|(pack, pack_stats)| (pack_stats.tier, pack_stats.live_bytes, *pack))
@@ -745,8 +744,17 @@ impl GcContext {
     /// is only trusted when the REST listing shows no manifest versions
     /// either.
     pub async fn load_manifest(&self) -> Result<Manifest, Error> {
-        match self.save_mutable().load().await? {
+        match self.load_manifest_entry().await? {
             Some(entry) => Ok(Manifest::decode(&entry.data)?),
+            None => Ok(Manifest::new()),
+        }
+    }
+
+    /// Like [`Self::load_manifest`], but keeps the raw entry (the commit
+    /// step needs its index as a reservation floor).
+    async fn load_manifest_entry(&self) -> Result<Option<MutableEntry>, Error> {
+        match self.save_mutable().load().await? {
+            Some(entry) => Ok(Some(entry)),
             None => {
                 let prefix = format!("{}#", self.manifest_prefix);
                 let versions = self
@@ -759,7 +767,7 @@ impl GcContext {
                 if versions > 0 {
                     return Err(Error::ManifestLookupInconsistent(versions));
                 }
-                Ok(Manifest::new())
+                Ok(None)
             }
         }
     }
@@ -990,19 +998,30 @@ impl GcContext {
     /// its paths/packs are respected — a path the stale plan wanted to drop
     /// stays if the push made it live again, and a pack only enters the
     /// deletable set if the *committed* manifest no longer references it.
-    pub async fn commit(
-        &self,
-        observations: &[PackObservation],
-        repacks: &RepackOutput,
-        now: u64,
-    ) -> Result<CommitOutcome, Error> {
+    pub async fn commit(&self, repacks: &RepackOutput, now: u64) -> Result<CommitOutcome, Error> {
+        // Re-list the pack observations: the plan-time listing predates the
+        // potentially long repack and touch phases. A pack a concurrent
+        // drain uploaded since then carries the drain's *start* time, which
+        // can exceed min_age — the stale listing would judge it evicted and
+        // heal away the drain's just-committed paths.
+        let observations = self.observe_packs().await?;
+        let observations = observations.as_slice();
+
         // Skip the commit when it would be a byte-identical no-op. Note
         // this only fires for an empty or fully-unreachable manifest:
         // mark_reachable bumps last_reachable on every reachable path, so
         // any cache with a live root always commits (the fresh clocks
         // preserve the full path_grace window for paths whose roots later
         // expire).
-        let base = self.load_manifest().await?;
+        let entry = self.load_manifest_entry().await?;
+        // Never reserve at or below the version observed here, even when
+        // the eventually consistent lookup inside save() regresses below it
+        // (same hazard the drain commit guards against).
+        let floor = entry.as_ref().map_or(0, |e| e.index);
+        let base = match &entry {
+            Some(entry) => Manifest::decode(&entry.data)?,
+            None => Manifest::new(),
+        };
         let base_plan = plan(&base, observations, now, &self.policy);
         let (transformed, deletable) = apply(base.clone(), &base_plan, repacks);
         if transformed == base {
@@ -1017,7 +1036,7 @@ impl GcContext {
         let mut committed: Option<(Vec<PackHash>, BTreeSet<String>)> = None;
         let version = self
             .save_mutable()
-            .save(|existing| {
+            .save_with_floor(floor, |existing| {
                 let latest = match existing {
                     Some(entry) => Manifest::decode(&entry.data)
                         .map_err(|err| GhaError::InvalidResponse(err.to_string()))?,
@@ -1117,7 +1136,7 @@ impl GcContext {
     /// The full GC flow: plan, then (unless `dry_run`) execute every step in
     /// crash-safe order.
     pub async fn run(&self, dry_run: bool, now: u64) -> Result<GcReport, Error> {
-        let (_, observations, gc_plan) = self.plan(now).await?;
+        let (_, _, gc_plan) = self.plan(now).await?;
         eprintln!("hestia gc: plan: {}", gc_plan.summary());
 
         let mut report = GcReport {
@@ -1137,8 +1156,8 @@ impl GcContext {
         // 2. Touch.
         report.packs_touched = self.execute_touches(&gc_plan).await?;
 
-        // 3. Commit the manifest (re-plans on conflict).
-        let outcome = self.commit(&observations, &repacks, now).await?;
+        // 3. Commit the manifest (re-plans on conflict, re-lists packs).
+        let outcome = self.commit(&repacks, now).await?;
         report.manifest_version = outcome.version;
 
         // 4-6. Deletes happen strictly after the commit landed.

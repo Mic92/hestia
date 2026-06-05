@@ -538,8 +538,13 @@ async fn touch_failures_do_not_abort_the_gc_run() {
         let one = SimPath::new("app-one", 1, 60_000);
         let two = SimPath::new("lib-two", 3, 60_000);
         fake.set_clock(T0);
-        sim.push("main", std::slice::from_ref(&one), &[one.clone(), two.clone()], T0)
-            .await;
+        sim.push(
+            "main",
+            std::slice::from_ref(&one),
+            &[one.clone(), two.clone()],
+            T0,
+        )
+        .await;
         sim.push(
             "main",
             std::slice::from_ref(&two),
@@ -796,7 +801,7 @@ async fn concurrent_push_during_gc_keeps_both_outcomes_correct() {
             .await;
 
         let gc = sim.gc(GcPolicy::default());
-        let (_, observations, plan) = gc.plan(t1).await.unwrap();
+        let (_, _, plan) = gc.plan(t1).await.unwrap();
         assert!(plan.drop_paths.contains(&big.path_hash()));
         assert_eq!(plan.repack_jobs.len(), 1);
 
@@ -814,7 +819,7 @@ async fn concurrent_push_during_gc_keeps_both_outcomes_correct() {
         .await;
 
         // The commit re-plans against the new manifest.
-        let outcome = gc.commit(&observations, &repacks, t1).await.unwrap();
+        let outcome = gc.commit(&repacks, t1).await.unwrap();
         let deleted = gc.delete_packs(&outcome.deletable).await.unwrap();
         gc.delete_orphans(&outcome.orphan_keys).await.unwrap();
 
@@ -843,6 +848,61 @@ async fn concurrent_push_during_gc_keeps_both_outcomes_correct() {
 
         sim.assert_readable(&[&big, &small]).await;
         sim.assert_no_dangling_pack_references().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn commit_relists_packs_so_a_long_drain_is_not_judged_evicted() {
+    timed(async {
+        let fake = FakeGha::start().await;
+        let http = client();
+        let sim = SimCache::new(&fake, &http);
+
+        let app = SimPath::new("the-app", 1, 60_000);
+        fake.set_clock(T0);
+        sim.push(
+            "main",
+            std::slice::from_ref(&app),
+            std::slice::from_ref(&app),
+            T0,
+        )
+        .await;
+
+        // GC plans (taking its REST pack listing) at t1.
+        let t1 = T0 + DAY;
+        fake.set_clock(t1);
+        let gc = sim.gc(GcPolicy::default());
+        let (_, _, plan) = gc.plan(t1).await.unwrap();
+        let repacks = gc.execute_repacks(&plan).await.unwrap();
+
+        // While GC was repacking, a long drain that *started* hours ago
+        // (the pipeline stamps every pack with the drain start time, which
+        // can exceed min_age for multi-hour pushes) uploads its pack and
+        // commits. The pack is absent from GC's plan-time listing.
+        let late = SimPath::new("late-build", 3, 60_000);
+        sim.push(
+            "main",
+            std::slice::from_ref(&late),
+            &[app.clone(), late.clone()],
+            t1 - 2 * HOUR,
+        )
+        .await;
+
+        // The commit re-plans against the drain's manifest; it must not
+        // judge the drain's pack evicted just because the plan-time listing
+        // predates its upload.
+        let outcome = gc.commit(&repacks, t1).await.unwrap();
+        gc.delete_packs(&outcome.deletable).await.unwrap();
+        gc.delete_orphans(&outcome.orphan_keys).await.unwrap();
+
+        let manifest = sim.manifest().await;
+        assert!(
+            manifest.paths.contains_key(&late.path_hash()),
+            "the concurrent drain's path must survive the GC commit"
+        );
+        sim.assert_no_dangling_pack_references().await;
+        sim.assert_readable(&[&app, &late]).await;
     })
     .await;
 }
@@ -893,7 +953,7 @@ async fn crash_between_any_two_execute_steps_never_loses_live_paths() {
             let (sim, dying, surviving, t1) = crash_scenario(&fake, &http).await;
             let gc = sim.gc(GcPolicy::default());
 
-            let (_, observations, plan) = gc.plan(t1).await.unwrap();
+            let (_, _, plan) = gc.plan(t1).await.unwrap();
             let mut repacks = RepackOutput::default();
             let mut outcome = None;
 
@@ -904,7 +964,7 @@ async fn crash_between_any_two_execute_steps_never_loses_live_paths() {
                 gc.execute_touches(&plan).await.unwrap();
             }
             if stop_after >= 3 {
-                outcome = Some(gc.commit(&observations, &repacks, t1).await.unwrap());
+                outcome = Some(gc.commit(&repacks, t1).await.unwrap());
             }
             if stop_after >= 4 {
                 let deletable = &outcome.as_ref().unwrap().deletable;
