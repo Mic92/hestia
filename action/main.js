@@ -238,7 +238,11 @@ function configureNix(installDir, listen, hookShim) {
     '# written by the hestia-cache action\n' +
       `extra-substituters = http://${listen}?trusted=true&priority=30\n` +
       `post-build-hook = ${hookShim}\n` +
-      'fallback = true\n'
+      'fallback = true\n' +
+      // Without this, nix's on-disk narinfo cache remembers a 404 for an
+      // hour: on persistent self-hosted runners the next job would skip
+      // querying hestia for paths the previous job just uploaded.
+      'narinfo-cache-negative-ttl = 0\n'
   );
 
   // Prepend to the search path so existing user configuration stays active.
