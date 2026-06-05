@@ -110,17 +110,36 @@ pub fn stage_breakdown(stats: &DrainStats) -> String {
     stages.join(", ")
 }
 
+/// Exit code and output for a successful daemon response.
+///
+/// The module contract says a zero exit means the built paths were cached:
+/// verification failures mean exactly the opposite for the affected paths,
+/// so they must fail the step even though the daemon reported `ok`.
+fn report_outcome(response: protocol::Response) -> ExitCode {
+    let Some(stats) = response.stats else {
+        // A daemon from a different hestia build may omit the stats
+        // payload; do not fabricate a "pushed 0 paths" summary from zeros.
+        eprintln!("hestia drain: daemon reported success but sent no stats (version skew?)");
+        return ExitCode::SUCCESS;
+    };
+    eprintln!("hestia drain: {}", summarize(&stats));
+    if stats.failed_verification > 0 || stats.failed_chunking > 0 {
+        eprintln!(
+            "hestia drain: {} were NOT cached; see the daemon log",
+            count(stats.failed_verification + stats.failed_chunking, "path"),
+        );
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
 pub async fn run(args: &DrainArgs) -> ExitCode {
     let timeout = Duration::from_secs(args.timeout);
     let result =
         tokio::time::timeout(timeout, protocol::roundtrip(&args.socket, &Request::Drain)).await;
 
     match result {
-        Ok(Ok(response)) => {
-            let stats = response.stats.unwrap_or_default();
-            eprintln!("hestia drain: {}", summarize(&stats));
-            ExitCode::SUCCESS
-        }
+        Ok(Ok(response)) => report_outcome(response),
         Ok(Err(err)) => {
             eprintln!(
                 "hestia drain: failed to drain daemon at {}: {err}",
@@ -129,8 +148,12 @@ pub async fn run(args: &DrainArgs) -> ExitCode {
             ExitCode::FAILURE
         }
         Err(_) => {
+            // Only the client-side wait is abandoned: the daemon's drain
+            // keeps running and may still commit, so the outcome is
+            // unknown -- do not claim the paths were not cached.
             eprintln!(
-                "hestia drain: daemon at {} did not finish within {}s",
+                "hestia drain: daemon at {} still draining after {}s; outcome unknown, \
+                 see the daemon log",
                 args.socket.display(),
                 args.timeout
             );
@@ -255,6 +278,37 @@ mod tests {
             ..DrainStats::default()
         };
         assert!(summarize(&stats).contains("1 FAILED CHUNKING"));
+    }
+
+    #[test]
+    fn verification_failures_fail_the_drain_exit_code() {
+        // The exit code is the action's only escalation signal: paths that
+        // failed verification or chunking were NOT cached, so an ok
+        // response carrying such counts must still exit non-zero.
+        for stats in [
+            DrainStats {
+                failed_verification: 1,
+                ..DrainStats::default()
+            },
+            DrainStats {
+                failed_chunking: 1,
+                ..DrainStats::default()
+            },
+        ] {
+            let code = report_outcome(protocol::Response::ok().with_stats(stats));
+            assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
+        }
+
+        let clean = report_outcome(protocol::Response::ok().with_stats(DrainStats::default()));
+        assert_eq!(format!("{clean:?}"), format!("{:?}", ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn missing_stats_is_not_reported_as_an_empty_drain() {
+        // Version skew: an ok response without stats must not fabricate a
+        // "pushed 0 paths" summary, but it is not a failure either.
+        let code = report_outcome(protocol::Response::ok());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     }
 
     #[tokio::test]
