@@ -45,7 +45,7 @@ You will also want a daily GC workflow on the default branch to stay within
 the cache quota; copy [`.github/workflows/gc.yml`](.github/workflows/gc.yml)
 for that.
 
-See [`action/README.md`](action/README.md) for all action inputs.
+See [Configuration](#configuration) for all action inputs.
 
 ## Comparison
 
@@ -101,62 +101,27 @@ Roots are how hestia decides what is still alive. They are unrelated to
 GitHub's own cache access scoping (who may read or write entries, see
 [Security](#security)), which applies on top.
 
-## Configuration reference
+## Configuration
 
-The action takes care of all of this; the tables below are only relevant if
-you run the CLI yourself.
+All inputs are optional; the defaults work for the quick start above.
 
-### `hestia serve` — per-job daemon
-
-| Flag | Default | Description |
+| Input | Default | Description |
 |---|---|---|
-| `--socket <PATH>` | `/tmp/hestia/hook.sock` | Unix socket for the post-build-hook listener. |
-| `--listen <ADDR>` | `127.0.0.1:37515` | Substituter HTTP address. |
-| `--idle-exit <SECONDS>` | — | Drain and exit after this much inactivity (fallback for setups without post steps). |
-| `--branch <NAME>` | `$GITHUB_REF_NAME`, else `local` | Branch part of the manifest root key. |
-| `--system <SYSTEM>` | detected | Nix system part of the root key (e.g. `x86_64-linux`). |
-| `--upstream-cache-filter` | off | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
-| `--upstream-cache-key-name <KEY_NAME>` | `cache.nixos.org-1` | Key names treated as upstream caches by the filter. Repeatable. |
-| `--no-closure` | off | Cache built paths only, without their runtime closure. |
-| `--db-path <PATH>` | `/nix/var/nix/db/db.sqlite` | Nix store database to read path metadata from. |
+| `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
+| `version` | latest release | Release tag to download (e.g. `v0.1.0-alpha.10`). The download is verified against GitHub's build attestations. |
+| `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
+| `listen` | `127.0.0.1:37515` | Substituter listen address. |
+| `socket` | `/tmp/hestia/hook.sock` | Post-build-hook unix socket path. |
+| `drain-timeout` | `300` | Seconds the post-job step waits for the final upload. |
+| `upstream-cache-filter` | `false` | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
+| `upstream-cache-key-names` | `cache.nixos.org-1` | Space-separated key names treated as upstream caches by the filter. |
+| `no-closure` | `false` | Cache built paths only, without their runtime closure. |
 
-### `hestia hook` — post-build-hook client
+The GC workflow takes one input: `dry-run` (plan only, delete nothing); see
+[`.github/workflows/gc.yml`](.github/workflows/gc.yml).
 
-| Flag | Default | Description |
-|---|---|---|
-| `--socket <PATH>` | `/tmp/hestia/hook.sock` | Daemon socket. |
-| `[PATH]...` | `$OUT_PATHS` | Store paths to register. |
-
-Always exits 0 (a failing post-build-hook would fail the build).
-
-### `hestia drain` — upload + commit
-
-| Flag | Default | Description |
-|---|---|---|
-| `--socket <PATH>` | `/tmp/hestia/hook.sock` | Daemon socket. |
-| `--timeout <SECONDS>` | `300` | Maximum time to wait for the upload. |
-
-### `hestia gc` — garbage collection (cron, default branch)
-
-| Flag | Default | Description |
-|---|---|---|
-| `--dry-run` | off | Plan only; delete nothing. |
-| `--grace <DAYS>` | `3` | Unreachable paths are kept this long. |
-| `--push-ttl <DAYS>` | `14` | Recently pushed paths are kept, reachable or not. |
-| `--root-ttl <DAYS>` | `14` | Roots (branch+system pins) expire after this. |
-| `--touch-age <DAYS>` | `4` | Idle packs get an LRU touch after this. |
-
-### Environment variables
-
-| Variable | Used by | Description |
-|---|---|---|
-| `ACTIONS_RUNTIME_TOKEN` | serve, gc | GHA cache API token. Only visible to JS actions; the hestia action exports it. |
-| `ACTIONS_RESULTS_URL` | serve, gc | GHA cache API base URL. Exported by the action. |
-| `GITHUB_TOKEN` | gc | GitHub REST API token (`actions: write`) for listing/deleting cache entries. |
-| `GITHUB_REPOSITORY` | gc | `owner/repo`, set automatically in workflows. |
-| `GITHUB_API_URL` | gc | REST API base URL (override for GHES). |
-| `GITHUB_REF_NAME` | serve | Default for `--branch`. |
-| `OUT_PATHS` | hook | Set by Nix when invoking the post-build-hook. |
+Running the `hestia` binary yourself instead of using the action? See the
+[CLI reference](docs/cli.md).
 
 ## Security
 
