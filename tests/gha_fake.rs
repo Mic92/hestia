@@ -436,6 +436,46 @@ async fn download_lookup_only_consults_restore_keys() {
 }
 
 #[tokio::test]
+async fn degraded_ok_true_responses_are_rejected_not_forwarded_as_empty_urls() {
+    // A degraded backend (proxy, GHES) can answer 200 {"ok": true} with the
+    // URL fields missing; every response field is #[serde(default)], so
+    // deserialization cannot catch it. The client must reject such bodies
+    // at the protocol boundary instead of handing empty URLs downstream
+    // (where they fail as misleading key-parse or URL-builder errors).
+    use axum::routing::post;
+    let router = axum::Router::new().route(
+        "/twirp/github.actions.results.api.v1.CacheService/{method}",
+        post(|| async { axum::Json(serde_json::json!({ "ok": true })) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let http = reqwest::Client::new();
+    let twirp = hestia::gha::twirp::TwirpClient::new(http.clone(), &base_url, "token");
+
+    let error = twirp.get_download_url("m#", &["m#"]).await.unwrap_err();
+    let Error::InvalidResponse(msg) = &error else {
+        panic!("expected InvalidResponse, got {error:?}");
+    };
+    assert!(
+        msg.contains("GetCacheEntryDownloadURL"),
+        "error must name the RPC: {msg}"
+    );
+
+    let error = twirp.create_cache_entry("pack-x").await.unwrap_err();
+    let Error::InvalidResponse(msg) = &error else {
+        panic!("expected InvalidResponse, got {error:?}");
+    };
+    assert!(
+        msg.contains("CreateCacheEntry"),
+        "error must name the RPC: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn version_salt_isolates_the_cache_namespace() {
     // A salted client must see none of the entries an unsalted client
     // wrote, and vice versa.

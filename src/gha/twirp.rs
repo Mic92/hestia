@@ -234,9 +234,19 @@ impl TwirpClient {
             .call::<_, CreateCacheEntryResponse>("CreateCacheEntry", &request)
             .await
         {
-            Ok(response) if response.ok => Ok(Reservation::Created {
-                upload_url: response.signed_upload_url,
-            }),
+            // ok=true with no upload URL is a protocol violation; forwarding
+            // the empty URL would only fail later as an opaque builder error.
+            Ok(response) if response.ok => {
+                if response.signed_upload_url.is_empty() {
+                    return Err(Error::InvalidResponse(format!(
+                        "CreateCacheEntry for {key} returned ok=true with an empty \
+                         signed_upload_url"
+                    )));
+                }
+                Ok(Reservation::Created {
+                    upload_url: response.signed_upload_url,
+                })
+            }
             // Some backends signal "exists" with ok=false instead of a Twirp
             // error; treat both the same.
             Ok(_) => Ok(Reservation::AlreadyExists),
@@ -316,10 +326,20 @@ impl TwirpClient {
             .call::<_, GetCacheEntryDownloadUrlResponse>("GetCacheEntryDownloadURL", &request)
             .await
         {
-            Ok(response) if response.ok => Ok(DownloadUrl::Hit {
-                url: response.signed_download_url,
-                matched_key: response.matched_key,
-            }),
+            // ok=true with empty fields is a protocol violation; forwarding
+            // it would surface later as a misleading key-parse or URL error.
+            Ok(response) if response.ok => {
+                if response.signed_download_url.is_empty() || response.matched_key.is_empty() {
+                    return Err(Error::InvalidResponse(format!(
+                        "GetCacheEntryDownloadURL for {key} returned ok=true with an empty \
+                         signed_download_url or matched_key"
+                    )));
+                }
+                Ok(DownloadUrl::Hit {
+                    url: response.signed_download_url,
+                    matched_key: response.matched_key,
+                })
+            }
             Ok(_) => Ok(DownloadUrl::Miss),
             // not_found is a miss, not an error.
             Err(Error::Twirp { code, .. }) if code == "not_found" => Ok(DownloadUrl::Miss),
