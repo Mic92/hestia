@@ -419,6 +419,15 @@ impl ChunkFetcher {
     }
 }
 
+/// Reloads the served manifest from the cache backend (the daemon wires
+/// this to a SaveMutable load + ManifestStore::set_version_if_newer). The
+/// NAR handler invokes it when a pack the current view points at is gone:
+/// a concurrent gc repack moves live chunks into new packs and deletes the
+/// old ones, so the committed manifest knows where the data went while the
+/// daemon's view does not.
+pub type ManifestReload =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Callback invoked on every substituter request (the daemon uses it to
 /// reset its idle-exit timer: an actively substituting Nix counts as
 /// activity). The returned guard is held for the whole request so that
@@ -433,6 +442,7 @@ pub struct Substituter {
     access_log: AccessLog,
     fetcher: ChunkFetcher,
     activity_hook: Option<ActivityHook>,
+    manifest_reload: Option<ManifestReload>,
 }
 
 impl Substituter {
@@ -449,12 +459,19 @@ impl Substituter {
             access_log,
             fetcher: ChunkFetcher::new(twirp, http),
             activity_hook: None,
+            manifest_reload: None,
         }
     }
 
     /// Install a callback invoked on every request.
     pub fn with_activity_hook(mut self, hook: ActivityHook) -> Self {
         self.activity_hook = Some(hook);
+        self
+    }
+
+    /// Install a manifest-reload callback (see [`ManifestReload`]).
+    pub fn with_manifest_reload(mut self, reload: ManifestReload) -> Self {
+        self.manifest_reload = Some(reload);
         self
     }
 
@@ -593,6 +610,8 @@ async fn nar(
         // The URL's NAR hash does not match the entry: stale URL.
         return StatusCode::NOT_FOUND.into_response();
     }
+    let mut entry = entry.clone();
+    let mut manifest_view = view;
 
     // A NAR download is an access (the GC liveness signal), just like a
     // narinfo hit. Nix caches narinfo lookups locally and may fetch a NAR
@@ -602,16 +621,34 @@ async fn nar(
 
     // Fetch all chunks (concurrency-capped inside the fetcher); any
     // failure means 404 (Nix rebuilds or falls through), never partial
-    // data.
-    let chunks = match state
-        .fetcher
-        .fetch_path_chunks(&view.manifest, path_hash, entry)
-        .await
-    {
-        Ok(chunks) => chunks,
-        Err(err) => {
-            eprintln!("hestia substituter: cannot serve NAR for {path_hash}: {err}");
-            return StatusCode::NOT_FOUND.into_response();
+    // data. A missing pack gets one retry against a freshly loaded
+    // manifest (see [`ManifestReload`]).
+    let mut reloaded = false;
+    let chunks = loop {
+        match state
+            .fetcher
+            .fetch_path_chunks(&manifest_view.manifest, path_hash, &entry)
+            .await
+        {
+            Ok(chunks) => break chunks,
+            Err(err @ (FetchError::PackUnavailable(_) | FetchError::UnknownChunk(_)))
+                if !reloaded && state.manifest_reload.is_some() =>
+            {
+                reloaded = true;
+                eprintln!(
+                    "hestia substituter: {err}; reloading the manifest (concurrent gc repack?)"
+                );
+                (state.manifest_reload.as_ref().expect("checked above"))().await;
+                manifest_view = state.manifest.view();
+                match manifest_view.manifest.paths.get(&path_hash) {
+                    Some(fresh) if fresh.nar_hash == nar_hash => entry = fresh.clone(),
+                    _ => return StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+            Err(err) => {
+                eprintln!("hestia substituter: cannot serve NAR for {path_hash}: {err}");
+                return StatusCode::NOT_FOUND.into_response();
+            }
         }
     };
 

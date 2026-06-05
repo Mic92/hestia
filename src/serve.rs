@@ -412,6 +412,28 @@ impl Daemon {
     }
 }
 
+/// Load the newest committed manifest and publish it into the served
+/// store if it is newer than the current view. A drain may have published
+/// a newer manifest while the load was in flight (or the load may return a
+/// stale version: lookups are eventually consistent); that version must
+/// win. Recording the version makes drains start their reservations above
+/// it even when cache lookups lag.
+async fn load_published_manifest(
+    twirp: &TwirpClient,
+    http: &reqwest::Client,
+    manifest_store: &ManifestStore,
+) {
+    let save = crate::gha::savemutable::SaveMutable::new(twirp, http, MANIFEST_PREFIX);
+    match save.load().await {
+        Ok(Some(entry)) => manifest_store
+            .set_version_if_newer(pipeline::decode_manifest_or_empty(&entry.data), entry.index),
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("hestia serve: cannot load the manifest, substituting nothing: {err}");
+        }
+    }
+}
+
 /// Accept errors that do not mean the listener is dead: a queued client
 /// that disconnected before being accepted, or momentary fd/buffer
 /// exhaustion. Treating these as fatal would kill caching for the rest of
@@ -576,7 +598,20 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         twirp.clone(),
         http.clone(),
     )
-        .with_activity_hook(daemon.activity_hook());
+    .with_activity_hook(daemon.activity_hook())
+    .with_manifest_reload({
+        let twirp = twirp.clone();
+        let http = http.clone();
+        let manifest_store = manifest_store.clone();
+        Arc::new(move || {
+            let twirp = twirp.clone();
+            let http = http.clone();
+            let manifest_store = manifest_store.clone();
+            Box::pin(async move {
+                load_published_manifest(&twirp, &http, &manifest_store).await;
+            })
+        })
+    });
     let substituter_task = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, substituter.into_router()).await {
             eprintln!("hestia serve: substituter server failed: {err}");
@@ -594,23 +629,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         let http = http.clone();
         let manifest_store = manifest_store.clone();
         tokio::spawn(async move {
-            let save = crate::gha::savemutable::SaveMutable::new(&twirp, &http, MANIFEST_PREFIX);
-            match save.load().await {
-                // Recording the version makes drains start their
-                // reservations above it even when cache lookups lag. A
-                // drain may already have published a newer manifest while
-                // this load was in flight; that version must win.
-                Ok(Some(entry)) => manifest_store.set_version_if_newer(
-                    pipeline::decode_manifest_or_empty(&entry.data),
-                    entry.index,
-                ),
-                Ok(None) => {}
-                Err(err) => {
-                    eprintln!(
-                        "hestia serve: cannot load the manifest, substituting nothing: {err}"
-                    );
-                }
-            }
+            load_published_manifest(&twirp, &http, &manifest_store).await;
         })
     };
 
