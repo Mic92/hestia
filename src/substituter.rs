@@ -233,13 +233,11 @@ impl ChunkFetcher {
     }
 
     fn path_lock(&self, path: PathHash) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(
-            self.path_locks
-                .lock()
-                .expect("path lock map poisoned")
-                .entry(path)
-                .or_default(),
-        )
+        let mut locks = self.path_locks.lock().expect("path lock map poisoned");
+        // Drop locks no request holds anymore: without pruning the map
+        // grows by one entry per distinct path for the process lifetime.
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        Arc::clone(locks.entry(path).or_default())
     }
 
     /// Get a signed download URL for a pack, reusing a cached one if it is
@@ -256,10 +254,13 @@ impl ChunkFetcher {
         let key = pack_cache_key(&pack);
         match self.twirp.get_download_url(&key, &[]).await? {
             DownloadUrl::Hit { url, .. } => {
-                self.url_cache
-                    .lock()
-                    .expect("url cache poisoned")
-                    .insert(pack, (url.clone(), Instant::now()));
+                let mut cache = self.url_cache.lock().expect("url cache poisoned");
+                // Expired entries are only ever bypassed, never overwritten
+                // unless the same pack is fetched again — prune them here so
+                // URLs of packs GC has repacked away do not accumulate for
+                // the process lifetime.
+                cache.retain(|_, (_, issued)| issued.elapsed() < PACK_URL_TTL);
+                cache.insert(pack, (url.clone(), Instant::now()));
                 Ok(url)
             }
             DownloadUrl::Miss => Err(FetchError::PackUnavailable(pack)),
@@ -701,6 +702,25 @@ mod tests {
             Some(&test_path_hash(1))
         );
         assert_eq!(view.by_nar_hash.get(&Hash32::digest([99])), None);
+    }
+
+    #[test]
+    fn unused_path_locks_are_pruned() {
+        let fetcher = ChunkFetcher::new(
+            TwirpClient::new(reqwest::Client::new(), "http://unused", "token"),
+            reqwest::Client::new(),
+        );
+        let held = fetcher.path_lock(test_path_hash(1));
+        drop(fetcher.path_lock(test_path_hash(2)));
+        // The next call prunes everything no request holds.
+        let _other = fetcher.path_lock(test_path_hash(3));
+        let locks = fetcher.path_locks.lock().unwrap();
+        assert!(locks.contains_key(&test_path_hash(1)), "held lock kept");
+        assert!(
+            !locks.contains_key(&test_path_hash(2)),
+            "released lock pruned"
+        );
+        drop(held);
     }
 
     #[test]
