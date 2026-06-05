@@ -296,12 +296,16 @@ function warnIfHookCannotFire() {
   if (show.status !== 0) {
     return; // cannot determine; stay quiet
   }
-  const trusted = show.stdout.trim().split(/\s+/);
+  const trusted = show.stdout.trim().split(/\s+/).filter(Boolean);
+  if (trusted.some((entry) => entry.startsWith('@'))) {
+    return; // trust via group membership is possible; avoid a false alarm
+  }
   const user = os.userInfo().username;
   if (!trusted.includes(user) && !trusted.includes('*')) {
     console.log(
       `::warning::hestia-cache: ${user} is not in nix trusted-users; ` +
-        'the post-build-hook cannot fire and built paths will not be cached'
+        'nix will ignore both the hestia substituter and the post-build-hook ' +
+        '(nothing will be restored from or saved to the cache)'
     );
   }
 }
