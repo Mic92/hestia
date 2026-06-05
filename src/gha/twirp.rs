@@ -275,9 +275,11 @@ impl TwirpClient {
 
     /// PUT `data` to a reserved entry's upload URL, then finalize it.
     ///
-    /// If the SAS URL expires mid-upload, the key is re-reserved once for
-    /// a fresh URL. An `AlreadyExists` answer means no fresh URL is coming
-    /// and the upload fails.
+    /// If the SAS URL expires mid-upload, the upload fails: the v2 API has
+    /// no RPC to re-derive an upload URL for an already-reserved key (the
+    /// caller by construction holds the reservation, so re-reserving always
+    /// answers `AlreadyExists`), and the key is left reserved-but-
+    /// unfinalized. Transient failures are still retried by the blob layer.
     pub async fn upload_and_finalize(
         &self,
         http: &reqwest::Client,
@@ -287,12 +289,9 @@ impl TwirpClient {
     ) -> Result<(), Error> {
         let size = data.len() as u64;
         blob::put_with_refresh(http, &upload_url, data, async move || {
-            match self.create_cache_entry(key).await? {
-                Reservation::Created { upload_url } => Ok(upload_url),
-                Reservation::AlreadyExists => Err(Error::InvalidResponse(format!(
-                    "upload URL for {key:?} expired and cannot be refreshed"
-                ))),
-            }
+            Err(Error::InvalidResponse(format!(
+                "upload URL for {key:?} expired and cannot be refreshed"
+            )))
         })
         .await?;
         self.finalize_upload(key, size).await?;
