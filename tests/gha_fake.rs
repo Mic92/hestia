@@ -289,6 +289,36 @@ async fn savemutable_skips_stale_reservation() {
 }
 
 #[tokio::test]
+async fn savemutable_recovers_from_many_consecutive_dead_reservations() {
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let twirp = fake.twirp(&http);
+
+    // Three writers crashed in a row at the frontier: m#1..m#3 are all
+    // reserved but never finalized (e.g. a mass workflow cancellation).
+    for index in 1..=3 {
+        let Reservation::Created { .. } = twirp
+            .create_cache_entry(&format!("m#{index}"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected reservation for m#{index}");
+        };
+    }
+
+    // max_attempts is exactly stale_skip_after x dead reservations (the
+    // production ratio: 60 = 3 x 20). The give-up check must not fire on
+    // the attempt that performs the last skip, otherwise three dead
+    // reservations permanently wedge every save and the cache never heals.
+    let save = SaveMutable::new(&twirp, &http, "m").with_retry(Duration::from_millis(1), 6, 2);
+    let index = save.save(|_| Ok(b"recovered".to_vec())).await.unwrap();
+    assert_eq!(index, 4, "writer must skip all three dead indexes");
+
+    let entry = save.load().await.unwrap().expect("entry exists");
+    assert_eq!(entry.data.as_ref(), b"recovered");
+}
+
+#[tokio::test]
 async fn savemutable_conflict_gives_up_eventually() {
     let fake = FakeGha::start().await;
     let http = reqwest::Client::new();
