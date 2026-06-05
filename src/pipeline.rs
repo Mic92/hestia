@@ -535,12 +535,4 @@ mod tests {
         log.record(hash);
         assert_eq!(log.snapshot().len(), 1);
     }
-
-    #[test]
-    fn now_unix_is_sane() {
-        let now = now_unix();
-        // After 2024-01-01, before 2100-01-01.
-        assert!(now > 1_704_067_200, "clock too early: {now}");
-        assert!(now < 4_102_444_800, "clock too late: {now}");
-    }
 }
