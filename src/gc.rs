@@ -31,6 +31,7 @@ use crate::chunker::{
     self, PackBuilder, coalesce_adjacent, extract_chunk, flatten_tree, pack_cache_key,
 };
 use crate::cli::GcArgs;
+use crate::drain::human_bytes;
 use crate::gha::rest::{CacheEntry, RestClient};
 use crate::gha::savemutable::SaveMutable;
 use crate::gha::twirp::{DownloadUrl, TwirpClient};
@@ -210,7 +211,7 @@ impl GcPlan {
         // Repacks copy compressed frames verbatim, so upload == download.
         format!(
             "evicted {} pack(s); heal {} path(s); drop {} root(s) + {} path(s); \
-             repack {} job(s) ({} chunk(s), {} B down, {} B up); \
+             repack {} job(s) ({} chunk(s), {} copied); \
              touch {} pack(s); delete {} pack(s) + {} orphan(s)",
             self.evicted_packs.len(),
             self.heal_paths.len(),
@@ -221,8 +222,7 @@ impl GcPlan {
                 .iter()
                 .map(|job| job.copies.len())
                 .sum::<usize>(),
-            self.download_bytes(),
-            self.download_bytes(),
+            human_bytes(self.download_bytes()),
             self.touch_packs.len(),
             self.delete_packs.len(),
             self.orphan_keys.len(),
@@ -639,12 +639,12 @@ pub struct GcReport {
 impl GcReport {
     pub fn summary(&self) -> String {
         format!(
-            "uploaded {} pack(s) ({} B down, {} B up); touched {} pack(s); \
+            "uploaded {} pack(s) ({} down, {} up); touched {} pack(s); \
              deleted {} pack(s), {} orphan(s), {} old manifest version(s); \
              manifest version: {}",
             self.packs_uploaded,
-            self.bytes_downloaded,
-            self.bytes_uploaded,
+            human_bytes(self.bytes_downloaded),
+            human_bytes(self.bytes_uploaded),
             self.packs_touched,
             self.packs_deleted,
             self.orphans_deleted,

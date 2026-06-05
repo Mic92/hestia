@@ -22,7 +22,7 @@ fn count(n: usize, noun: &str) -> String {
 }
 
 /// `512 B`, `1.5 KiB`, `64.6 MiB`, `2.1 GiB`.
-fn human_bytes(bytes: u64) -> String {
+pub fn human_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{bytes} B");
     }
