@@ -488,7 +488,7 @@ async fn drained_paths_are_substitutable_despite_lookup_lag() {
         let substituter = hestia::substituter::Substituter::new(
             store.database().store_dir().clone(),
             manifest_store.clone(),
-            access_log,
+            access_log.clone(),
             fake.twirp(&http),
             http.clone(),
         );
@@ -539,11 +539,16 @@ async fn drained_paths_are_substitutable_despite_lookup_lag() {
              (read-your-writes), regardless of lookup propagation lag"
         );
 
-        // Guarantee 2: the shutdown drain (root update from the narinfo
-        // hit) commits m#2 promptly. Without the reservation floor it
-        // would spin in the conflict loop against its own m#1 until the
-        // stale-skip window (60s in production) expired — the whole test
-        // would blow its timeout.
+        // Guarantee 2: the shutdown drain commits m#2 promptly. Without
+        // the reservation floor it would spin in the conflict loop against
+        // its own m#1 until the stale-skip window (60s in production)
+        // expired — the whole test would blow its timeout. The narinfo
+        // hit alone would be a pure root-clock refresh (skipped, no
+        // commit), so record a new accessed hash to give the shutdown
+        // drain a real root delta.
+        let extra_accessed: hestia::manifest::PathHash =
+            "86yk8b7ny30zl1wsq2vd66j9vrcgrkah".parse().unwrap();
+        access_log.record(extra_accessed);
         drop(shutdown_tx);
         let final_stats = daemon_handle.await.unwrap().expect("final drain failed");
         assert_eq!(
@@ -562,6 +567,11 @@ async fn drained_paths_are_substitutable_despite_lookup_lag() {
             "the second commit must not lose the first commit's paths"
         );
         assert!(manifest.roots[TEST_ROOT_KEY].paths.contains(&hash));
+        assert!(
+            manifest.roots[TEST_ROOT_KEY]
+                .paths
+                .contains(&extra_accessed)
+        );
     };
     tokio::time::timeout(Duration::from_secs(120), test)
         .await

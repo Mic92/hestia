@@ -17,7 +17,7 @@ pub use harmonia_store_path::{StorePath, StorePathHash};
 
 /// Window inside which two root updates are considered concurrent and get
 /// unioned instead of newest-wins (10 minutes).
-const ROOT_UNION_WINDOW_SECS: u64 = 600;
+pub(crate) const ROOT_UNION_WINDOW_SECS: u64 = 600;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

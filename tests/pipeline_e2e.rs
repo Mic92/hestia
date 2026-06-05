@@ -397,6 +397,40 @@ async fn accessed_paths_join_the_root_without_store_queries() {
 }
 
 #[tokio::test]
+async fn redundant_root_refresh_does_not_commit() {
+    // The SIGTERM final drain re-runs with the same access-log snapshot a
+    // previous drain already committed. When nothing changed but the
+    // root's `updated` clock, no new manifest version must be burned.
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let ctx = context(&fake, &http, StoreDatabase::new("/nonexistent/db.sqlite"));
+
+    let accessed_hash: PathHash = "76yk8b7ny30zl1wsq2vd66j9vrcgrkah".parse().unwrap();
+    let accessed = BTreeSet::from([accessed_hash]);
+
+    let now = now_unix();
+    let first = ctx
+        .run(BTreeSet::new(), accessed.clone(), now)
+        .await
+        .expect("first drain failed");
+    assert_eq!(first.manifest_version, 1);
+
+    // Same snapshot a few seconds later: pure clock refresh, no commit.
+    let second = ctx
+        .run(BTreeSet::new(), accessed, now + 5)
+        .await
+        .expect("second drain failed");
+    assert_eq!(
+        second.manifest_version, 0,
+        "a drain that would only bump the root clock must not commit"
+    );
+
+    let (version, manifest) = committed_manifest(&fake, &http).await.unwrap();
+    assert_eq!(version, 1, "no second manifest version");
+    assert_eq!(manifest.roots[TEST_ROOT_KEY].updated, now);
+}
+
+#[tokio::test]
 async fn identical_content_across_paths_shares_chunks() {
     // Chunk-level dedup across store paths: two different paths with the
     // same blob content must not store the blob twice.

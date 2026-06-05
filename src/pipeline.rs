@@ -456,6 +456,32 @@ impl PipelineContext {
             },
         );
 
+        // Skip commits that would only refresh the root's `updated` clock:
+        // the access log is never cleared and the SIGTERM final drain runs
+        // unconditionally, so otherwise every job that substituted a path
+        // burns a redundant manifest version at teardown. Only skip while
+        // the committed clock is recent: it drives root-TTL liveness in GC
+        // and must still be refreshed on long-lived daemons.
+        let refresh_only = {
+            let mut probe = current.clone().merge(delta.clone());
+            match (
+                probe.roots.get_mut(&self.root_key),
+                current.roots.get(&self.root_key),
+            ) {
+                (Some(probed), Some(committed))
+                    if now.saturating_sub(committed.updated)
+                        <= crate::manifest::ROOT_UNION_WINDOW_SECS =>
+                {
+                    probed.updated = committed.updated;
+                    probe == current
+                }
+                _ => false,
+            }
+        };
+        if refresh_only {
+            return Ok(stats);
+        }
+
         // The merge closure keeps the manifest it encoded so the committed
         // version can be published without re-loading it from the cache.
         let commit_started = std::time::Instant::now();
