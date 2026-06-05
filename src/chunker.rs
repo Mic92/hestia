@@ -461,11 +461,13 @@ pub async fn chunk_path(path: impl Into<PathBuf>) -> Result<ChunkedPath, Error> 
 }
 
 /// NAR hash and size of a path, computed by streaming harmonia's
-/// [`NarByteStream`] (the exact code path that will serve NARs in Phase 4)
-/// into SHA-256.
+/// [`NarByteStream`] (an independent walk of the on-disk path) into
+/// SHA-256.
 ///
-/// Using the same serializer for hashing and for serving is what guarantees
-/// hashes match by construction.
+/// Test-only oracle: gives tests a hash derived without going through the
+/// chunk pipeline to compare against. The production by-construction
+/// guarantee lives in [`nar_hash_from_chunks`] / [`nar_from_chunks`],
+/// which share NAR event synthesis with the serving path.
 pub async fn nar_hash_and_size(path: impl Into<PathBuf>) -> Result<(Hash32, u64), Error> {
     let mut stream = NarByteStream::new(path.into());
     let mut context = harmonia_utils_hash::Context::new(harmonia_utils_hash::Algorithm::SHA256);
