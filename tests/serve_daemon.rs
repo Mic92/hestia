@@ -537,6 +537,78 @@ async fn substituter_serves_paths_pushed_by_daemon_drains() {
         .expect("test timed out: deadlock or hung server");
 }
 
+#[tokio::test]
+async fn serve_becomes_ready_while_cache_api_stalls() {
+    // A stalled GHA cache API at startup must not block the daemon's
+    // listeners: the action polls /nix-cache-info for only 30s and then
+    // hard-fails the job, even though cache unavailability is designed to
+    // degrade to "substitute nothing". The manifest load must therefore
+    // happen concurrently with (not before) binding the listeners.
+    let test = async {
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        // The store database only exists once something was added.
+        store.add_fixture("stall-ready", 151);
+
+        // A cache API that accepts connections but never responds.
+        let stall = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stall_addr = stall.local_addr().unwrap();
+        let stall_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((stream, _)) = stall.accept().await else {
+                    return;
+                };
+                held.push(stream);
+            }
+        });
+
+        // A free port for the substituter (bind-and-release).
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let socket = store_socket_path(&store);
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hestia"))
+            .args(["serve", "--listen", &listen, "--socket"])
+            .arg(&socket)
+            .arg("--db-path")
+            .arg(store.db_path())
+            .env("ACTIONS_RESULTS_URL", format!("http://{stall_addr}"))
+            .env("ACTIONS_RUNTIME_TOKEN", "test-token")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning hestia serve failed");
+
+        // The substituter must answer readiness probes well within the
+        // action's 30s budget despite the stalled manifest load.
+        let http = reqwest::Client::new();
+        let url = format!("http://{listen}/nix-cache-info");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(response) = http.get(&url).send().await
+                && response.status() == 200
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            ready,
+            "substituter must become ready while the cache API stalls"
+        );
+
+        child.kill().await.expect("killing hestia serve failed");
+        stall_task.abort();
+    };
+    tokio::time::timeout(Duration::from_secs(60), test)
+        .await
+        .expect("test timed out");
+}
+
 /// Socket path inside the scratch store's tempdir (cleaned up with it).
 fn store_socket_path(store: &ScratchStore) -> PathBuf {
     store.db_path().parent().unwrap().join("hestia-hook.sock")

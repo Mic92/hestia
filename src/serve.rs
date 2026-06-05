@@ -14,7 +14,7 @@
 //! Lifecycle:
 //!
 //! ```text
-//! load manifest -> bind hook socket + substituter listener
+//! bind hook socket + substituter listener (manifest loads concurrently)
 //!   add     -> buffer paths in memory
 //!   drain   -> run the write pipeline over buffered + accessed paths
 //!              -> refresh the served manifest
@@ -370,18 +370,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         publish: None,
     };
 
-    // Load the manifest committed by previous runs so the substituter can
-    // serve those paths from the start. No manifest yet (first run) or a
-    // load failure both mean "serve nothing until the first drain".
     let manifest_store = ManifestStore::new();
-    match pipeline.load_manifest_versioned().await {
-        // Recording the version makes drains start their reservations
-        // above it even when cache lookups lag.
-        Ok((version, manifest)) => manifest_store.set_version(manifest, version),
-        Err(err) => {
-            eprintln!("hestia serve: cannot load the manifest, substituting nothing: {err}");
-        }
-    }
 
     let idle_exit = args.idle_exit.map(Duration::from_secs);
     let daemon = match Daemon::bind(
@@ -403,7 +392,13 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 
     // The substituter HTTP server shares the manifest and access log with
     // the daemon and runs until the daemon exits.
-    let substituter = Substituter::new(store_dir, manifest_store, daemon.access_log(), twirp, http)
+    let substituter = Substituter::new(
+        store_dir,
+        manifest_store.clone(),
+        daemon.access_log(),
+        twirp.clone(),
+        http.clone(),
+    )
         .with_activity_hook(daemon.activity_hook());
     let listener = match tokio::net::TcpListener::bind(&args.listen).await {
         Ok(listener) => listener,
@@ -420,6 +415,37 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             eprintln!("hestia serve: substituter server failed: {err}");
         }
     });
+
+    // Load the manifest committed by previous runs so the substituter can
+    // serve those paths. Loaded concurrently: the listeners are already
+    // bound, so a slow or stalled cache API cannot delay the action's
+    // readiness probe (which gives up after 30s and fails the job). No
+    // manifest yet (first run) or a load failure both mean "serve nothing
+    // until the first drain".
+    let load_task = {
+        let twirp = twirp.clone();
+        let http = http.clone();
+        let manifest_store = manifest_store.clone();
+        tokio::spawn(async move {
+            let save = crate::gha::savemutable::SaveMutable::new(&twirp, &http, MANIFEST_PREFIX);
+            match save.load().await {
+                // Recording the version makes drains start their
+                // reservations above it even when cache lookups lag. A
+                // drain may already have published a newer manifest while
+                // this load was in flight; that version must win.
+                Ok(Some(entry)) => manifest_store.set_version_if_newer(
+                    pipeline::decode_manifest_or_empty(&entry.data),
+                    entry.index,
+                ),
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!(
+                        "hestia serve: cannot load the manifest, substituting nothing: {err}"
+                    );
+                }
+            }
+        })
+    };
 
     eprintln!(
         "hestia serve: hook socket {}, substituter http://{} (root key: {}-{})",
@@ -442,6 +468,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     };
 
     let result = daemon.run(shutdown).await;
+    load_task.abort();
     substituter_task.abort();
     match result {
         Ok(stats) => {
