@@ -396,8 +396,10 @@ impl ChunkFetcher {
 
 /// Callback invoked on every substituter request (the daemon uses it to
 /// reset its idle-exit timer: an actively substituting Nix counts as
-/// activity).
-pub type ActivityHook = Arc<dyn Fn() + Send + Sync>;
+/// activity). The returned guard is held for the whole request so that
+/// long downloads count as in-flight work instead of only touching the
+/// idle clock once at request start.
+pub type ActivityHook = Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>;
 
 /// The substituter's shared state and configuration.
 pub struct Substituter {
@@ -443,15 +445,15 @@ impl Substituter {
             .with_state(state)
     }
 
-    fn touch(&self) {
-        if let Some(hook) = &self.activity_hook {
-            hook();
-        }
+    /// Mark this request as in-flight work for the daemon's idle-exit
+    /// timer; the guard must live until the response is built.
+    fn touch(&self) -> Option<Box<dyn Send>> {
+        self.activity_hook.as_ref().map(|hook| hook())
     }
 }
 
 async fn nix_cache_info(State(state): State<Arc<Substituter>>) -> Response {
-    state.touch();
+    let _activity = state.touch();
     let body = format!(
         "StoreDir: {}\nWantMassQuery: 1\nPriority: {PRIORITY}\n",
         state.store_dir
@@ -498,7 +500,7 @@ fn narinfo_for_entry(store_dir: &StoreDir, entry: &PathEntry, hash: &str) -> Vec
 }
 
 async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>) -> Response {
-    state.touch();
+    let _activity = state.touch();
     let Some(hash_str) = file.strip_suffix(".narinfo") else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -532,7 +534,7 @@ async fn nar(
     Path(file): Path<String>,
     Query(query): Query<NarQuery>,
 ) -> Response {
-    state.touch();
+    let _activity = state.touch();
     let Some(nar_hash_str) = file.strip_suffix(".nar") else {
         return StatusCode::NOT_FOUND.into_response();
     };

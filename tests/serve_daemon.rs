@@ -272,6 +272,52 @@ async fn idle_exit_drains_and_returns() {
 }
 
 #[tokio::test]
+async fn idle_exit_waits_for_in_flight_work() {
+    // The idle timer only sees the *start* of work, so an operation longer
+    // than --idle-exit (a long drain, a large NAR download holding the
+    // activity guard) must count as in-flight work; otherwise the daemon
+    // exits mid-operation and severs it.
+    let test = async {
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hook.sock");
+
+        let daemon = Daemon::bind(
+            &socket,
+            Some(Duration::from_millis(200)),
+            pipeline_context(&fake, &http, StoreDatabase::new("/nonexistent/db.sqlite")),
+            AccessLog::new(),
+            ManifestStore::new(),
+        )
+        .expect("binding daemon failed");
+
+        // Simulates a long substituter request: the hook's guard is held
+        // far past the idle timeout.
+        let hook = daemon.activity_hook();
+        let handle = tokio::spawn(daemon.run(std::future::pending()));
+        let guard = hook();
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            !handle.is_finished(),
+            "daemon must not idle-exit while work is in flight"
+        );
+
+        drop(guard);
+        let result = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("daemon must idle-exit once the work is done")
+            .expect("daemon task panicked");
+        // Final drain over an empty buffer succeeds even with a broken db.
+        assert_eq!(result.expect("final drain failed").pushed, 0);
+    };
+    tokio::time::timeout(Duration::from_secs(30), test)
+        .await
+        .expect("test timed out");
+}
+
+#[tokio::test]
 async fn failed_drain_keeps_paths_buffered_for_retry() {
     // A drain that cannot reach the store database must not lose the
     // buffered paths: they stay queued for a later retry.

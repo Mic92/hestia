@@ -71,12 +71,49 @@ struct DaemonState {
     /// Serializes drains: concurrent drain requests run one at a time.
     drain_lock: tokio::sync::Mutex<()>,
     /// Last time anything happened (for idle-exit).
-    last_activity: Mutex<Instant>,
+    last_activity: Arc<Mutex<Instant>>,
+    /// Number of operations currently in progress (drains, substituter
+    /// requests). Idle-exit only measures time since the *start* of work,
+    /// so without this count any operation longer than the idle timeout
+    /// (a long drain, a large NAR fetch) would trip the timer mid-flight
+    /// and get severed by the shutdown.
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Keeps the daemon alive while held: counts as in-flight work for the
+/// idle-exit timer and restarts the idle clock when dropped.
+pub struct WorkGuard {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    last_activity: Arc<Mutex<Instant>>,
+}
+
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        // Touch on completion: the idle window starts after the work
+        // finished, not when it began.
+        *self.last_activity.lock().expect("activity lock poisoned") = Instant::now();
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl DaemonState {
     fn touch(&self) {
         *self.last_activity.lock().expect("activity lock poisoned") = Instant::now();
+    }
+
+    fn begin_work(&self) -> WorkGuard {
+        self.touch();
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        WorkGuard {
+            in_flight: Arc::clone(&self.in_flight),
+            last_activity: Arc::clone(&self.last_activity),
+        }
+    }
+
+    fn has_in_flight(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 
     fn idle_for(&self) -> Duration {
@@ -95,8 +132,8 @@ impl DaemonState {
     /// On failure the paths go back into the buffer so a later drain (or
     /// the final drain at shutdown) can retry them.
     async fn drain(&self) -> Result<DrainStats, pipeline::Error> {
+        let _work = self.begin_work();
         let _guard = self.drain_lock.lock().await;
-        self.touch();
 
         let paths = std::mem::take(&mut *self.buffered.lock().expect("buffer lock poisoned"));
         let accessed = self.access_log.snapshot();
@@ -191,7 +228,8 @@ impl Daemon {
                 access_log,
                 pipeline,
                 drain_lock: tokio::sync::Mutex::new(()),
-                last_activity: Mutex::new(Instant::now()),
+                last_activity: Arc::new(Mutex::new(Instant::now())),
+                in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }),
             listener,
             idle_exit,
@@ -208,7 +246,7 @@ impl Daemon {
     /// actively substituting must not be cut off).
     pub fn activity_hook(&self) -> crate::substituter::ActivityHook {
         let state = Arc::clone(&self.state);
-        Arc::new(move || state.touch())
+        Arc::new(move || Box::new(state.begin_work()))
     }
 
     /// Serve until `shutdown` resolves or the idle timeout expires, then
@@ -258,7 +296,9 @@ impl Daemon {
                 None => std::future::pending::<()>().await,
                 Some(timeout) => loop {
                     tokio::time::sleep(IDLE_CHECK_INTERVAL.min(timeout)).await;
-                    if idle_state.idle_for() >= timeout {
+                    // In-flight work (a drain, an active NAR download)
+                    // counts as activity: exiting now would sever it.
+                    if !idle_state.has_in_flight() && idle_state.idle_for() >= timeout {
                         break;
                     }
                 },
