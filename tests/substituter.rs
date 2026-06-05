@@ -265,8 +265,16 @@ async fn narinfo_miss_is_404() {
         // Misses are not liveness signals.
         assert!(substituter.access_log.snapshot().is_empty());
 
-        // Malformed requests are 404 too (never 500).
-        for path in ["zzz.narinfo", "x", "nar/zzz.nar", "nar/x"] {
+        // Malformed requests are 404 too (never 400/500) — including a
+        // query string the NarQuery extractor cannot deserialize: every
+        // NAR failure must let Nix fall through to the next substituter.
+        for path in [
+            "zzz.narinfo",
+            "x",
+            "nar/zzz.nar",
+            "nar/x",
+            "nar/zzz.nar?hash=a&hash=b",
+        ] {
             let response = substituter.get(&http, path).await;
             assert_eq!(response.status(), 404, "GET /{path}");
         }

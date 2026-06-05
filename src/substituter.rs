@@ -551,7 +551,10 @@ struct NarQuery {
 async fn nar(
     State(state): State<Arc<Substituter>>,
     Path(file): Path<String>,
-    Query(query): Query<NarQuery>,
+    // Result: an unparsable query string must yield the same 404 as every
+    // other NAR failure (the module contract Nix relies on to fall through
+    // to the next substituter), not axum's 400 extractor rejection.
+    query: Result<Query<NarQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let _activity = state.touch();
     let Some(nar_hash_str) = file.strip_suffix(".nar") else {
@@ -565,6 +568,10 @@ async fn nar(
 
     // Resolve the path entry: by ?hash= if present, otherwise via the
     // NAR-hash index.
+    let query = match query {
+        Ok(Query(query)) => query,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
     let path_hash = match &query.hash {
         Some(hash) => match hash.parse::<PathHash>() {
             Ok(path_hash) => path_hash,
