@@ -304,6 +304,10 @@ function startDaemon(hestiaBin, listen, socket, logFile) {
     stdio: ['ignore', log, log],
     env: process.env, // carries ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL
   });
+  // spawn failures (ENOEXEC from a wrong-arch binary, EACCES, ...) surface
+  // as an async 'error' event; without a listener Node dies with an opaque
+  // uncaught exception instead of an actionable message.
+  daemon.on('error', (err) => fail(`failed to start hestia daemon: ${err}`));
   daemon.unref();
   console.log(`hestia-cache: daemon started (pid ${daemon.pid}, log ${logFile})`);
 }
