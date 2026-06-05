@@ -20,7 +20,7 @@ inputs:
   version:
     description: >
       Hestia release tag to download from GitHub releases
-      (e.g. "v0.1.0-alpha.4"), or "latest" to auto-resolve the newest
+      (e.g. "v0.1.0-beta.1"), or "latest" to auto-resolve the newest
       release.  The downloaded binary is verified against GitHub's build
       provenance attestations before it runs.
     required: false

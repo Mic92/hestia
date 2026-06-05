@@ -1,7 +1,8 @@
 # hestia-cache action
 
-> ⚠️ **Alpha software**: APIs, cache format, and behavior may change without
-> notice. Not yet recommended for production CI.
+> ⚠️ **Beta software**: the cache format and behavior are stabilizing, but
+> breaking changes are still possible before 1.0. Suitable for trying in
+> real CI; expect occasional cache resets on upgrades.
 
 This action runs [hestia](https://github.com/Mic92/hestia) inside your job,
 turning the GitHub Actions cache into a Nix binary cache.
@@ -74,7 +75,7 @@ integration tests use it.
 | Input | Default | Description |
 |---|---|---|
 | `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
-| `version` | latest release | Release tag to download (e.g. `v0.1.0-alpha.10`). The download is verified against GitHub's build attestations. |
+| `version` | latest release | Release tag to download (e.g. `v0.1.0-beta.1`). The download is verified against GitHub's build attestations. |
 | `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
 | `listen` | free port per invocation | Substituter listen address. |
 | `socket` | per-invocation temp path | Post-build-hook unix socket path. |
