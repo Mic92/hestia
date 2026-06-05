@@ -892,8 +892,12 @@ impl GcContext {
         repacks: &RepackOutput,
         now: u64,
     ) -> Result<CommitOutcome, Error> {
-        // Skip the commit when it would be a byte-identical no-op (e.g. GC
-        // of an empty or already-clean cache).
+        // Skip the commit when it would be a byte-identical no-op. Note
+        // this only fires for an empty or fully-unreachable manifest:
+        // mark_reachable bumps last_reachable on every reachable path, so
+        // any cache with a live root always commits (the fresh clocks
+        // preserve the full path_grace window for paths whose roots later
+        // expire).
         let base = self.load_manifest().await?;
         let base_plan = plan(&base, observations, now, &self.policy);
         let (transformed, deletable) = apply(base.clone(), &base_plan, repacks);
