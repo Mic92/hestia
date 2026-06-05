@@ -232,6 +232,17 @@ function writeHookShim(installDir, hestiaBin, socket) {
  * in trusted-users.
  */
 function configureNix(installDir, listen, hookShim) {
+  // nix has a single post-build-hook slot and our conf wins (applied last,
+  // see below): warn instead of silently disabling a pre-existing hook.
+  const show = spawnSync('nix', ['config', 'show', 'post-build-hook'], { encoding: 'utf8' });
+  const previousHook = show.status === 0 ? show.stdout.trim() : '';
+  if (previousHook) {
+    console.log(
+      `::warning::hestia-cache: replacing existing post-build-hook ${previousHook}; ` +
+        'it will no longer fire'
+    );
+  }
+
   const conf = path.join(installDir, 'nix.conf');
   fs.writeFileSync(
     conf,
@@ -245,7 +256,9 @@ function configureNix(installDir, listen, hookShim) {
       'narinfo-cache-negative-ttl = 0\n'
   );
 
-  // Prepend to the search path so existing user configuration stays active.
+  // Prepend to the search path: nix applies user conf files in reverse
+  // list order, so the first file wins conflicting settings -- our hook
+  // and substituter take effect even if the user configures their own.
   const home = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
   const dirs = (process.env.XDG_CONFIG_DIRS || '/etc/xdg').split(':');
   const defaults = [home, ...dirs].map((dir) => path.join(dir, 'nix', 'nix.conf')).join(':');
