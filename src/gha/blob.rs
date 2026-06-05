@@ -46,7 +46,9 @@ fn url_expired(status: u16) -> bool {
 /// fresh signed URL instead.
 pub fn is_transient(error: &Error) -> bool {
     match error {
-        Error::Http(err) => !err.is_builder(),
+        // Builder and redirect-policy failures are deterministic: retrying
+        // them only burns the whole backoff budget on the same outcome.
+        Error::Http(err) => !err.is_builder() && !err.is_redirect(),
         Error::Status { status, .. } => *status >= 500,
         _ => false,
     }

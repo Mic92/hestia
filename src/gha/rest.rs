@@ -39,6 +39,18 @@ const RATE_LIMIT_FALLBACK_WAIT: Duration = Duration::from_secs(60);
 /// Give up after this many rate-limited responses for a single request.
 const RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
 
+/// Never sleep longer than this on a server-provided Retry-After: the
+/// header is server-controlled data and must not be able to stall a GC run
+/// indefinitely.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
+
+/// Retries for transient failures (5xx, dropped connections), mirroring the
+/// data plane's policy in [`crate::gha::blob`].
+const TRANSIENT_RETRIES: u32 = 3;
+
+/// First transient-retry delay; doubles per attempt.
+const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// Build the caches collection URL for a repository.
 fn caches_url(api_url: &str, repo: &str) -> String {
     format!(
@@ -294,7 +306,10 @@ impl RestClient {
     }
 
     /// Send a request and decode the response, waiting and retrying when
-    /// GitHub rate-limits it. `mutating` requests are additionally paced.
+    /// GitHub rate-limits it and retrying transient failures (5xx, dropped
+    /// connections) with bounded backoff. `mutating` requests are
+    /// additionally paced. Every request this client sends is idempotent
+    /// (listing pages, delete-by-key), so retrying is always safe.
     ///
     /// Rate limits answer 403 or 429; a Retry-After header or a "rate
     /// limit" message distinguishes them from a real permission error.
@@ -305,18 +320,40 @@ impl RestClient {
         mutating: bool,
     ) -> Result<T, Error> {
         let mut attempts = 0;
+        let mut transient_left = TRANSIENT_RETRIES;
+        let mut transient_delay = TRANSIENT_RETRY_DELAY;
         loop {
             if mutating {
                 self.pace_mutation().await;
             }
-            let response = request
+            let result = request
                 .try_clone()
                 .expect("cache API requests have no streaming body")
                 .send()
-                .await?;
+                .await;
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => {
+                    let error = Error::Http(err);
+                    if crate::gha::blob::is_transient(&error) && transient_left > 0 {
+                        transient_left -= 1;
+                        tokio::time::sleep(transient_delay).await;
+                        transient_delay *= 2;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             let status = response.status();
             if status.is_success() {
                 return Ok(response.json().await?);
+            }
+
+            if status.is_server_error() && transient_left > 0 {
+                transient_left -= 1;
+                tokio::time::sleep(transient_delay).await;
+                transient_delay *= 2;
+                continue;
             }
 
             let retry_after = response
@@ -338,7 +375,11 @@ impl RestClient {
                     body,
                 });
             }
-            tokio::time::sleep(retry_after.unwrap_or(self.rate_limit_fallback_wait)).await;
+            let wait = retry_after
+                .unwrap_or(self.rate_limit_fallback_wait)
+                .min(MAX_RETRY_AFTER);
+            eprintln!("GitHub rate limit on {url}: waiting {wait:?} before retrying");
+            tokio::time::sleep(wait).await;
         }
     }
 

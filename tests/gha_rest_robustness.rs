@@ -268,6 +268,78 @@ async fn start_rate_limited_server(
     (start_server(router).await, state)
 }
 
+/// A flaky endpoint: the first `failures` requests get a 502, then it
+/// serves normally (the intermittent 5xx GitHub's results service throws
+/// under load).
+struct FlakyServer {
+    failures: usize,
+    requests: usize,
+}
+
+async fn flaky_list_handler(State(state): State<Arc<Mutex<FlakyServer>>>) -> Response {
+    let mut inner = state.lock().unwrap();
+    inner.requests += 1;
+    if inner.requests <= inner.failures {
+        return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
+    }
+    single_entry_listing("pack-flaky").into_response()
+}
+
+#[tokio::test]
+async fn list_retries_transient_server_errors() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let state = Arc::new(Mutex::new(FlakyServer {
+            failures: 2,
+            requests: 0,
+        }));
+        let router = Router::new()
+            .route(
+                "/repos/{owner}/{repo}/actions/caches",
+                get(flaky_list_handler),
+            )
+            .with_state(state.clone());
+        let url = start_server(router).await;
+        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
+            .with_pacing(Duration::ZERO, Duration::from_millis(100));
+
+        // A single transient 502 during pagination must not abort the whole
+        // GC run; the data plane (blob.rs) already retries 5xx with backoff
+        // and the control plane deserves the same.
+        let listed = rest.list_caches("pack-").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(state.lock().unwrap().requests, 3);
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn persistent_server_errors_still_fail() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let state = Arc::new(Mutex::new(FlakyServer {
+            failures: usize::MAX,
+            requests: 0,
+        }));
+        let router = Router::new()
+            .route(
+                "/repos/{owner}/{repo}/actions/caches",
+                get(flaky_list_handler),
+            )
+            .with_state(state.clone());
+        let url = start_server(router).await;
+        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
+            .with_pacing(Duration::ZERO, Duration::from_millis(10));
+
+        let err = rest.list_caches("pack-").await.unwrap_err();
+        assert!(
+            err.to_string().contains("502"),
+            "error should carry the HTTP status: {err}"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
 #[tokio::test]
 async fn delete_retries_after_secondary_rate_limit() {
     tokio::time::timeout(TEST_TIMEOUT, async {
