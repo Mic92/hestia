@@ -109,6 +109,16 @@ impl Default for GcPolicy {
     }
 }
 
+/// Parse a manifest version key (`<prefix><index>`) back into its index.
+/// Only the canonical decimal form SaveMutable writes is accepted:
+/// `str::parse` alone also accepts `m#+99` and `m#007`, which would let a
+/// foreign same-prefix key inflate the newest-version computation.
+fn parse_manifest_index(prefix: &str, key: &str) -> Option<u64> {
+    let suffix = key.strip_prefix(prefix)?;
+    let index: u64 = suffix.parse().ok()?;
+    (suffix == index.to_string()).then_some(index)
+}
+
 /// Parse a `pack-<sha256 hex>` cache key back into the pack hash.
 fn parse_pack_key(key: &str) -> Option<PackHash> {
     let hex = key.strip_prefix("pack-")?;
@@ -1078,10 +1088,7 @@ impl GcContext {
             // (possibly higher) indices into `newest` would make GC delete
             // this namespace's live manifest head.
             .filter(|entry| entry.version == self.twirp.version())
-            .filter_map(|entry| {
-                let index: u64 = entry.key.strip_prefix(&prefix)?.parse().ok()?;
-                Some((index, entry))
-            })
+            .filter_map(|entry| Some((parse_manifest_index(&prefix, &entry.key)?, entry)))
             .collect();
         let Some(newest) = indexed.iter().map(|(index, _)| *index).max() else {
             return Ok(0);
@@ -1359,6 +1366,17 @@ mod tests {
         // Get-FileHash digest in an actions/cache key) is foreign.
         assert_eq!(parse_pack_key(&format!("pack-{}", "A".repeat(64))), None);
         assert_eq!(parse_pack_key(&format!("pack-{}", "+1".repeat(32))), None);
+    }
+
+    #[test]
+    fn manifest_index_parses_only_canonical_decimal() {
+        assert_eq!(parse_manifest_index("m#", "m#0"), Some(0));
+        assert_eq!(parse_manifest_index("m#", "m#42"), Some(42));
+        assert_eq!(parse_manifest_index("m#", "m#+99"), None);
+        assert_eq!(parse_manifest_index("m#", "m#007"), None);
+        assert_eq!(parse_manifest_index("m#", "m#"), None);
+        assert_eq!(parse_manifest_index("m#", "m#1x"), None);
+        assert_eq!(parse_manifest_index("m#", "other#1"), None);
     }
 
     #[test]
