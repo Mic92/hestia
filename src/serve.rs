@@ -236,6 +236,12 @@ impl Daemon {
                             }
                         });
                     }
+                    Err(err) if is_transient_accept_error(&err) => {
+                        // The short sleep lets fds free up instead of
+                        // spinning.
+                        eprintln!("hestia serve: accept failed (transient), retrying: {err}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                     Err(err) => {
                         eprintln!("hestia serve: accept failed: {err}");
                         // Socket is gone; nothing left to serve.
@@ -275,6 +281,20 @@ impl Daemon {
         // the runner disappears.
         state.drain().await
     }
+}
+
+/// Accept errors that do not mean the listener is dead: a queued client
+/// that disconnected before being accepted, or momentary fd/buffer
+/// exhaustion. Treating these as fatal would kill caching for the rest of
+/// the job over a single transient failure.
+fn is_transient_accept_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::ConnectionAborted {
+        return true;
+    }
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
 }
 
 /// Serve one client connection: JSON request lines, JSON response lines.
@@ -488,5 +508,29 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             eprintln!("hestia serve: final drain failed: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_accept_errors_are_classified() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(is_transient_accept_error(
+                &std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        assert!(is_transient_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionAborted
+        )));
+        // A listener that is actually gone must still end the loop.
+        assert!(!is_transient_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!is_transient_accept_error(
+            &std::io::Error::from_raw_os_error(libc::EBADF)
+        ));
     }
 }

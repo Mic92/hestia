@@ -27,6 +27,9 @@ tokio = { version = "1", features = [
   "fs",
 ] }
 
+# Accept-loop errno classification (unix sockets are unix-only anyway)
+libc = "0.2"
+
 # Serialization (manifest = CBOR + zstd)
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
