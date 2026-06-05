@@ -378,17 +378,25 @@ impl ChunkFetcher {
             let end = last.offset + u64::from(last.compressed_size);
             let data = self.read_pack_range(pack, start..end).await?;
 
-            for (hash, location) in run {
-                let from = (location.offset - start) as usize;
-                let to = from + location.compressed_size as usize;
-                if to > data.len() {
-                    return Err(FetchError::PackUnavailable(pack));
+            // Decompression + hash verification are CPU-bound: off the
+            // runtime workers, like the write pipeline's compression
+            // stages, so concurrent fetches cannot starve the hook socket.
+            let extracted = tokio::task::spawn_blocking(move || {
+                let mut extracted = Vec::with_capacity(run.len());
+                for (hash, location) in run {
+                    let from = (location.offset - start) as usize;
+                    let to = from + location.compressed_size as usize;
+                    // extract_chunk verifies the SHA-256 of the
+                    // decompressed data; corrupt or truncated cache
+                    // contents cannot pass.
+                    let chunk = extract_chunk(&data[from..to], &hash)?;
+                    extracted.push((hash, Bytes::from(chunk)));
                 }
-                // extract_chunk verifies the SHA-256 of the decompressed
-                // data; corrupt or truncated cache contents cannot pass.
-                let chunk = extract_chunk(&data[from..to], &hash)?;
-                fetched.push((hash, Bytes::from(chunk)));
-            }
+                Ok::<_, FetchError>(extracted)
+            })
+            .await
+            .expect("chunk extraction task panicked")?;
+            fetched.extend(extracted);
         }
         Ok(fetched)
     }
@@ -590,23 +598,41 @@ async fn nar(
         }
     };
 
-    let nar = match nar_from_chunks(&entry.tree, &chunks).await {
+    // NAR assembly and the full-NAR hash are CPU-bound and run as single
+    // non-yielding polls (the Vec sink never pends), so they go off the
+    // runtime workers: with up to MAX_CONCURRENT_NAR_FETCHES of them, a
+    // multi-hundred-MiB path would otherwise pin every worker thread and
+    // starve the hook socket (whose client times out and silently drops
+    // path registrations).
+    let tree = entry.tree.clone();
+    let nar_size = entry.nar_size;
+    let expected_hash = entry.nar_hash;
+    let nar = tokio::task::spawn_blocking(move || {
+        use futures_util::FutureExt as _;
+        let nar = nar_from_chunks(&tree, &chunks)
+            .now_or_never()
+            .expect("NAR synthesis into a Vec sink never pends")
+            .map_err(|err| format!("NAR synthesis failed: {err}"))?;
+        // Final integrity gate: the response must hash to exactly the NAR
+        // hash the manifest (and the narinfo we served) promised.
+        if nar.len() as u64 != nar_size || Hash32::digest(&nar) != expected_hash {
+            return Err(
+                "synthesized NAR does not match its recorded hash/size; refusing to serve \
+                 corrupt data"
+                    .to_string(),
+            );
+        }
+        Ok(nar)
+    })
+    .await
+    .expect("NAR synthesis task panicked");
+    let nar = match nar {
         Ok(nar) => nar,
         Err(err) => {
-            eprintln!("hestia substituter: NAR synthesis for {path_hash} failed: {err}");
+            eprintln!("hestia substituter: cannot serve NAR for {path_hash}: {err}");
             return StatusCode::NOT_FOUND.into_response();
         }
     };
-
-    // Final integrity gate: the response must hash to exactly the NAR hash
-    // the manifest (and the narinfo we served) promised.
-    if nar.len() as u64 != entry.nar_size || Hash32::digest(&nar) != entry.nar_hash {
-        eprintln!(
-            "hestia substituter: synthesized NAR for {path_hash} does not match its recorded \
-             hash/size; refusing to serve corrupt data"
-        );
-        return StatusCode::NOT_FOUND.into_response();
-    }
 
     // axum derives Content-Length from the sized body; because the NAR is
     // fully assembled and verified before responding, the length is always
