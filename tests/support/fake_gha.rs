@@ -13,7 +13,7 @@
 //! Test-only injection endpoints simulate the failure modes GitHub will
 //! throw at us in production:
 //!
-//! * `POST /test/evict/{key}`: LRU eviction of an entry.
+//! * `POST /test/evict?key=...`: LRU eviction of an entry.
 //! * `POST /test/expire-urls`: invalidate all previously issued signed URLs
 //!   (subsequent transfers get 403, like an expired SAS URL).
 //! * `POST /test/expire-token-after/{n}`: the next `n` Twirp calls succeed,
@@ -485,9 +485,9 @@ async fn rest_delete(State(state): State<AppState>, Query(query): Query<ListQuer
 // Test-only injection endpoints
 // ---------------------------------------------------------------------------
 
-async fn test_evict(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+async fn test_evict(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
     let mut inner = state.inner.lock().unwrap();
-    let removed = inner.remove_by_key(&key);
+    let removed = inner.remove_by_key(&query.key);
     Json(json!({ "evicted": removed.len() })).into_response()
 }
 
@@ -573,7 +573,7 @@ impl FakeGha {
                 "/repos/{owner}/{repo}/actions/caches",
                 get(rest_list).delete(rest_delete),
             )
-            .route("/test/evict/{key}", post(test_evict))
+            .route("/test/evict", post(test_evict))
             .route("/test/expire-urls", post(test_expire_urls))
             .route(
                 "/test/expire-token-after/{calls}",
@@ -630,10 +630,24 @@ impl FakeGha {
     }
 
     /// Simulate LRU eviction of `key` (entry and blob disappear).
+    ///
+    /// The key travels as a query parameter (like the real REST delete):
+    /// manifest keys contain `#`, which interpolated into a URL path would
+    /// become a never-transmitted fragment and silently evict nothing.
     pub async fn evict(&self, http: &reqwest::Client, key: &str) {
-        let url = format!("{}/test/evict/{key}", self.base_url);
-        let response = http.post(&url).send().await.expect("evict request");
+        let url = format!("{}/test/evict", self.base_url);
+        let response = http
+            .post(&url)
+            .query(&[("key", key)])
+            .send()
+            .await
+            .expect("evict request");
         assert!(response.status().is_success());
+        let body: serde_json::Value = response.json().await.expect("evict response");
+        assert!(
+            body["evicted"].as_u64().unwrap_or(0) > 0,
+            "evict({key}) removed nothing"
+        );
     }
 
     /// Invalidate all previously issued signed URLs (simulates SAS expiry).

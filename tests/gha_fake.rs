@@ -407,6 +407,16 @@ async fn eviction_makes_entry_disappear() {
         panic!("expected 404 after eviction, got {error:?}");
     };
 
+    // Manifest keys contain '#', which a naive URL interpolation would
+    // truncate into a fragment, turning the eviction into a silent no-op.
+    store_entry(&twirp, &http, "m#1", b"manifest").await;
+    fake.evict(&http, "m#1").await;
+    assert_eq!(
+        twirp.get_download_url("m#", &["m#"]).await.unwrap(),
+        DownloadUrl::Miss,
+        "manifest entry must actually be evicted"
+    );
+
     // The key can be re-uploaded after eviction (heal path).
     store_entry(&twirp, &http, "pack-evictme", b"healed").await;
     let DownloadUrl::Hit { url, .. } = twirp.get_download_url("pack-evictme", &[]).await.unwrap()
