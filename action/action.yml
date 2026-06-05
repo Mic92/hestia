@@ -32,13 +32,18 @@ inputs:
     required: false
     default: ${{ github.token }}
   listen:
-    description: Address the substituter HTTP server listens on.
+    description: >
+      Address the substituter HTTP server listens on. Defaults to 127.0.0.1
+      with a free port picked per invocation, so the action can run more
+      than once in a job without the daemons colliding.
     required: false
-    default: "127.0.0.1:37515"
+    default: ""
   socket:
-    description: Unix socket path for the post-build-hook listener.
+    description: >
+      Unix socket path for the post-build-hook listener. Defaults to a
+      per-invocation path under the runner's temp directory.
     required: false
-    default: "/tmp/hestia/hook.sock"
+    default: ""
   drain-timeout:
     description: >
       Maximum number of seconds the post-job step waits for the final upload

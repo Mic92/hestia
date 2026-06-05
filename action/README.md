@@ -67,8 +67,8 @@ themselves; hestia's own integration tests use it.
 | `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
 | `version` | latest release | Release tag to download (e.g. `v0.1.0-alpha.10`). The download is verified against GitHub's build attestations. |
 | `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
-| `listen` | `127.0.0.1:37515` | Substituter listen address. |
-| `socket` | `/tmp/hestia/hook.sock` | Post-build-hook unix socket path. |
+| `listen` | free port per invocation | Substituter listen address. |
+| `socket` | per-invocation temp path | Post-build-hook unix socket path. |
 | `drain-timeout` | `300` | Seconds the post-job step waits for the final upload. |
 | `upstream-cache-filter` | `false` | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
 | `upstream-cache-key-names` | `cache.nixos.org-1` | Space-separated key names treated as upstream caches by the filter. |

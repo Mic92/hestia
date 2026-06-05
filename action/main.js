@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const net = require('net');
 const { spawn, spawnSync } = require('child_process');
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,18 @@ function fail(message) {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Ask the kernel for a free TCP port on the loopback interface. */
+function pickFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      server.close(() => resolve(port));
+    });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Setup steps
@@ -327,11 +340,21 @@ function startDaemon(hestiaBin, listen, socket, logFile) {
   daemon.on('error', (err) => fail(`failed to start hestia daemon: ${err}`));
   daemon.unref();
   console.log(`hestia-cache: daemon started (pid ${daemon.pid}, log ${logFile})`);
+  return daemon.pid;
 }
 
 /** Poll /nix-cache-info until the substituter answers (max ~30s). */
-async function waitForReadiness(listen, logFile) {
+async function waitForReadiness(listen, logFile, pid) {
   for (let attempt = 0; attempt < 60; attempt++) {
+    // A dead daemon must fail here even if another process answers on the
+    // same address (e.g. a daemon leaked by an earlier job).
+    try {
+      process.kill(pid, 0);
+    } catch {
+      console.error('--- hestia serve log ---');
+      console.error(fs.readFileSync(logFile, 'utf8'));
+      fail(`hestia daemon (pid ${pid}) exited during startup`);
+    }
     try {
       const response = await fetch(`http://${listen}/nix-cache-info`);
       if (response.ok) {
@@ -365,8 +388,6 @@ async function main() {
     return;
   }
 
-  const listen = getInput('listen') || '127.0.0.1:37515';
-  const socket = getInput('socket') || '/tmp/hestia/hook.sock';
   // Unique per invocation: a job can run this action more than once, and a
   // shared directory would overwrite the first daemon's binary and log.
   const tempDir = process.env.RUNNER_TEMP || '/tmp';
@@ -374,11 +395,17 @@ async function main() {
   const installDir = fs.mkdtempSync(path.join(tempDir, 'hestia-cache-'));
   const logFile = path.join(installDir, 'serve.log');
 
+  // Like installDir, the defaults are unique per invocation: a fixed
+  // address/socket would make a second invocation unlink the first
+  // daemon's hook socket and die on the TCP bind conflict.
+  const listen = getInput('listen') || `127.0.0.1:${await pickFreePort()}`;
+  const socket = getInput('socket') || path.join(installDir, 'hook.sock');
+
   const hestiaBin = await installBinary(installDir);
   const hookShim = writeHookShim(installDir, hestiaBin, socket);
   configureNix(installDir, listen, hookShim);
-  startDaemon(hestiaBin, listen, socket, logFile);
-  await waitForReadiness(listen, logFile);
+  const daemonPid = startDaemon(hestiaBin, listen, socket, logFile);
+  await waitForReadiness(listen, logFile, daemonPid);
 
   // Environment variables for the user's later shell steps. When the action
   // runs more than once in a job, these point at the latest daemon.
