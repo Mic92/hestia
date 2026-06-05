@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use hestia::chunker::pack_cache_key;
 use hestia::gc::{GcContext, GcPolicy};
 use hestia::gha::savemutable::SaveMutable;
 use hestia::pipeline::{AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
@@ -237,7 +238,11 @@ async fn gc_refuses_to_act_on_a_corrupt_manifest() {
     let twirp = fake.twirp(&http);
 
     store_entry(&twirp, &http, "m#1", b"garbage manifest").await;
-    store_entry(&twirp, &http, "pack-data", b"some pack contents").await;
+    // A hestia-shaped pack key, old enough to pass the min_age guard: if GC
+    // misjudged the corrupt manifest as empty and ran its orphan sweep, this
+    // is exactly what it would delete.
+    let pack_key = pack_cache_key(&hestia::manifest::PackHash::digest(b"some pack contents"));
+    store_entry(&twirp, &http, &pack_key, b"some pack contents").await;
 
     let gc = GcContext {
         twirp: fake.twirp(&http),
@@ -247,14 +252,17 @@ async fn gc_refuses_to_act_on_a_corrupt_manifest() {
         policy: GcPolicy::default(),
     };
 
-    let result = gc.run(false, now_unix()).await;
+    // Run well past min_age so the planted pack is not shielded by the
+    // too-young-to-delete guard.
+    let gc_now = now_unix() + GcPolicy::default().min_age + 1;
+    let result = gc.run(false, gc_now).await;
     assert!(result.is_err(), "GC must fail on a corrupt manifest");
 
     // Nothing was deleted.
     let entries = fake.rest(&http).list_caches("").await.unwrap();
     let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
     assert!(keys.contains(&"m#1"), "corrupt manifest left in place");
-    assert!(keys.contains(&"pack-data"), "packs left in place");
+    assert!(keys.contains(&pack_key.as_str()), "packs left in place");
 }
 
 #[tokio::test]
