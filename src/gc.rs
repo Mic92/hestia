@@ -568,7 +568,15 @@ pub fn apply(
         }
     }
     for (pack, info) in &repacks.packs {
-        manifest.packs.entry(*pack).or_insert_with(|| info.clone());
+        // A repack output can reproduce an existing pack byte-identically
+        // (same content-addressed hash). Merge higher-tier-wins (like
+        // PackInfo::merge) so a stable-tier promotion is never lost —
+        // otherwise consolidation would re-plan the pack forever.
+        manifest
+            .packs
+            .entry(*pack)
+            .and_modify(|existing| existing.tier = existing.tier.max(info.tier))
+            .or_insert_with(|| info.clone());
     }
 
     // Prune: chunks no surviving path references, then packs no surviving
@@ -1745,6 +1753,54 @@ mod tests {
             );
         }
         output
+    }
+
+    #[test]
+    fn apply_merges_repack_output_with_higher_tier_wins() {
+        // A repack output reproducing an existing pack byte-identically
+        // carries the same pack hash. Its tier promotion must not be
+        // dropped, or the pack stays volatile and consolidation re-plans
+        // it on every run.
+        let old = NOW - 30 * SECS_PER_DAY;
+        let manifest = ManifestBuilder::new()
+            .pack(1, TIER_VOLATILE, old)
+            .chunk(1, 1, 100, 1)
+            .path(1, &[1], &[], old, NOW)
+            .root("main", &[1], NOW)
+            .build();
+
+        let gc_plan = GcPlan {
+            now: NOW,
+            ..GcPlan::default()
+        };
+        let location = manifest.chunks[&chunk_hash(1)].clone();
+        let repacks = RepackOutput {
+            packs: BTreeMap::from([(
+                pack_hash(1),
+                PackInfo {
+                    size: 100,
+                    created: NOW,
+                    tier: TIER_STABLE,
+                },
+            )]),
+            locations: BTreeMap::from([(
+                chunk_hash(1),
+                ChunkLocation {
+                    repacks_survived: location.repacks_survived + 1,
+                    ..location
+                },
+            )]),
+            replaced: BTreeSet::from([pack_hash(1)]),
+            ..RepackOutput::default()
+        };
+
+        let (committed, deletable) = apply(manifest, &gc_plan, &repacks);
+        assert_eq!(
+            committed.packs[&pack_hash(1)].tier,
+            TIER_STABLE,
+            "a same-hash repack output must promote the existing pack's tier"
+        );
+        assert!(deletable.is_empty());
     }
 
     #[test]
