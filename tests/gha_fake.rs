@@ -428,6 +428,56 @@ async fn eviction_makes_entry_disappear() {
 }
 
 #[tokio::test]
+async fn rest_list_honors_the_stable_created_at_sort_order() {
+    // RestClient::list_caches requests sort=created_at&direction=asc
+    // because GitHub's default order (last_accessed_at desc) is mutable
+    // and makes page-numbered pagination skip entries. The fake must
+    // honor those parameters, otherwise dropping them from the client
+    // would pass the whole suite while reintroducing the hazard.
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let twirp = fake.twirp(&http);
+
+    store_entry(&twirp, &http, "pack-old", b"a").await;
+    store_entry(&twirp, &http, "pack-new", b"b").await;
+
+    let url = format!("{}/repos/fake/repo/actions/caches", fake.base_url);
+    let keys_for = |query: &'static str| {
+        let http = http.clone();
+        let url = url.clone();
+        async move {
+            let body: serde_json::Value = http
+                .get(format!("{url}?{query}"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            body["actions_caches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["key"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // GitHub's default: last_accessed_at descending (newest first).
+    assert_eq!(
+        keys_for("key=pack-").await,
+        vec!["pack-new", "pack-old"],
+        "default order must be LRU-descending like the real service"
+    );
+    // The stable order the production client requests.
+    assert_eq!(
+        keys_for("key=pack-&sort=created_at&direction=asc").await,
+        vec!["pack-old", "pack-new"],
+        "created_at ascending must be honored"
+    );
+}
+
+#[tokio::test]
 async fn download_lookup_only_consults_restore_keys() {
     // Fidelity test for a production-API behavior discovered by
     // tests/gha_real.rs in CI: GetCacheEntryDownloadURL ignores the `key`

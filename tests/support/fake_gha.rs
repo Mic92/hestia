@@ -422,6 +422,10 @@ struct ListQuery {
     page: Option<u64>,
     #[serde(default)]
     per_page: Option<u64>,
+    #[serde(default)]
+    sort: Option<String>,
+    #[serde(default)]
+    direction: Option<String>,
 }
 
 fn rest_entry_json(entry: &Entry) -> serde_json::Value {
@@ -444,7 +448,16 @@ async fn rest_list(State(state): State<AppState>, Query(query): Query<ListQuery>
         .iter()
         .filter(|e| e.finalized && e.key.starts_with(&query.key))
         .collect();
-    matching.sort_by_key(|e| std::cmp::Reverse(e.last_accessed_at));
+    // The production client relies on the immutable created_at order for
+    // stable pagination; honoring the parameters here means dropping them
+    // from list_caches would fail tests instead of silently reintroducing
+    // the skip/duplicate pagination hazard.
+    match (query.sort.as_deref(), query.direction.as_deref()) {
+        (Some("created_at"), Some("asc")) => matching.sort_by_key(|e| e.created_at),
+        // GitHub's documented default: last_accessed_at descending (the
+        // mutable LRU order).
+        _ => matching.sort_by_key(|e| std::cmp::Reverse(e.last_accessed_at)),
+    }
 
     let per_page = query.per_page.unwrap_or(30).max(1) as usize;
     let page = query.page.unwrap_or(1).max(1) as usize;
