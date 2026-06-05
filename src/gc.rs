@@ -194,7 +194,7 @@ pub struct GcPlan {
     /// referenced by no manifest, old enough to be sure no in-flight push
     /// still wants them. Keys that merely share the `pack-` prefix belong
     /// to other workflows and are never touched.
-    pub orphan_keys: Vec<String>,
+    pub orphan_keys: BTreeSet<String>,
 }
 
 impl GcPlan {
@@ -481,7 +481,9 @@ pub fn plan(
     touch.sort();
     plan.touch_packs = touch.into_iter().map(|(_, _, pack)| pack).collect();
 
-    // Orphans: in GitHub but in no manifest
+    // Orphans: in GitHub but in no manifest. The REST listing repeats a
+    // key once per ref; deletion is by key, so the set collapses the
+    // duplicates.
     plan.orphan_keys = observations
         .iter()
         .filter(|observation| {
@@ -598,7 +600,7 @@ pub fn apply(
 /// orphan, no matter what the pre-commit plan thought. Without this, a GC
 /// run recovering from a crashed predecessor could commit a manifest that
 /// references a previously-orphaned pack and then delete that very pack.
-fn retained_orphans(orphan_keys: &[String], committed: &Manifest) -> Vec<String> {
+fn retained_orphans(orphan_keys: &BTreeSet<String>, committed: &Manifest) -> BTreeSet<String> {
     orphan_keys
         .iter()
         .filter(|key| parse_pack_key(key).is_none_or(|pack| !committed.packs.contains_key(&pack)))
@@ -614,7 +616,7 @@ pub struct CommitOutcome {
     /// Packs no longer referenced by the committed manifest → safe to delete.
     pub deletable: Vec<PackHash>,
     /// Orphan keys re-derived against the committed manifest.
-    pub orphan_keys: Vec<String>,
+    pub orphan_keys: BTreeSet<String>,
 }
 
 /// What one full GC run did.
@@ -870,7 +872,7 @@ impl GcContext {
             });
         }
 
-        let mut committed: Option<(Vec<PackHash>, Vec<String>)> = None;
+        let mut committed: Option<(Vec<PackHash>, BTreeSet<String>)> = None;
         let version = self
             .save_mutable()
             .save(|existing| {
@@ -922,7 +924,7 @@ impl GcContext {
     /// Execute step 5 of 6: REST-delete orphaned cache keys (uploaded but
     /// never referenced by any committed manifest, e.g. by a crashed GC or
     /// push).
-    pub async fn delete_orphans(&self, keys: &[String]) -> Result<usize, Error> {
+    pub async fn delete_orphans(&self, keys: &BTreeSet<String>) -> Result<usize, Error> {
         let mut deleted = 0;
         for key in keys {
             if !self.rest.delete_by_key(key).await?.is_empty() {
@@ -1577,7 +1579,38 @@ mod tests {
         });
 
         let plan = plan(&manifest, &observations, NOW, &policy());
-        assert_eq!(plan.orphan_keys, vec![pack_cache_key(&pack_hash(9))]);
+        assert_eq!(
+            plan.orphan_keys,
+            BTreeSet::from([pack_cache_key(&pack_hash(9))])
+        );
+    }
+
+    #[test]
+    fn orphan_keys_are_deduplicated_across_refs() {
+        // The REST listing repeats a key once per ref (same pack pushed
+        // from several branches); one delete removes all of them.
+        let manifest = ManifestBuilder::new()
+            .pack(1, TIER_VOLATILE, NOW - SECS_PER_DAY)
+            .chunk(1, 1, 100, 0)
+            .path(1, &[1], &[], NOW, NOW)
+            .root("main", &[1], NOW)
+            .build();
+
+        let mut observations = observe_all(&manifest, NOW);
+        for _ in 0..3 {
+            observations.push(PackObservation {
+                key: pack_cache_key(&pack_hash(9)),
+                pack: Some(pack_hash(9)),
+                created: NOW - 2 * SECS_PER_HOUR,
+                last_accessed: NOW,
+            });
+        }
+
+        let plan = plan(&manifest, &observations, NOW, &policy());
+        assert_eq!(
+            plan.orphan_keys,
+            BTreeSet::from([pack_cache_key(&pack_hash(9))])
+        );
     }
 
     #[test]
