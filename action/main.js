@@ -156,8 +156,15 @@ async function installBinary(installDir) {
   } else {
     version = await resolveVersion(version);
     const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch] || process.arch;
-    if (process.platform !== 'linux' && process.platform !== 'darwin') {
-      fail(`unsupported platform: ${process.platform}`);
+    // Must match the release.yml build matrix; there is no x86_64-darwin
+    // asset, so Intel macs need a locally built binary.
+    const supported = ['x86_64-linux', 'aarch64-linux', 'aarch64-darwin'];
+    const system = `${arch}-${process.platform}`;
+    if (!supported.includes(system)) {
+      fail(
+        `no release binary is published for ${system}; ` +
+          "pass the 'binary' input to use a locally built hestia"
+      );
     }
     // GITHUB_ACTION_REPOSITORY points at the repo this action was loaded
     // from, so forks automatically download their own releases.
