@@ -40,6 +40,15 @@ stop() {
     echo "no recording is running (start one with: $0 start)" >&2
     exit 1
   fi
+  # Check the render tools before teardown: failing after the pid file is
+  # removed would leave the captured data unrenderable through this script.
+  local tool
+  for tool in perf inferno-collapse-perf inferno-flamegraph; do
+    if ! command -v "$tool" >/dev/null; then
+      echo "$tool not found on PATH; install it before stopping" >&2
+      exit 1
+    fi
+  done
   local pid
   pid=$(cat "$perf_pid_file")
 
