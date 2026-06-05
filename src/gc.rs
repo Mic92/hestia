@@ -109,6 +109,12 @@ fn parse_pack_key(key: &str) -> Option<PackHash> {
     if hex.len() != 64 {
         return None;
     }
+    // Hestia only emits lowercase hex. `from_str_radix` would also accept
+    // uppercase digits and a leading `+` — keys hestia never created, so
+    // they belong to other workflows and must not parse.
+    if !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
     let mut bytes = [0u8; 32];
     for (i, byte) in bytes.iter_mut().enumerate() {
         *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
@@ -1286,6 +1292,10 @@ mod tests {
         assert_eq!(parse_pack_key("pack-"), None);
         assert_eq!(parse_pack_key("m#3"), None);
         assert_eq!(parse_pack_key(&format!("pack-{}", "0".repeat(63))), None);
+        // Hestia only emits lowercase hex; an uppercase 64-hex key (e.g. a
+        // Get-FileHash digest in an actions/cache key) is foreign.
+        assert_eq!(parse_pack_key(&format!("pack-{}", "A".repeat(64))), None);
+        assert_eq!(parse_pack_key(&format!("pack-{}", "+1".repeat(32))), None);
     }
 
     #[test]
