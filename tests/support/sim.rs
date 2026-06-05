@@ -2,9 +2,11 @@
 //!
 //! GC logic does not depend on a Nix store: it operates on manifests and
 //! pack blobs. This module fabricates store paths with deterministic
-//! contents and pushes them through the *real* production code (chunker,
-//! pack builder, pack upload, SaveMutable manifest commit) against the fake
-//! GHA backend — no nix tooling required, so these tests run everywhere
+//! contents and pushes them with the real chunker, pack builder, pack
+//! upload, and SaveMutable manifest commit against the fake GHA backend.
+//! (Pack assembly is simplified versus the drain pipeline: one pack per
+//! push via PackBuilder::add, no target-size splitting.) No nix tooling
+//! required, so these tests run everywhere
 //! (including the Nix build sandbox) and a 30-day history simulates in
 //! seconds.
 //!

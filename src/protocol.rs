@@ -45,10 +45,10 @@ pub enum Request {
     Status,
 }
 
-/// What one drain accomplished. Also the daemon's status payload.
+/// What one drain accomplished.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrainStats {
-    /// Paths received from hooks since the daemon started.
+    /// Paths handed to this drain (buffered since the previous drain).
     #[serde(default)]
     pub paths_received: usize,
     /// Paths skipped because an upstream cache already serves them.

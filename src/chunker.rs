@@ -79,7 +79,8 @@ pub struct Chunk {
 /// Split file contents into content-defined chunks.
 ///
 /// Deterministic: the same input always produces the same chunk boundaries
-/// and hashes (FastCDC is seeded with a constant).
+/// and hashes (the gear table is fixed by the FastCDC algorithm; only
+/// MIN/AVG/MAX_CHUNK_SIZE and the fastcdc crate version affect boundaries).
 pub fn chunk_data(data: &Bytes) -> Vec<Chunk> {
     if data.is_empty() {
         return Vec::new();
@@ -147,10 +148,11 @@ impl PackBuilder {
 
     /// Append an already-compressed chunk frame without recompressing it.
     ///
-    /// Used by GC repack: frames are Range-read from source packs and copied
-    /// into new packs byte-identically, never recompressed. The caller must
-    /// have verified that `frame` decompresses to data hashing to `hash`
-    /// (see [`extract_chunk`]). Returns whether the chunk was actually added
+    /// Used by the write pipeline (frames freshly produced by
+    /// [`compress_chunks`]; integrity covered by the NAR-hash gate over the
+    /// uncompressed data) and by GC repack (frames Range-read from source
+    /// packs and copied byte-identically after verification via
+    /// [`extract_chunk`]). Returns whether the chunk was actually added
     /// (duplicates are skipped).
     pub fn add_compressed(
         &mut self,

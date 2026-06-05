@@ -67,7 +67,10 @@ fn create_fixture(root: &Path) {
 async fn assert_reconstruction_from_pack(path: &Path) {
     let chunked = chunk_path(path).await.unwrap();
 
-    // Build the pack the way the write pipeline will.
+    // Build a single pack from the chunks. (The production pipeline goes
+    // through compress_chunks + add_compressed and splits packs at the
+    // target size; add() produces byte-identical frames, pinned by
+    // add_compressed_copies_frames_byte_identically.)
     let mut builder = PackBuilder::new();
     for chunk in &chunked.chunks {
         builder.add(chunk).unwrap();
