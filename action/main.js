@@ -20,10 +20,24 @@ const { spawn, spawnSync } = require('child_process');
 // Tiny replacements for @actions/core
 // ---------------------------------------------------------------------------
 
+/**
+ * Append a name/value pair to a runner file command (GITHUB_ENV,
+ * GITHUB_STATE). Uses the heredoc form like @actions/core: the simple
+ * `name=value` form would let a value with an embedded newline inject
+ * extra entries.
+ */
+function fileCommand(file, name, value) {
+  const delimiter = `ghadelimiter_${crypto.randomUUID()}`;
+  if (String(value).includes(delimiter)) {
+    throw new Error(`value of ${name} contains the file command delimiter`);
+  }
+  fs.appendFileSync(process.env[file], `${name}<<${delimiter}\n${value}\n${delimiter}\n`);
+}
+
 /** Export an environment variable to this process and all later job steps. */
 function exportVariable(name, value) {
   process.env[name] = value;
-  fs.appendFileSync(process.env.GITHUB_ENV, `${name}=${value}\n`);
+  fileCommand('GITHUB_ENV', name, value);
 }
 
 /** Read an action input (the runner exposes them as INPUT_* variables). */
@@ -38,7 +52,7 @@ function getInput(name) {
  * post steps, each draining its own daemon.
  */
 function saveState(name, value) {
-  fs.appendFileSync(process.env.GITHUB_STATE, `${name}=${value}\n`);
+  fileCommand('GITHUB_STATE', name, value);
 }
 
 function fail(message) {
