@@ -423,12 +423,18 @@ impl PipelineContext {
                 rx.recv().await.map(|pack| (pack, rx))
             });
             pack_stream
-                .map(|pack| async move {
+                .map(|mut pack| async move {
                     let uploaded = upload_pack(&self.twirp, &self.http, &pack).await?;
-                    Ok::<_, Error>((uploaded, pack))
+                    // Only metadata is read after upload; dropping the blob
+                    // here keeps peak memory bounded by the in-flight packs
+                    // instead of growing with the drain's total compressed
+                    // size.
+                    let size = pack.data.len() as u64;
+                    pack.data = bytes::Bytes::new();
+                    Ok::<_, Error>((uploaded, size, pack))
                 })
                 .buffer_unordered(UPLOAD_CONCURRENCY)
-                .try_collect::<Vec<(bool, chunker::Pack)>>()
+                .try_collect::<Vec<(bool, u64, chunker::Pack)>>()
                 .await
         };
 
@@ -442,24 +448,24 @@ impl PipelineContext {
         stats.upload_ms = upload_started.elapsed().as_millis() as u64;
 
         let mut delta = Manifest::new();
-        let mut packs: Vec<chunker::Pack> = Vec::new();
-        for (uploaded, pack) in uploads {
+        let mut packs: Vec<(u64, chunker::Pack)> = Vec::new();
+        for (uploaded, size, pack) in uploads {
             if uploaded {
                 stats.packs_uploaded += 1;
-                stats.bytes_uploaded += pack.data.len() as u64;
+                stats.bytes_uploaded += size;
             }
-            packs.push(pack);
+            packs.push((size, pack));
         }
-        stats.new_chunks = packs.iter().map(|pack| pack.chunks.len()).sum();
+        stats.new_chunks = packs.iter().map(|(_, pack)| pack.chunks.len()).sum();
 
-        for pack in &packs {
+        for (size, pack) in &packs {
             for (chunk_hash, location) in pack.locations() {
                 delta.chunks.insert(chunk_hash, location);
             }
             delta.packs.insert(
                 pack.hash,
                 PackInfo {
-                    size: pack.data.len() as u64,
+                    size: *size,
                     created: now,
                     tier: 0,
                 },
