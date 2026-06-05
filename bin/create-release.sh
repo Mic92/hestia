@@ -5,9 +5,10 @@
 # Usage: bin/create-release.sh 0.1.0-alpha.3
 #
 # The tag push triggers .github/workflows/release.yml, which builds the
-# static binaries and creates the GitHub release. This script then points
-# the HESTIA_DOGFOOD_* repository variables at the new release so CI
-# dogfoods it.
+# static binaries and creates the GitHub release. CI dogfoods the latest
+# published release automatically; dogfooding must be enabled once by
+# setting the HESTIA_DOGFOOD repository variable to "true" (a manual kill
+# switch this script deliberately does not touch).
 
 set -euo pipefail
 
@@ -88,7 +89,8 @@ if [[ -z $run_id ]]; then
 fi
 gh run watch "$run_id" --exit-status
 
-# Dogfooding needs a published release; draft assets are not downloadable.
+# Dogfooding needs a published release: the action resolves 'latest' to
+# the newest non-draft release, so CI dogfoods this one once published.
 echo
 echo "draft release created:"
 gh release view "$tag" --json url --jq .url
@@ -97,12 +99,10 @@ while [[ "$(gh release view "$tag" --json isDraft --jq .isDraft)" == "true" ]]; 
   sleep 10
 done
 
-# Point CI dogfooding at the new release. Downloads are verified via build
-# attestations, so only the version variable is needed.
-gh variable set HESTIA_DOGFOOD_VERSION --body "$tag"
-
 echo
 echo "released ${tag}:"
 gh release view "$tag" --json url --jq .url
-echo "dogfood variables updated:"
-echo "  HESTIA_DOGFOOD_VERSION=${tag}"
+if [[ "$(gh variable get HESTIA_DOGFOOD 2>/dev/null || true)" != "true" ]]; then
+  echo "note: HESTIA_DOGFOOD is not 'true'; CI will not dogfood until you run:"
+  echo "  gh variable set HESTIA_DOGFOOD --body true"
+fi

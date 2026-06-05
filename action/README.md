@@ -56,9 +56,18 @@ to trust release binaries, pass a path instead:
 
 ### Token capture only
 
-With neither `version` nor `binary` set, the action only exports the cache
-API tokens and starts nothing. This mode is for setups that run hestia
-themselves; hestia's own integration tests use it.
+With both `version` and `binary` explicitly set to empty strings, the
+action only exports the cache API tokens and starts nothing (`version`
+defaults to `latest` when omitted, so a bare invocation starts a daemon):
+
+```yaml
+      - uses: Mic92/hestia/action@main
+        with:
+          version: ""
+```
+
+This mode is for setups that run hestia themselves; hestia's own
+integration tests use it.
 
 ## Inputs
 
