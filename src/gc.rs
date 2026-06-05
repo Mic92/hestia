@@ -479,7 +479,11 @@ pub fn plan(
             !pack_stats.live.is_empty()
                 && !repack_sources.contains(*pack)
                 && observed.get(*pack).is_some_and(|observation| {
-                    now.saturating_sub(observation.last_accessed) > policy.touch_age
+                    // `last_accessed == 0` means the REST timestamp did not
+                    // parse: the idle time is unknown, so do not force a
+                    // touch (mirrors the `created == 0` orphan guard).
+                    observation.last_accessed != 0
+                        && now.saturating_sub(observation.last_accessed) > policy.touch_age
                 })
         })
         .map(|(pack, pack_stats)| (pack_stats.tier, pack_stats.live_bytes, *pack))
@@ -878,11 +882,27 @@ impl GcContext {
         for pack in &plan.touch_packs {
             // A missing pack was evicted since planning; the next run
             // reconciles it.
-            if let Some(url) = self.pack_url(pack).await? {
-                // Downloads through the Twirp/Azure path bump
-                // last_accessed_at (verified against the real service).
-                blob::get(&self.http, &url, Some(0..1)).await?;
-                touched += 1;
+            let Some(url) = self.pack_url(pack).await? else {
+                continue;
+            };
+            let pack = *pack;
+            let refresh = async move || match self
+                .twirp
+                .get_download_url(&pack_cache_key(&pack), &[])
+                .await?
+            {
+                DownloadUrl::Hit { url, .. } => Ok(url),
+                DownloadUrl::Miss => Err(GhaError::InvalidResponse(format!(
+                    "pack {pack} disappeared while touching"
+                ))),
+            };
+            // Downloads through the Twirp/Azure path bump last_accessed_at
+            // (verified against the real service). A touch is a pure LRU
+            // optimization that self-heals next run; a failure must not
+            // abort the run and strand the commit and deletes behind it.
+            match blob::get_with_refresh(&self.http, &url, Some(0..1), refresh).await {
+                Ok(_) => touched += 1,
+                Err(err) => eprintln!("hestia gc: touch of pack {pack} failed ({err}); skipping"),
             }
         }
         Ok(touched)
@@ -1591,6 +1611,27 @@ mod tests {
         assert!(
             plan.touch_packs.contains(&pack_hash(1)),
             "the pack skipped by the CAS guard must be touched instead: {:?}",
+            plan.touch_packs
+        );
+    }
+
+    #[test]
+    fn packs_with_unparsable_lru_clock_are_not_force_touched() {
+        // `last_accessed == 0` means the REST timestamp did not parse.
+        // Treating the unknown idle time as "idle since 1970" would
+        // force-touch every referenced pack on every run.
+        let old = NOW - 30 * SECS_PER_DAY;
+        let manifest = ManifestBuilder::new()
+            .pack(1, TIER_VOLATILE, old)
+            .chunk(1, 1, 100, 0)
+            .path(1, &[1], &[], old, NOW)
+            .root("main", &[1], NOW)
+            .build();
+
+        let plan = plan(&manifest, &observe_all(&manifest, 0), NOW, &policy());
+        assert!(
+            plan.touch_packs.is_empty(),
+            "a pack of unknown idle time must not be force-touched: {:?}",
             plan.touch_packs
         );
     }

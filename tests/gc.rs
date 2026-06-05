@@ -527,6 +527,54 @@ async fn fully_live_pack_is_touched_and_never_repacked() {
     .await;
 }
 
+#[tokio::test]
+async fn touch_failures_do_not_abort_the_gc_run() {
+    timed(async {
+        let fake = FakeGha::start().await;
+        let http = client();
+        let sim = SimCache::new(&fake, &http);
+
+        // Two separate pushes -> two packs, both fully live.
+        let one = SimPath::new("app-one", 1, 60_000);
+        let two = SimPath::new("lib-two", 3, 60_000);
+        fake.set_clock(T0);
+        sim.push("main", std::slice::from_ref(&one), &[one.clone(), two.clone()], T0)
+            .await;
+        sim.push(
+            "main",
+            std::slice::from_ref(&two),
+            &[one.clone(), two.clone()],
+            T0 + 60,
+        )
+        .await;
+
+        // 5 days later both packs are idle past TouchAge.
+        let t1 = T0 + 5 * DAY;
+        fake.set_clock(t1);
+        sim.push("main", &[], &[one.clone(), two.clone()], t1).await;
+
+        // The first pack's touch fails persistently (initial read plus all
+        // transient retries); the second pack's touch must still happen and
+        // the step must complete - a touch is a pure LRU optimization that
+        // self-heals next run, and aborting here would strand the commit
+        // and all deletes behind it.
+        let gc = sim.gc(GcPolicy::default());
+        let (_, _, plan) = gc.plan(t1).await.unwrap();
+        assert_eq!(plan.touch_packs.len(), 2);
+
+        fake.fail_blob_reads(&http, 4).await;
+        let touched = gc
+            .execute_touches(&plan)
+            .await
+            .expect("a failed touch must not abort the touch step");
+        assert_eq!(
+            touched, 1,
+            "the touch after the failed one must still happen"
+        );
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Eviction healing
 // ---------------------------------------------------------------------------
