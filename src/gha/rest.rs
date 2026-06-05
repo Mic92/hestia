@@ -65,6 +65,18 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + day_of_era as i64 - 719_468
 }
 
+/// Days in `month` of `year` (proleptic Gregorian).
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+    }
+}
+
 /// Inverse of [`days_from_civil`].
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let days = days + 719_468;
@@ -99,19 +111,37 @@ pub fn parse_timestamp(s: &str) -> Option<u64> {
     {
         return None;
     }
+    // Integer FromStr alone is too lenient (it accepts a leading '+'), so
+    // every field byte must be an ASCII digit.
+    const DIGIT_POSITIONS: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
+    if DIGIT_POSITIONS.iter().any(|&i| !bytes[i].is_ascii_digit()) {
+        return None;
+    }
     let year: i64 = s.get(0..4)?.parse().ok()?;
     let month: u32 = s.get(5..7)?.parse().ok()?;
     let day: u32 = s.get(8..10)?.parse().ok()?;
     let hour: u64 = s.get(11..13)?.parse().ok()?;
     let minute: u64 = s.get(14..16)?.parse().ok()?;
     let second: u64 = s.get(17..19)?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+    // second == 60 is allowed for leap seconds and clamped below;
+    // days_from_civil is pure arithmetic, so an impossible date like
+    // Feb 31 would silently roll into March instead of being rejected.
+    if !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
         return None;
     }
     // Optional fractional seconds, then a UTC marker.
     let mut rest = &s[19..];
     if let Some(stripped) = rest.strip_prefix('.') {
         rest = stripped.trim_start_matches(|c: char| c.is_ascii_digit());
+        if rest.len() == stripped.len() {
+            // RFC 3339 requires at least one fractional digit.
+            return None;
+        }
     }
     if rest != "Z" && rest != "z" && rest != "+00:00" {
         return None;
@@ -393,6 +423,22 @@ mod tests {
         assert_eq!(parse_timestamp("not a timestamp"), None);
         assert_eq!(parse_timestamp("2019-13-24T22:45:36Z"), None);
         assert_eq!(parse_timestamp("2019-01-24T22:45:36+02:00"), None);
+        // Impossible calendar dates must not silently roll over.
+        assert_eq!(parse_timestamp("2026-02-31T00:00:00Z"), None);
+        assert_eq!(parse_timestamp("2023-02-29T00:00:00Z"), None);
+        assert_eq!(parse_timestamp("2019-04-31T00:00:00Z"), None);
+        // Seconds beyond the leap-second value must not silently clamp.
+        assert_eq!(parse_timestamp("2019-01-24T22:45:99Z"), None);
+        // Leap seconds themselves still clamp to :59.
+        assert_eq!(
+            parse_timestamp("2019-01-24T22:45:60Z"),
+            Some(1_548_369_936 + 23)
+        );
+        // RFC 3339 requires at least one digit after the decimal point.
+        assert_eq!(parse_timestamp("2019-01-24T22:45:36.Z"), None);
+        // Field bytes must be digits; integer FromStr would accept "+1".
+        assert_eq!(parse_timestamp("2019-+1-24T22:45:36Z"), None);
+        assert_eq!(parse_timestamp("+019-01-24T22:45:36Z"), None);
     }
 
     #[test]
