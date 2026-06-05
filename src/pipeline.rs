@@ -286,11 +286,11 @@ impl PipelineContext {
             }
 
             let hash = info.path_hash();
-            root_paths.insert(hash);
 
             if let Some(existing) = current.paths.get(&hash) {
                 // Already stored: bump the push clock so push-TTL-based
                 // liveness keeps protecting it.
+                root_paths.insert(hash);
                 let mut entry = existing.clone();
                 entry.last_pushed = now;
                 bumped.insert(hash, entry);
@@ -429,6 +429,10 @@ impl PipelineContext {
         };
 
         let (prepared, uploads) = tokio::try_join!(producer, consumer)?;
+        // Paths the producer rejected (failed verification or chunking)
+        // must not enter the committed root: it would pin hashes the
+        // manifest cannot serve.
+        root_paths.extend(prepared.iter().map(|path| path.hash));
         // Stage times overlap now: chunk/pack are producer busy times,
         // upload is the wall time of the whole pipelined section.
         stats.upload_ms = upload_started.elapsed().as_millis() as u64;
