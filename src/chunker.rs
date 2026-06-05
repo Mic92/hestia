@@ -264,7 +264,9 @@ pub fn coalesce_adjacent<T>(
         let (offset, _) = span(&item);
         let adjacent = runs.last().and_then(|run| run.last()).is_some_and(|last| {
             let (last_offset, last_size) = span(last);
-            last_offset + u64::from(last_size) == offset
+            // Checked: locations can come from a corrupt manifest; an
+            // offset near u64::MAX must not panic the comparison.
+            last_offset.checked_add(u64::from(last_size)) == Some(offset)
         });
         match runs.last_mut() {
             Some(run) if adjacent => run.push(item),

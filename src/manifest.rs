@@ -575,6 +575,16 @@ fn visit_contents<C>(tree: &FileTree<C>, visit: &mut impl FnMut(&C)) {
 /// incompressible hash bytes, so higher levels gain little.
 const ZSTD_LEVEL: i32 = 9;
 
+/// Decompression bound for stored manifest blobs.
+///
+/// The GHA cache is not trusted storage: without a bound, a small zstd
+/// bomb stored as the next manifest version would abort every serve,
+/// drain, and GC inside the allocator -- before the corrupt-manifest
+/// fallback (`decode_manifest_or_empty`) can trigger. Production manifest
+/// CBOR is single-digit megabytes, so 64 MiB is ample headroom while an
+/// over-long stream surfaces as a normal decode error.
+const MAX_MANIFEST_CBOR_BYTES: u64 = 64 * 1024 * 1024;
+
 impl Manifest {
     pub fn new() -> Self {
         Self::default()
@@ -589,7 +599,19 @@ impl Manifest {
 
     /// Deserialize from zstd-compressed columnar CBOR.
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let cbor = zstd::decode_all(data)?;
+        use std::io::Read as _;
+        let mut cbor = Vec::new();
+        // Read one byte past the bound: enough to detect an oversized
+        // stream without buffering its full payload.
+        zstd::Decoder::with_buffer(data)?
+            .take(MAX_MANIFEST_CBOR_BYTES + 1)
+            .read_to_end(&mut cbor)?;
+        if cbor.len() as u64 > MAX_MANIFEST_CBOR_BYTES {
+            return Err(Error::InvalidEncoding(format!(
+                "manifest decompresses past the {MAX_MANIFEST_CBOR_BYTES}-byte bound \
+                 (corrupt or malicious data)"
+            )));
+        }
         Self::from_wire(ciborium::from_reader(cbor.as_slice())?)
     }
 
@@ -723,8 +745,15 @@ impl Manifest {
         let mut previous_offset: BTreeMap<u64, u64> = BTreeMap::new();
         for row in 0..rows {
             let pack = wire.location_packs[row];
-            let offset =
-                previous_offset.get(&pack).copied().unwrap_or(0) + wire.location_offsets[row];
+            // Checked: deltas come straight from untrusted CBOR, and an
+            // overflowing accumulation must be a decode error, not a
+            // debug-build panic or a silently wrapped offset.
+            let offset = previous_offset
+                .get(&pack)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(wire.location_offsets[row])
+                .ok_or_else(|| invalid(format!("chunk offset overflow in row {row}")))?;
             previous_offset.insert(pack, offset);
             chunks.insert(
                 chunk_at(wire.location_chunks[row])?,
@@ -1011,6 +1040,45 @@ mod tests {
         let compressed = zstd::encode_all(patched.as_slice(), 3).unwrap();
 
         let result = Manifest::decode(&compressed);
+        assert!(
+            matches!(result, Err(Error::InvalidEncoding(_))),
+            "expected InvalidEncoding, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn overflowing_wire_offsets_are_an_error_not_a_panic() {
+        // Delta-encoded offsets come from untrusted CBOR: two rows for the
+        // same pack whose deltas sum past u64::MAX must surface as
+        // InvalidEncoding instead of panicking (debug) or wrapping
+        // (release).
+        let wire = WireManifest {
+            chunk_hashes: Blob([1u8; 2 * ChunkHash::LEN].to_vec()),
+            pack_hashes: Blob([2u8; PackHash::LEN].to_vec()),
+            location_chunks: vec![0, 1],
+            location_packs: vec![0, 0],
+            location_offsets: vec![u64::MAX, 1],
+            location_compressed_sizes: vec![1, 1],
+            location_uncompressed_sizes: vec![1, 1],
+            location_repacks_survived: vec![0, 0],
+            ..WireManifest::default()
+        };
+        let result = Manifest::from_wire(wire);
+        assert!(
+            matches!(result, Err(Error::InvalidEncoding(_))),
+            "expected InvalidEncoding, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_zstd_bomb_is_an_error_not_an_allocation() {
+        // A small zstd stream of zeros decompressing far past any real
+        // manifest must be rejected at the size bound, before the full
+        // payload is buffered.
+        let bomb_payload = vec![0u8; 128 * 1024 * 1024];
+        let bomb = zstd::encode_all(bomb_payload.as_slice(), 3).unwrap();
+        assert!(bomb.len() < 1024 * 1024, "bomb must be small on the wire");
+        let result = Manifest::decode(&bomb);
         assert!(
             matches!(result, Err(Error::InvalidEncoding(_))),
             "expected InvalidEncoding, got {result:?}"
