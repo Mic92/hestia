@@ -399,9 +399,12 @@ impl ChunkFetcher {
                 for (hash, location) in run {
                     let from = (location.offset - start) as usize;
                     let to = from + location.compressed_size as usize;
-                    // extract_chunk verifies the SHA-256 of the
-                    // decompressed data; corrupt or truncated cache
-                    // contents cannot pass.
+                    // In bounds by construction: blob::get errors unless
+                    // the ranged response is exactly end - start bytes,
+                    // and coalesce_adjacent only groups chunks that tile
+                    // [start, end) contiguously. extract_chunk verifies
+                    // the SHA-256 of the decompressed data; corrupt or
+                    // truncated cache contents cannot pass.
                     let chunk = extract_chunk(&data[from..to], &hash)?;
                     extracted.push((hash, Bytes::from(chunk)));
                 }
