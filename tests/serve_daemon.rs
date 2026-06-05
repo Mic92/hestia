@@ -357,6 +357,40 @@ async fn failed_drain_keeps_paths_buffered_for_retry() {
 }
 
 #[tokio::test]
+async fn bind_refuses_to_take_over_a_live_daemons_socket() {
+    // A second daemon (or a failed second startup) must not unlink the
+    // socket of a running daemon: that would silently sever every later
+    // hook and drain client from it.
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("hook.sock");
+
+    let daemon = RunningDaemon::start(
+        socket.clone(),
+        None,
+        pipeline_context(&fake, &http, StoreDatabase::new("/nonexistent/db.sqlite")),
+    )
+    .await;
+
+    let second = Daemon::bind(
+        &socket,
+        None,
+        pipeline_context(&fake, &http, StoreDatabase::new("/nonexistent/db.sqlite")),
+        AccessLog::new(),
+        ManifestStore::new(),
+    );
+    assert!(
+        second.is_err(),
+        "binding over a live daemon's socket must fail"
+    );
+
+    let status = daemon.request(&Request::Status).await;
+    assert_eq!(status.buffered, Some(0));
+    let _ = daemon.stop().await;
+}
+
+#[tokio::test]
 async fn oversized_hook_request_is_rejected_with_bounded_memory() {
     // The hook socket is reachable by anything that can open the socket
     // file (and clients are not necessarily hestia: a stray process can
