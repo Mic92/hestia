@@ -29,6 +29,12 @@ function main() {
   const drain = spawnSync(binary, ['drain', '--socket', socket, '--timeout', timeout], {
     stdio: 'inherit',
   });
+  if (drain.error) {
+    // spawnSync does not throw on launch failures (e.g. ENOENT when the
+    // temp dir was cleaned mid-job); without this the only output is the
+    // generic drain-failed error below.
+    console.error(`::error::failed to run ${binary}: ${drain.error}`);
+  }
 
   // The daemon log carries what the drain summary does not: per-stage drain
   // timings, substituter hits, and error details. Collapsed on success so it
@@ -67,4 +73,6 @@ function main() {
   return drain.status === null ? 1 : drain.status;
 }
 
-process.exit(main());
+// Not process.exit(): that drops pending async stdout writes, truncating
+// the daemon log dump exactly when it is needed.
+process.exitCode = main();
