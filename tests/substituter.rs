@@ -17,7 +17,7 @@ use hestia::manifest::{Hash32, Manifest, PathHash};
 use hestia::pipeline::{AccessLog, now_unix};
 use hestia::substituter::{ManifestStore, Substituter};
 
-use support::common::{TEST_ROOT_KEY, pipeline_context, to_path_set};
+use support::common::{TEST_ROOT_KEY, pipeline_context, store_entry, to_path_set};
 use support::fake_gha::FakeGha;
 use support::store::ScratchStore;
 
@@ -840,6 +840,121 @@ async fn nar_downloads_record_access_without_a_narinfo_hit() {
             substituter.access_log.snapshot().contains(&path_hash),
             "a served NAR must be recorded as an access (GC liveness signal)"
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn concurrent_gc_repack_triggers_manifest_reload() {
+    timed(async {
+        // A nightly `hestia gc` repack moves live chunks into a new pack,
+        // commits the manifest, and deletes the old pack — while a running
+        // daemon still serves the pre-repack view. The NAR handler must
+        // reload the manifest on the pack miss and serve from the new pack
+        // instead of 404ing every affected path for the rest of the job.
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let fixture = store.add_fixture("repack-reload", 157);
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let twirp = fake.twirp(&http);
+
+        // Substituter serving the pre-repack manifest, wired with the same
+        // reload hook hestia serve installs.
+        let manifest_store = ManifestStore::new();
+        manifest_store.set(manifest.clone());
+        let reload_store = manifest_store.clone();
+        let reload_twirp = twirp.clone();
+        let reload_http = http.clone();
+        let substituter = Substituter::new(
+            store.database().store_dir().clone(),
+            manifest_store.clone(),
+            AccessLog::new(),
+            twirp.clone(),
+            http.clone(),
+        )
+        .with_manifest_reload(std::sync::Arc::new(move || {
+            let twirp = reload_twirp.clone();
+            let http = reload_http.clone();
+            let manifest_store = reload_store.clone();
+            Box::pin(async move {
+                let save = hestia::gha::savemutable::SaveMutable::new(
+                    &twirp,
+                    &http,
+                    hestia::pipeline::MANIFEST_PREFIX,
+                );
+                if let Ok(Some(entry)) = save.load().await {
+                    manifest_store.set_version_if_newer(
+                        hestia::pipeline::decode_manifest_or_empty(&entry.data),
+                        entry.index,
+                    );
+                }
+            })
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, substituter.into_router())
+                .await
+                .unwrap();
+        });
+
+        // Simulate the gc repack: copy the pack bytes into a new pack (one
+        // padding byte appended so the content hash changes; chunk offsets
+        // are unaffected), rewrite the manifest, delete the old pack.
+        let old_pack = *manifest.packs.keys().next().expect("one pack uploaded");
+        let url = match twirp
+            .get_download_url(&pack_cache_key(&old_pack), &[])
+            .await
+            .unwrap()
+        {
+            hestia::gha::twirp::DownloadUrl::Hit { url, .. } => url,
+            hestia::gha::twirp::DownloadUrl::Miss => panic!("pack must exist"),
+        };
+        let mut pack_bytes = hestia::gha::blob::get(&http, &url, None)
+            .await
+            .unwrap()
+            .to_vec();
+        pack_bytes.push(0);
+        let new_pack = hestia::manifest::PackHash::digest(&pack_bytes);
+        store_entry(&twirp, &http, &pack_cache_key(&new_pack), &pack_bytes).await;
+
+        let mut repacked = manifest.clone();
+        let info = repacked.packs.remove(&old_pack).unwrap();
+        repacked.packs.insert(new_pack, info);
+        for location in repacked.chunks.values_mut() {
+            assert_eq!(location.pack, old_pack);
+            location.pack = new_pack;
+        }
+        let save = hestia::gha::savemutable::SaveMutable::new(
+            &twirp,
+            &http,
+            hestia::pipeline::MANIFEST_PREFIX,
+        );
+        save.save(|_| Ok(repacked.encode().expect("manifest encodes")))
+            .await
+            .expect("committing the repacked manifest failed");
+        fake.evict(&http, &pack_cache_key(&old_pack)).await;
+
+        // The served view is stale (still points at the deleted pack), but
+        // the NAR request must succeed via the reload.
+        let entry = &manifest.paths[&path_hash_of(&fixture)];
+        let nar_url = format!("{base_url}/nar/{}.nar", entry.nar_hash.to_hex());
+        let response = http.get(&nar_url).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "a pack deleted by a concurrent gc repack must trigger a manifest \
+             reload, not a 404"
+        );
+        assert_eq!(
+            Hash32::digest(response.bytes().await.unwrap()),
+            entry.nar_hash
+        );
+        server.abort();
     })
     .await;
 }
