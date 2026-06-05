@@ -1,9 +1,8 @@
 # Release pipeline: tag push -> static binaries -> GitHub release.
 #
-# The binaries are statically linked (musl): the hestia-cache action
-# downloads and runs them on stock runners, where dynamically linked
-# nix-built binaries would not work (their library paths point into
-# /nix/store).
+# The binaries must run on stock runners without nix: Linux binaries are
+# statically linked (musl); darwin binaries link only system libraries
+# (nix-built dynamic binaries would point into /nix/store).
 name: Release
 
 on:
