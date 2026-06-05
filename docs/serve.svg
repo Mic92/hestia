@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 360" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#5b6b7a"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#c2603e"/>
+    </marker>
+  </defs>
+
+  <style>
+    .h1 { font-size: 15px; font-weight: 600; fill: #2b3a49; }
+    .t  { font-size: 12.5px; font-weight: 600; fill: #3d4c5c; }
+    .ts { font-size: 11px; fill: #6b7a89; }
+    .m  { font-size: 11.5px; font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; fill: #34424f; }
+    .edge { stroke: #5b6b7a; stroke-width: 1.4; fill: none; }
+    .edge-dash { stroke: #8a99a8; stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+    .edge-accent { stroke: #c2603e; stroke-width: 1.6; fill: none; }
+    .lbl { font-size: 11px; fill: #5b6b7a; }
+    .lbla { font-size: 11px; fill: #c2603e; }
+  </style>
+
+  <!-- Nix -->
+  <rect x="20" y="40" width="270" height="280" rx="10" fill="#f4f6f9" stroke="#cdd6e0"/>
+  <text x="40" y="68" class="h1">Nix</text>
+  <text x="40" y="100" class="t">substitution</text>
+  <text x="40" y="118" class="ts">Nix tries this substituter first:</text>
+  <rect x="40" y="128" width="230" height="30" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
+  <text x="155" y="147" class="m" text-anchor="middle">http://127.0.0.1:&#60;port&#62;</text>
+  <text x="40" y="182" class="ts">on a 404 Nix simply moves on to the</text>
+  <text x="40" y="197" class="ts">next substituter (cache.nixos.org)</text>
+
+  <!-- daemon -->
+  <rect x="370" y="40" width="300" height="280" rx="10" fill="#fbfcfd" stroke="#cdd6e0"/>
+  <text x="390" y="68" class="h1">hestia serve &#8212; per-job daemon</text>
+  <text x="390" y="100" class="t">substituter (HTTP)</text>
+  <text x="390" y="118" class="ts">narinfo answers come straight from</text>
+  <text x="390" y="133" class="ts">the manifest; every hit is logged</text>
+  <text x="390" y="154" class="ts">NARs are rebuilt from chunks and</text>
+  <text x="390" y="169" class="ts">hash-checked before serving; if</text>
+  <text x="390" y="184" class="ts">anything goes wrong: 404, never bad data</text>
+  <text x="390" y="218" class="ts">accessed paths join this run's GC</text>
+  <text x="390" y="233" class="ts">root at the next drain, keeping</text>
+  <text x="390" y="248" class="ts">downloaded closures alive</text>
+
+  <!-- GHA cache -->
+  <rect x="750" y="40" width="270" height="280" rx="10" fill="#f4f6f9" stroke="#cdd6e0"/>
+  <text x="770" y="68" class="h1">GitHub Actions cache</text>
+  <rect x="770" y="90" width="230" height="30" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
+  <text x="885" y="109" class="m" text-anchor="middle">m#1 &#8230; m#N  (manifest)</text>
+  <rect x="770" y="128" width="230" height="30" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
+  <text x="885" y="147" class="m" text-anchor="middle">pack-&#8230;  (chunk blobs)</text>
+  <text x="770" y="196" class="ts">Twirp hands out signed Azure URLs;</text>
+  <text x="770" y="211" class="ts">chunks arrive via Range GETs, in</text>
+  <text x="770" y="226" class="ts">parallel across packs</text>
+
+  <!-- edges -->
+  <path class="edge-dash" d="M 746 84 L 674 84" marker-end="url(#arrow)"/>
+  <text x="708" y="74" class="lbl" text-anchor="middle">load m#N</text>
+
+  <path class="edge" d="M 290 122 L 366 122" marker-end="url(#arrow)"/>
+  <text x="328" y="112" class="lbl" text-anchor="middle">narinfo, nar</text>
+  <path class="edge-accent" d="M 366 164 L 290 164" marker-end="url(#arrow-accent)"/>
+  <text x="328" y="182" class="lbla" text-anchor="middle">verified NAR</text>
+
+  <path class="edge" d="M 670 122 L 746 122" marker-end="url(#arrow)"/>
+  <text x="708" y="112" class="lbl" text-anchor="middle">Range GET</text>
+  <path class="edge-accent" d="M 746 144 L 670 144" marker-end="url(#arrow-accent)"/>
+  <text x="708" y="162" class="lbla" text-anchor="middle">chunk bytes</text>
+</svg>
