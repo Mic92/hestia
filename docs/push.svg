@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 360" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#5b6b7a"/>
+    </marker>
+  </defs>
+
+  <style>
+    .h1 { font-size: 15px; font-weight: 600; fill: #2b3a49; }
+    .t  { font-size: 12.5px; font-weight: 600; fill: #3d4c5c; }
+    .ts { font-size: 11px; fill: #6b7a89; }
+    .m  { font-size: 11.5px; font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; fill: #34424f; }
+    .edge { stroke: #5b6b7a; stroke-width: 1.4; fill: none; }
+    .lbl { font-size: 11px; fill: #5b6b7a; }
+  </style>
+
+  <!-- Nix -->
+  <rect x="20" y="40" width="270" height="280" rx="10" fill="#f4f6f9" stroke="#cdd6e0"/>
+  <text x="40" y="68" class="h1">Nix</text>
+  <text x="40" y="100" class="t">build succeeds</text>
+  <text x="40" y="118" class="ts">post-build-hook runs</text>
+  <rect x="40" y="128" width="230" height="30" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
+  <text x="155" y="147" class="m" text-anchor="middle">hestia hook  ($OUT_PATHS)</text>
+  <text x="40" y="182" class="ts">the hook always exits 0: losing a path</text>
+  <text x="40" y="197" class="ts">is never worth failing the build</text>
+
+  <!-- daemon -->
+  <rect x="370" y="40" width="300" height="280" rx="10" fill="#fbfcfd" stroke="#cdd6e0"/>
+  <text x="390" y="68" class="h1">hestia serve &#8212; per-job daemon</text>
+  <text x="390" y="100" class="t">hook listener (unix socket)</text>
+  <text x="390" y="118" class="ts">buffers built paths in memory</text>
+  <text x="390" y="160" class="t">drain (post step, idle, SIGTERM)</text>
+  <text x="390" y="178" class="ts">everything built or served this job:</text>
+  <rect x="390" y="190" width="260" height="30" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
+  <text x="520" y="209" class="m" text-anchor="middle">chunk &#8594; pack &#8594; commit</text>
+  <text x="390" y="242" class="ts">chunks are cut with FastCDC and</text>
+  <text x="390" y="257" class="ts">zstd-compressed; the branch root is</text>
+  <text x="390" y="272" class="ts">updated to pin this job's paths</text>
+
+  <!-- GHA cache -->
+  <rect x="750" y="40" width="270" height="280" rx="10" fill="#f4f6f9" stroke="#cdd6e0"/>
+  <text x="770" y="68" class="h1">GitHub Actions cache</text>
+  <rect x="770" y="90" width="230" height="30" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
+  <text x="885" y="109" class="m" text-anchor="middle">m#1 &#8230; m#N+1  (manifest)</text>
+  <rect x="770" y="128" width="230" height="30" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
+  <text x="885" y="147" class="m" text-anchor="middle">pack-&#8230;  (chunk blobs)</text>
+  <text x="770" y="196" class="ts">upload = reserve, PUT, finalize;</text>
+  <text x="770" y="211" class="ts">a pack that already exists is</text>
+  <text x="770" y="226" class="ts">simply skipped</text>
+  <text x="770" y="262" class="ts">keys are write-once; racing manifest</text>
+  <text x="770" y="277" class="ts">commits sort themselves out (SaveMutable)</text>
+
+  <!-- edges -->
+  <path class="edge" d="M 290 143 L 366 143" marker-end="url(#arrow)"/>
+  <text x="328" y="133" class="lbl" text-anchor="middle">add paths</text>
+
+  <path class="edge" d="M 670 205 L 746 205" marker-end="url(#arrow)"/>
+  <text x="708" y="181" class="lbl" text-anchor="middle">PUT packs,</text>
+  <text x="708" y="195" class="lbl" text-anchor="middle">commit m#N+1</text>
+</svg>

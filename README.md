@@ -128,7 +128,8 @@ The GC workflow takes one input: `dry-run` (plan only, delete nothing); see
 [`.github/workflows/gc.yml`](.github/workflows/gc.yml).
 
 Running the `hestia` binary yourself instead of using the action? See the
-[CLI reference](docs/cli.md).
+[CLI reference](docs/cli.md). How it all works under the hood:
+[architecture](docs/architecture.md).
 
 ## Security
 
