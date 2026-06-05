@@ -318,10 +318,36 @@ pub fn plan(
         ..GcPlan::default()
     };
 
-    let observed: BTreeMap<PackHash, &PackObservation> = observations
-        .iter()
-        .filter_map(|observation| observation.pack.map(|pack| (pack, observation)))
-        .collect();
+    // The REST listing repeats a key once per ref, each entry with its own
+    // clocks. Keep the *stalest* parsed LRU clock per pack: any copy going
+    // idle warrants a touch, since each ref's entry is evicted
+    // independently. 0 means no copy's clock parsed.
+    let mut observed: BTreeMap<PackHash, u64> = BTreeMap::new();
+    for observation in observations {
+        let Some(pack) = observation.pack else {
+            continue;
+        };
+        let last_accessed = observed.entry(pack).or_insert(observation.last_accessed);
+        if *last_accessed == 0
+            || (observation.last_accessed != 0 && observation.last_accessed < *last_accessed)
+        {
+            *last_accessed = observation.last_accessed;
+        }
+    }
+    // Newest creation time per key across refs; 0 when any duplicate's
+    // timestamp failed to parse. Deletion is by key across all refs, so a
+    // key is only safe to judge by its newest entry.
+    let mut newest_created: BTreeMap<&str, u64> = BTreeMap::new();
+    for observation in observations.iter().filter(|o| o.pack.is_some()) {
+        let created = newest_created
+            .entry(observation.key.as_str())
+            .or_insert(observation.created);
+        *created = if *created == 0 || observation.created == 0 {
+            0
+        } else {
+            (*created).max(observation.created)
+        };
+    }
 
     // ① Reconcile: packs GitHub already evicted
     // Packs younger than min_age are never judged evicted: they may have been
@@ -484,12 +510,12 @@ pub fn plan(
         .filter(|(pack, pack_stats)| {
             !pack_stats.live.is_empty()
                 && !repack_sources.contains(*pack)
-                && observed.get(*pack).is_some_and(|observation| {
-                    // `last_accessed == 0` means the REST timestamp did not
-                    // parse: the idle time is unknown, so do not force a
-                    // touch (mirrors the `created == 0` orphan guard).
-                    observation.last_accessed != 0
-                        && now.saturating_sub(observation.last_accessed) > policy.touch_age
+                && observed.get(*pack).is_some_and(|last_accessed| {
+                    // 0 means no REST timestamp parsed: the idle time is
+                    // unknown, so do not force a touch (mirrors the
+                    // `created == 0` orphan guard).
+                    *last_accessed != 0
+                        && now.saturating_sub(*last_accessed) > policy.touch_age
                 })
         })
         .map(|(pack, pack_stats)| (pack_stats.tier, pack_stats.live_bytes, *pack))
@@ -511,12 +537,15 @@ pub fn plan(
             let Some(pack) = observation.pack else {
                 return false;
             };
-            // `created == 0` means the REST timestamp did not parse: the
-            // entry's age is unknown, so treat it as too young to judge
-            // (it could be a concurrent push's just-uploaded pack).
+            // Judge the key by its *newest* entry across refs: a fresh
+            // duplicate on another ref is an in-flight push's upload (or a
+            // retried push's dedup re-use), and deletion removes every
+            // ref's copy. `newest == 0` means the age is unknown: treat it
+            // as too young to judge.
+            let newest = newest_created[observation.key.as_str()];
             !manifest.packs.contains_key(&pack)
-                && observation.created != 0
-                && now.saturating_sub(observation.created) > policy.min_age
+                && newest != 0
+                && now.saturating_sub(newest) > policy.min_age
         })
         .map(|observation| observation.key.clone())
         .collect();
@@ -1719,6 +1748,67 @@ mod tests {
         assert_eq!(
             plan.orphan_keys,
             BTreeSet::from([pack_cache_key(&pack_hash(9))])
+        );
+    }
+
+    #[test]
+    fn orphan_keys_require_every_duplicate_entry_to_be_old() {
+        // A week-old entry on one ref must not orphan the key while
+        // another ref holds a minutes-old entry (an in-flight push's
+        // upload): deletion is by key across all refs.
+        let manifest = ManifestBuilder::new()
+            .pack(1, TIER_VOLATILE, NOW - SECS_PER_DAY)
+            .chunk(1, 1, 100, 0)
+            .path(1, &[1], &[], NOW, NOW)
+            .root("main", &[1], NOW)
+            .build();
+
+        let mut observations = observe_all(&manifest, NOW);
+        for created in [NOW - 7 * SECS_PER_DAY, NOW - 60] {
+            observations.push(PackObservation {
+                key: pack_cache_key(&pack_hash(9)),
+                pack: Some(pack_hash(9)),
+                created,
+                last_accessed: NOW,
+            });
+        }
+
+        let plan = plan(&manifest, &observations, NOW, &policy());
+        assert!(
+            plan.orphan_keys.is_empty(),
+            "a key with a fresh duplicate on another ref must not be deleted: {:?}",
+            plan.orphan_keys
+        );
+    }
+
+    #[test]
+    fn touch_judges_staleness_by_the_stalest_duplicate_entry() {
+        // Each ref-scoped entry has its own LRU clock and is evicted
+        // independently. A fresh feature-branch copy must not mask a 6-day
+        // idle default-branch copy of the same key.
+        let old = NOW - 30 * SECS_PER_DAY;
+        let manifest = ManifestBuilder::new()
+            .pack(1, TIER_VOLATILE, old)
+            .chunk(1, 1, 100, 0)
+            .path(1, &[1], &[], old, NOW)
+            .root("main", &[1], NOW)
+            .build();
+
+        // Stale copy listed first, fresh copy second (last-wins collapse
+        // would judge against the fresh clock).
+        let mut observations = observe_all(&manifest, NOW - 6 * SECS_PER_DAY);
+        observations.push(PackObservation {
+            key: pack_cache_key(&pack_hash(1)),
+            pack: Some(pack_hash(1)),
+            created: old,
+            last_accessed: NOW,
+        });
+
+        let plan = plan(&manifest, &observations, NOW, &policy());
+        assert_eq!(
+            plan.touch_packs,
+            vec![pack_hash(1)],
+            "the stalest per-ref copy decides whether a touch is needed"
         );
     }
 
