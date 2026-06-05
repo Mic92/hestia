@@ -471,7 +471,18 @@ fn narinfo_for_entry(store_dir: &StoreDir, entry: &PathEntry, hash: &str) -> Vec
         ultimate: false,
         // Unsigned: the store URL carries ?trusted=true.
         signatures: BTreeSet::new(),
-        ca: entry.ca.as_deref().and_then(|ca| ca.parse().ok()),
+        ca: entry.ca.as_deref().and_then(|ca| match ca.parse() {
+            Ok(ca) => Some(ca),
+            // Served without a CA line the path silently degrades to
+            // input-addressed on the substituting side; leave a trace.
+            Err(err) => {
+                eprintln!(
+                    "hestia substituter: dropping unparsable CA string {ca:?} for {}: {err}",
+                    entry.store_path
+                );
+                None
+            }
+        }),
         store_dir: store_dir.clone(),
     };
     let narinfo = build_narinfo(
