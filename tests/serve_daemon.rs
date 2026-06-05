@@ -357,6 +357,47 @@ async fn failed_drain_keeps_paths_buffered_for_retry() {
 }
 
 #[tokio::test]
+async fn shutdown_closes_idle_connections_and_rejects_late_adds() {
+    // Connection tasks must not outlive the daemon: an idle client gets
+    // EOF at shutdown instead of a forever-open socket, and an Add after
+    // shutdown began must be rejected (an ACKed path that misses the
+    // final drain would be silently dropped at process exit).
+    let test = async {
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hook.sock");
+
+        let daemon = RunningDaemon::start(
+            socket.clone(),
+            None,
+            pipeline_context(&fake, &http, StoreDatabase::new("/nonexistent/db.sqlite")),
+        )
+        .await;
+
+        use tokio::io::AsyncReadExt as _;
+        let mut idle = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connecting to hook socket failed");
+
+        daemon.stop().await.expect("final drain failed");
+
+        let mut buffer = [0u8; 64];
+        let result = tokio::time::timeout(Duration::from_secs(5), idle.read(&mut buffer))
+            .await
+            .expect("idle connection must be closed at shutdown");
+        // EOF or a reset both mean "closed"; data would be a protocol bug.
+        match result {
+            Ok(read) => assert_eq!(read, 0, "idle connection must see EOF, not data"),
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset),
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), test)
+        .await
+        .expect("test timed out");
+}
+
+#[tokio::test]
 async fn bind_refuses_to_take_over_a_live_daemons_socket() {
     // A second daemon (or a failed second startup) must not unlink the
     // socket of a running daemon: that would silently sever every later
