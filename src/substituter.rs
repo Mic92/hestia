@@ -14,7 +14,7 @@
 //!   so Nix falls through to the next substituter — never partial or
 //!   corrupt data.
 //!
-//! A semaphore caps concurrent NAR fetches so parallel narinfo queries
+//! A semaphore caps concurrent pack reads so parallel narinfo queries
 //! from Nix (`WantMassQuery: 1`) do not flood the GHA cache API.
 //!
 //! Responses are unsigned: the action configures the store URL with
@@ -62,11 +62,11 @@ const PACK_URL_TTL: Duration = Duration::from_secs(10 * 60);
 /// Oldest chunks are dropped first.
 const CHUNK_CACHE_BUDGET: usize = 256 * 1024 * 1024;
 
-/// Maximum number of NAR downloads served concurrently.  Each NAR fetch
-/// may issue multiple GHA cache API calls (one per pack); capping
-/// concurrency prevents hitting the API rate limit when Nix requests many
-/// paths at once.
-const MAX_CONCURRENT_NAR_FETCHES: usize = 8;
+/// Maximum number of pack reads in flight across all NAR requests. A pack
+/// read is the unit of GHA cache API traffic (one Twirp URL lookup plus
+/// Azure Range requests), so this bounds the total API concurrency no
+/// matter how the packs distribute over paths.
+const MAX_CONCURRENT_PACK_FETCHES: usize = 8;
 
 /// How many times a pack Range read is retried after a transient failure
 /// (connection drop, timeout, 5xx) before the whole NAR request gives up
@@ -213,6 +213,11 @@ struct ChunkFetcher {
     /// Per-path serialization: concurrent NAR requests for the same path
     /// must not fetch the same chunks twice.
     path_locks: Mutex<HashMap<PathHash, Arc<tokio::sync::Mutex<()>>>>,
+    /// Caps pack reads that hit the GHA cache API. Acquired per pack,
+    /// *after* the per-path lock and the cache check, so idle waiters and
+    /// cache hits never pin a permit. FIFO: a many-pack path cannot
+    /// starve others.
+    fetch_semaphore: Semaphore,
 }
 
 impl ChunkFetcher {
@@ -223,6 +228,7 @@ impl ChunkFetcher {
             url_cache: Mutex::new(HashMap::new()),
             chunk_cache: Mutex::new(ChunkCache::default()),
             path_locks: Mutex::new(HashMap::new()),
+            fetch_semaphore: Semaphore::new(MAX_CONCURRENT_PACK_FETCHES),
         }
     }
 
@@ -342,10 +348,17 @@ impl ChunkFetcher {
             }
         }
 
-        // Fetch packs in parallel.
-        let fetches = missing
-            .into_iter()
-            .map(|(pack, chunks)| self.fetch_from_pack(pack, chunks));
+        // Fetch packs in parallel; each fetch holds one global permit
+        // while it talks to the GHA cache API. The semaphore is never
+        // closed, so acquire only fails after close.
+        let fetches = missing.into_iter().map(|(pack, chunks)| async move {
+            let _permit = self
+                .fetch_semaphore
+                .acquire()
+                .await
+                .expect("fetch semaphore closed");
+            self.fetch_from_pack(pack, chunks).await
+        });
         for fetched in futures_util::future::try_join_all(fetches).await? {
             let mut cache = self.chunk_cache.lock().expect("chunk cache poisoned");
             for (hash, data) in fetched {
@@ -416,7 +429,6 @@ pub struct Substituter {
     access_log: AccessLog,
     fetcher: ChunkFetcher,
     activity_hook: Option<ActivityHook>,
-    nar_semaphore: Arc<Semaphore>,
 }
 
 impl Substituter {
@@ -433,7 +445,6 @@ impl Substituter {
             access_log,
             fetcher: ChunkFetcher::new(twirp, http),
             activity_hook: None,
-            nar_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_NAR_FETCHES)),
         }
     }
 
@@ -578,14 +589,9 @@ async fn nar(
     // would let GC collect paths that are actively being substituted.
     state.access_log.record(path_hash);
 
-    // Cap concurrent fetches — each NAR pull may issue several Twirp +
-    // Range calls and Nix fires all requests at once (WantMassQuery: 1).
-    let Ok(_permit) = state.nar_semaphore.acquire().await else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-
-    // Fetch all chunks; any failure means 404 (Nix rebuilds or falls
-    // through), never partial data.
+    // Fetch all chunks (concurrency-capped inside the fetcher); any
+    // failure means 404 (Nix rebuilds or falls through), never partial
+    // data.
     let chunks = match state
         .fetcher
         .fetch_path_chunks(&view.manifest, path_hash, entry)
@@ -600,7 +606,7 @@ async fn nar(
 
     // NAR assembly and the full-NAR hash are CPU-bound and run as single
     // non-yielding polls (the Vec sink never pends), so they go off the
-    // runtime workers: with up to MAX_CONCURRENT_NAR_FETCHES of them, a
+    // runtime workers: with many NAR requests assembling at once, a
     // multi-hundred-MiB path would otherwise pin every worker thread and
     // starve the hook socket (whose client times out and silently drops
     // path registrations).
