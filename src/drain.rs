@@ -58,6 +58,9 @@ pub fn summarize(stats: &DrainStats) -> String {
     if stats.failed_verification > 0 {
         parts.push(format!("{} FAILED VERIFICATION", stats.failed_verification));
     }
+    if stats.failed_chunking > 0 {
+        parts.push(format!("{} FAILED CHUNKING", stats.failed_chunking));
+    }
     let mut summary = parts.join(", ");
     if stats.packs_uploaded > 0 {
         let mut inner = human_bytes(stats.bytes_uploaded);
@@ -149,6 +152,7 @@ mod tests {
             skipped_upstream: 2,
             skipped_invalid: 1,
             failed_verification: 0,
+            failed_chunking: 0,
             new_chunks: 123,
             packs_uploaded: 1,
             bytes_uploaded: 456_789,
@@ -242,6 +246,15 @@ mod tests {
             ..DrainStats::default()
         };
         assert!(summarize(&stats).contains("2 FAILED VERIFICATION"));
+    }
+
+    #[test]
+    fn chunking_failures_are_loud() {
+        let stats = DrainStats {
+            failed_chunking: 1,
+            ..DrainStats::default()
+        };
+        assert!(summarize(&stats).contains("1 FAILED CHUNKING"));
     }
 
     #[tokio::test]

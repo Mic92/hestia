@@ -318,13 +318,34 @@ impl PipelineContext {
 
             'paths: for (path, info) in to_push {
                 let chunk_started = std::time::Instant::now();
-                let chunked = chunk_path(&path).await?;
+                // Per-path chunking failures (unreadable files, NAR contents
+                // hestia cannot represent) are skipped, not propagated: a
+                // pipeline error would re-buffer the whole batch, and a
+                // deterministic failure would then keep every later drain --
+                // including the final shutdown drain -- from caching
+                // anything at all.
+                let chunked = match chunk_path(&path).await {
+                    Ok(chunked) => chunked,
+                    Err(err) => {
+                        eprintln!("hestia: NOT uploading {path}: chunking failed: {err}");
+                        stats.failed_chunking += 1;
+                        continue;
+                    }
+                };
                 let chunk_map = chunked.chunk_map();
 
                 // Integrity gate: the chunked representation must reproduce
                 // the NAR hash Nix recorded for this path. A mismatch means
                 // hestia would serve corrupt data; never upload it.
-                let (nar_hash, nar_size) = nar_hash_from_chunks(&chunked.tree, &chunk_map).await?;
+                let (nar_hash, nar_size) =
+                    match nar_hash_from_chunks(&chunked.tree, &chunk_map).await {
+                        Ok(result) => result,
+                        Err(err) => {
+                            eprintln!("hestia: NOT uploading {path}: NAR replay failed: {err}");
+                            stats.failed_chunking += 1;
+                            continue;
+                        }
+                    };
                 stats.chunk_ms += chunk_started.elapsed().as_millis() as u64;
                 if nar_hash != info.nar_hash || nar_size != info.nar_size {
                     eprintln!(

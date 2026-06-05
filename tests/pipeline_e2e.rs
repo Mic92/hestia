@@ -397,6 +397,44 @@ async fn accessed_paths_join_the_root_without_store_queries() {
 }
 
 #[tokio::test]
+async fn unchunkable_path_is_skipped_without_failing_the_drain() {
+    // A path that deterministically fails chunking (here: its contents
+    // vanished from disk while staying registered in the store database)
+    // must not abort the whole drain: the healthy path still gets cached
+    // and the drain reports success.
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let good = store.add_fixture("chunkable", 29);
+    let bad = store.add_fixture("unchunkable", 31);
+    // Make the bad path unreadable on disk; the DB still lists it.
+    std::process::Command::new("chmod")
+        .arg("-R")
+        .arg("u+w")
+        .arg(&bad)
+        .status()
+        .unwrap();
+    std::fs::remove_dir_all(&bad).unwrap();
+
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let ctx = context(&fake, &http, store.database());
+
+    let stats = ctx
+        .run(to_path_set(&[&good, &bad]), BTreeSet::new(), now_unix())
+        .await
+        .expect("a per-path chunking failure must not fail the drain");
+
+    assert_eq!(stats.failed_chunking, 1);
+    assert_eq!(stats.pushed, 1);
+    assert_eq!(stats.manifest_version, 1);
+
+    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
+    assert!(manifest.paths.contains_key(&path_hash_of(&good)));
+    assert!(!manifest.paths.contains_key(&path_hash_of(&bad)));
+}
+
+#[tokio::test]
 async fn redundant_root_refresh_does_not_commit() {
     // The SIGTERM final drain re-runs with the same access-log snapshot a
     // previous drain already committed. When nothing changed but the

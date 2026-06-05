@@ -389,9 +389,12 @@ impl TreeBuilder {
     }
 }
 
-fn name_to_string(name: &[u8]) -> Result<String, Error> {
+/// NAR permits arbitrary bytes in entry names and symlink targets, but the
+/// manifest stores them as UTF-8 (a representation limit); `what` names the
+/// field so the diagnostic points at the right one.
+fn name_to_string(name: &[u8], what: &str) -> Result<String, Error> {
     String::from_utf8(name.to_vec())
-        .map_err(|_| Error::InvalidNar(format!("non-UTF-8 entry name: {name:?}")))
+        .map_err(|_| Error::InvalidNar(format!("non-UTF-8 {what}: {name:?}")))
 }
 
 /// Walk `path` with harmonia's NAR dumper, splitting every regular file into
@@ -409,16 +412,16 @@ pub async fn chunk_path(path: impl Into<PathBuf>) -> Result<ChunkedPath, Error> 
     while let Some(event) = events.next().await {
         match event? {
             NarEvent::StartDirectory { name } => {
-                builder.start_directory(name_to_string(&name)?);
+                builder.start_directory(name_to_string(&name, "entry name")?);
             }
             NarEvent::EndDirectory => {
                 builder.end_directory()?;
             }
             NarEvent::Symlink { name, target } => {
                 builder.place(
-                    name_to_string(&name)?,
+                    name_to_string(&name, "entry name")?,
                     FileTree(FileSystemObject::Symlink(Symlink {
-                        target: name_to_string(&target)?,
+                        target: name_to_string(&target, "symlink target")?,
                     })),
                 )?;
             }
@@ -439,7 +442,7 @@ pub async fn chunk_path(path: impl Into<PathBuf>) -> Result<ChunkedPath, Error> 
                     }
                 }
                 builder.place(
-                    name_to_string(&name)?,
+                    name_to_string(&name, "entry name")?,
                     FileTree(FileSystemObject::Regular(Regular {
                         executable,
                         contents: list,
