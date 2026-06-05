@@ -432,6 +432,16 @@ async fn unchunkable_path_is_skipped_without_failing_the_drain() {
     let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
     assert!(manifest.paths.contains_key(&path_hash_of(&good)));
     assert!(!manifest.paths.contains_key(&path_hash_of(&bad)));
+
+    // The rejected path must not be pinned by the root either: a root
+    // member without a PathEntry is a dangling hash the cache can never
+    // serve.
+    let root = &manifest.roots[TEST_ROOT_KEY];
+    assert!(root.paths.contains(&path_hash_of(&good)));
+    assert!(
+        !root.paths.contains(&path_hash_of(&bad)),
+        "rejected paths must not join the committed root"
+    );
 }
 
 #[tokio::test]
