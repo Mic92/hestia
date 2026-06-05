@@ -65,7 +65,7 @@ themselves; hestia's own integration tests use it.
 | Input | Default | Description |
 |---|---|---|
 | `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
-| `version` | — | Release tag to download (e.g. `v0.1.0-alpha.4`). The download is verified against GitHub's build attestations. |
+| `version` | latest release | Release tag to download (e.g. `v0.1.0-alpha.10`). The download is verified against GitHub's build attestations. |
 | `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
 | `listen` | `127.0.0.1:37515` | Substituter listen address. |
 | `socket` | `/tmp/hestia/hook.sock` | Post-build-hook unix socket path. |
