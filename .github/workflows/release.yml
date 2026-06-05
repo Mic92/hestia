@@ -51,8 +51,6 @@ jobs:
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
         uses: ./action
-        with:
-          version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
       - name: Build release binary
         run: nix build .#
       - name: Prepare release asset

@@ -12,16 +12,12 @@ permissions:
 jobs:
   # Formatting, clippy, tests, and the package build, all as flake checks.
   #
-  # Also the dogfood job: with the repository variables below set, these
-  # derivations are cached through hestia itself, so cache breakage shows
-  # up as slow or failing CI. The daemon is bootstrapped from a released
-  # binary (this job cannot use the package it is about to build); with
-  # the variables unset the dogfood step is skipped.
-  #   HESTIA_DOGFOOD          "true"
-  #   HESTIA_DOGFOOD_VERSION  release tag, e.g. "v0.1.0-alpha.4"
-  #
-  # macOS jobs do not dogfood yet: no release ships darwin binaries. Drop
-  # the runner.os conditions once one does.
+  # Also the dogfood job: with the HESTIA_DOGFOOD repository variable set
+  # to "true", these derivations are cached through hestia itself (the
+  # latest published release), so cache breakage shows up as slow or
+  # failing CI. The daemon is bootstrapped from a released binary (this
+  # job cannot use the package it is about to build); with the variable
+  # unset the dogfood step is skipped.
   build:
     strategy:
       fail-fast: false
@@ -38,8 +34,6 @@ jobs:
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
         uses: ./action
-        with:
-          version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
       - name: Run flake checks
         run: nix flake check --print-build-logs
       # No-op after the flake checks; asserts the closures the dependent
@@ -68,8 +62,6 @@ jobs:
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
         uses: ./action
-        with:
-          version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
       # Explicitly empty binary/version: token-capture-only mode (must
       # stay tested). version defaults to "latest" when omitted.
       - uses: ./action
@@ -125,11 +117,13 @@ jobs:
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
         uses: ./action
-        with:
-          version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
-      # Token-capture-only mode when dogfooding is off (forks).
+      # Token-capture-only mode when dogfooding is off (forks). Explicitly
+      # empty version: it defaults to "latest" when omitted, which would
+      # start an unwanted daemon.
       - uses: ./action
         if: vars.HESTIA_DOGFOOD != 'true'
+        with:
+          version: ""
       - name: Build hestia
         run: nix build .# -o hestia-bin
       - name: Run GC (dry run)
@@ -159,8 +153,6 @@ jobs:
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
         uses: ./action
-        with:
-          version: ${{ vars.HESTIA_DOGFOOD_VERSION }}
       - name: Build hestia
         run: nix build .# -o hestia-bin
       # Instance under test on its own port/socket, started last: the
