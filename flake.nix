@@ -7,7 +7,7 @@
   inputs.crane.url = "github:ipetkov/crane";
 
   outputs =
-    {
+    inputs@{
       self,
       nixpkgs,
       treefmt-nix,
@@ -85,6 +85,14 @@
           clippy = (craneFor pkgs).clippy;
           tests = (craneFor pkgs).tests;
           gha-real-tests = self.packages.${system}.gha-real-tests;
+          # Input sources end up in the binary cache, so later runs
+          # substitute them instead of re-fetching from GitHub.
+          flake-inputs = pkgs.linkFarm "flake-inputs" (
+            lib.mapAttrsToList (name: input: {
+              inherit name;
+              path = input.outPath;
+            }) (removeAttrs inputs [ "self" ])
+          );
         }
       );
     };
