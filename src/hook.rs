@@ -5,9 +5,12 @@
 //! over the unix socket and exits.
 //!
 //! **This command must always exit 0.** A failing post-build-hook fails
-//! the nix build that triggered it. Losing a path registration is harmless
-//! (the path gets rebuilt and re-registered on a future run); failing a
-//! build over it is not. All errors go to stderr only.
+//! the nix build that triggered it. On ephemeral runners losing a path
+//! registration is harmless (the path gets rebuilt and re-registered on a
+//! future run); on persistent runners a leaf path may stay uncached until
+//! the local store is GC'd, because Nix never rebuilds a still-valid path
+//! and so never fires the hook for it again. Failing a build over it is
+//! worse either way. All errors go to stderr only.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
