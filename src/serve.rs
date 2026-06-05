@@ -78,6 +78,14 @@ struct DaemonState {
     /// (a long drain, a large NAR fetch) would trip the timer mid-flight
     /// and get severed by the shutdown.
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set once shutdown begins: Add requests are rejected from then on
+    /// (an accepted-and-ACKed path that misses the final drain would be
+    /// silently dropped at process exit).
+    shutting_down: std::sync::atomic::AtomicBool,
+    /// Number of connection tasks currently alive. The shutdown path
+    /// waits for this to reach zero so a response in flight (e.g. the
+    /// drain client's stats) is flushed before the process exits.
+    connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Keeps the daemon alive while held: counts as in-flight work for the
@@ -170,6 +178,11 @@ impl DaemonState {
         self.touch();
         match request {
             Request::Add { paths } => {
+                if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Response::error(
+                        "daemon is shutting down; path not registered".to_string(),
+                    );
+                }
                 let count = {
                     let mut buffered = self.buffered.lock().expect("buffer lock poisoned");
                     buffered.extend(paths);
@@ -240,6 +253,8 @@ impl Daemon {
                 drain_lock: tokio::sync::Mutex::new(()),
                 last_activity: Arc::new(Mutex::new(Instant::now())),
                 in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }),
             listener,
             idle_exit,
@@ -271,6 +286,10 @@ impl Daemon {
             idle_exit,
         } = self;
 
+        // Closing this channel tells connection tasks to stop at their
+        // next read instead of waiting for the client to hang up.
+        let (conn_shutdown_tx, conn_shutdown_rx) = tokio::sync::watch::channel(false);
+
         // Accept loop: one task per connection.
         let accept_state = Arc::clone(&state);
         let accept = async move {
@@ -278,10 +297,19 @@ impl Daemon {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let state = Arc::clone(&accept_state);
+                        let mut shutdown_rx = conn_shutdown_rx.clone();
+                        state
+                            .connections
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         tokio::spawn(async move {
-                            if let Err(err) = handle_connection(&state, stream).await {
+                            if let Err(err) =
+                                handle_connection(&state, stream, &mut shutdown_rx).await
+                            {
                                 eprintln!("hestia serve: connection error: {err}");
                             }
+                            state
+                                .connections
+                                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         });
                     }
                     Err(err) if is_transient_accept_error(&err) => {
@@ -327,9 +355,42 @@ impl Daemon {
             }
         }
 
+        // No new registrations from here on: an Add accepted after the
+        // final drain snapshots the buffer would be ACKed and then
+        // silently dropped at process exit.
+        state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
         // Final drain: whatever is still buffered must be uploaded before
-        // the runner disappears.
-        state.drain().await
+        // the runner disappears. Adds that raced in before the flag
+        // landed are caught by re-draining until the buffer stays empty.
+        let mut stats = state.drain().await?;
+        while state.buffered_count() > 0 {
+            let more = state.drain().await?;
+            stats.paths_received += more.paths_received;
+            stats.pushed += more.pushed;
+            stats.new_chunks += more.new_chunks;
+            stats.packs_uploaded += more.packs_uploaded;
+            stats.bytes_uploaded += more.bytes_uploaded;
+            if more.manifest_version > 0 {
+                stats.manifest_version = more.manifest_version;
+            }
+        }
+
+        // Let connection tasks flush their responses (e.g. the drain
+        // client's stats line) before the runtime is torn down. Tasks
+        // idle at a read return promptly via the watch channel; the
+        // timeout bounds a client that never reads its response.
+        let _ = conn_shutdown_tx.send(true);
+        let flush_deadline = Instant::now() + Duration::from_secs(5);
+        while state.connections.load(std::sync::atomic::Ordering::SeqCst) > 0
+            && Instant::now() < flush_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        Ok(stats)
     }
 }
 
@@ -348,7 +409,12 @@ fn is_transient_accept_error(err: &std::io::Error) -> bool {
 }
 
 /// Serve one client connection: JSON request lines, JSON response lines.
-async fn handle_connection(state: &DaemonState, stream: UnixStream) -> std::io::Result<()> {
+/// Returns when the client hangs up or `shutdown` flips to true.
+async fn handle_connection(
+    state: &DaemonState,
+    stream: UnixStream,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
     let mut stream = BufReader::new(stream);
     let mut line = Vec::new();
     loop {
@@ -359,10 +425,11 @@ async fn handle_connection(state: &DaemonState, stream: UnixStream) -> std::io::
         // accumulated buffer and would error out before the oversize and
         // malformed-request responses below get a chance to be sent (e.g.
         // when the cap lands inside a multi-byte character).
-        let read = (&mut stream)
-            .take(MAX_REQUEST_BYTES)
-            .read_until(b'\n', &mut line)
-            .await?;
+        let mut bounded = (&mut stream).take(MAX_REQUEST_BYTES);
+        let read = tokio::select! {
+            read = bounded.read_until(b'\n', &mut line) => read?,
+            _ = shutdown.wait_for(|down| *down) => return Ok(()),
+        };
         if read == 0 {
             return Ok(()); // client hung up
         }
@@ -545,6 +612,19 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
                 result.expect("installing SIGINT handler failed");
             },
         }
+        // Tokio's signal registration disables the default disposition
+        // for the rest of the process, so without a live listener a
+        // second SIGTERM/^C during a hung final drain would be silently
+        // swallowed and only SIGKILL would work. Keep listening and
+        // force-exit on the second signal.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = sigterm.recv() => {},
+                _ = tokio::signal::ctrl_c() => {},
+            }
+            eprintln!("hestia serve: second signal received, exiting without finishing the drain");
+            std::process::exit(1);
+        });
     };
 
     let result = daemon.run(shutdown).await;
