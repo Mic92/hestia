@@ -94,7 +94,18 @@ pub fn current_system() -> String {
         "macos" => "darwin",
         os => os,
     };
-    format!("{}-{os}", std::env::consts::ARCH)
+    // Rust arch names diverge from Nix system spellings on some platforms;
+    // the value defaults the manifest root key, so an unmapped spelling
+    // fragments (or collides) GC roots against jobs passing --system with
+    // the Nix spelling.
+    let arch = match std::env::consts::ARCH {
+        "x86" => "i686",
+        // Rust reports "arm" for all 32-bit ARM; armv7l is the common
+        // case. armv6l hosts must pass --system explicitly.
+        "arm" => "armv7l",
+        arch => arch,
+    };
+    format!("{arch}-{os}")
 }
 
 /// Manifest root key for a branch + system pair, e.g. `main-x86_64-linux`.
@@ -572,11 +583,13 @@ mod tests {
 
     #[test]
     fn current_system_matches_nix_convention() {
+        // Assert the arch-os shape rather than enumerating blessed values:
+        // the function must work on any host the binary is built for.
         let system = current_system();
-        // x86_64-linux, aarch64-linux, aarch64-darwin, x86_64-darwin
         let (arch, os) = system.split_once('-').expect("system has arch-os form");
-        assert!(["x86_64", "aarch64"].contains(&arch), "arch: {arch}");
-        assert!(["linux", "darwin"].contains(&os), "os: {os}");
+        assert!(!arch.is_empty() && !os.is_empty(), "system: {system}");
+        assert!(!["x86", "arm", "macos"].contains(&arch), "arch: {arch}");
+        assert_ne!(os, "macos", "os must use the Nix spelling");
     }
 
     #[test]
