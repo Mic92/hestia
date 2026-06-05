@@ -37,7 +37,7 @@ async fn hook_exits_zero_when_daemon_is_unreachable() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("failed to reach daemon"),
+        stderr.contains("did not accept the paths"),
         "error must be reported on stderr, got: {stderr}"
     );
 }

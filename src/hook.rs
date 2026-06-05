@@ -67,9 +67,11 @@ pub async fn run(args: &HookArgs) -> ExitCode {
         Ok(Ok(buffered)) => {
             eprintln!("hestia hook: registered {count} path(s), {buffered} buffered for upload");
         }
+        // Most error variants occur after the daemon was reached, so do
+        // not claim it was unreachable.
         Ok(Err(err)) => {
             eprintln!(
-                "hestia hook: failed to reach daemon at {}: {err} \
+                "hestia hook: daemon at {} did not accept the paths: {err} \
                  (build continues; paths will be re-pushed on a future run)",
                 args.socket.display()
             );
