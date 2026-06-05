@@ -357,6 +357,36 @@ async fn failed_drain_keeps_paths_buffered_for_retry() {
 }
 
 #[tokio::test]
+async fn bind_creates_a_private_socket_directory() {
+    // The default socket path lives under world-writable /tmp and the
+    // protocol has no authentication: the directory hestia creates must
+    // not be accessible to other local users.
+    use std::os::unix::fs::PermissionsExt as _;
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("private").join("hook.sock");
+
+    let daemon = RunningDaemon::start(
+        socket.clone(),
+        None,
+        pipeline_context(&fake, &http, StoreDatabase::new("/nonexistent/db.sqlite")),
+    )
+    .await;
+
+    let mode = std::fs::metadata(socket.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o777,
+        0o700,
+        "socket directory must be private to the daemon's user"
+    );
+    let _ = daemon.stop().await;
+}
+
+#[tokio::test]
 async fn shutdown_closes_idle_connections_and_rejects_late_adds() {
     // Connection tasks must not outlive the daemon: an idle client gets
     // EOF at shutdown instead of a forever-open socket, and an Add after

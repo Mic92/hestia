@@ -227,7 +227,25 @@ impl Daemon {
         pipeline.publish = Some(manifest_store);
 
         if let Some(parent) = socket.parent() {
-            std::fs::create_dir_all(parent)?;
+            // The default path lives under world-writable /tmp and the
+            // line protocol has no authentication: create the directory
+            // 0700 so other local users cannot connect, and refuse a
+            // pre-existing directory owned by someone else (its owner
+            // could unlink our socket and bind their own in its place).
+            use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(parent)?;
+            let metadata = std::fs::metadata(parent)?;
+            let uid = unsafe { libc::getuid() };
+            if metadata.uid() != uid {
+                return Err(std::io::Error::other(format!(
+                    "socket directory {} is owned by uid {} (we are uid {uid}); \
+                     a foreign owner could replace the socket underneath us",
+                    parent.display(),
+                    metadata.uid(),
+                )));
+            }
         }
         if std::os::unix::net::UnixStream::connect(socket).is_ok() {
             return Err(std::io::Error::new(
