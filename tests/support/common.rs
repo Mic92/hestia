@@ -19,9 +19,10 @@ use super::fake_gha::FakeGha;
 /// Root key (branch + system) used by all pipeline-driving tests.
 pub const TEST_ROOT_KEY: &str = "main-test-system";
 
-/// Pipeline context against the fake backend. The default upstream filter
-/// passes scratch-store paths because they are unsigned, just like locally
-/// built paths in production.
+/// Pipeline context against the fake backend. Uses the default upstream
+/// key set (production only enables filtering with
+/// --upstream-cache-filter); scratch-store paths pass either way because
+/// they are unsigned, just like locally built paths.
 pub fn pipeline_context(
     fake: &FakeGha,
     http: &reqwest::Client,
