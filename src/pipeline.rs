@@ -312,6 +312,12 @@ impl PipelineContext {
 
         let producer = async {
             let mut prepared: Vec<PreparedPath> = Vec::new();
+            // Stage timers accumulate as Durations and convert to ms once:
+            // per-path as_millis() truncation would drop up to ~1 ms per
+            // path, systematically underreporting drains of many small
+            // paths.
+            let mut chunk_time = std::time::Duration::ZERO;
+            let mut pack_time = std::time::Duration::ZERO;
             // Chunks of earlier prepared paths in this batch (cross-path dedup).
             let mut batch_chunks: BTreeSet<crate::manifest::ChunkHash> = BTreeSet::new();
             let mut builder = PackBuilder::new();
@@ -346,7 +352,7 @@ impl PipelineContext {
                             continue;
                         }
                     };
-                stats.chunk_ms += chunk_started.elapsed().as_millis() as u64;
+                chunk_time += chunk_started.elapsed();
                 if nar_hash != info.nar_hash || nar_size != info.nar_size {
                     eprintln!(
                         "hestia: NOT uploading {path}: chunked NAR hash {nar_hash} (size \
@@ -377,7 +383,7 @@ impl PipelineContext {
                         // Pause the pack timer across the send: a full
                         // channel blocks on upload backpressure, which must
                         // not be booked as packing time.
-                        stats.pack_ms += pack_started.elapsed().as_millis() as u64;
+                        pack_time += pack_started.elapsed();
                         if pack_tx.send(pack).await.is_err() {
                             // Uploader gone: it failed, and try_join below
                             // reports its error; stop producing.
@@ -386,7 +392,7 @@ impl PipelineContext {
                         pack_started = std::time::Instant::now();
                     }
                 }
-                stats.pack_ms += pack_started.elapsed().as_millis() as u64;
+                pack_time += pack_started.elapsed();
 
                 prepared.push(PreparedPath {
                     hash: info.path_hash(),
@@ -414,6 +420,8 @@ impl PipelineContext {
             }
             // pack_tx drops here, ending the consumer's stream.
             drop(pack_tx);
+            stats.chunk_ms = chunk_time.as_millis() as u64;
+            stats.pack_ms = pack_time.as_millis() as u64;
             Ok::<_, Error>(prepared)
         };
 

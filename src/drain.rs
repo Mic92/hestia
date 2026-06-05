@@ -31,7 +31,9 @@ pub fn human_bytes(bytes: u64) -> String {
     for next in ["KiB", "MiB", "GiB", "TiB"] {
         value /= 1024.0;
         unit = next;
-        if value < 1024.0 {
+        // 1023.95 instead of 1024.0: values in [1023.95, 1024.0) would
+        // round to the self-contradictory "1024.0" in the smaller unit.
+        if value < 1023.95 {
             break;
         }
     }
@@ -64,11 +66,14 @@ pub fn summarize(stats: &DrainStats) -> String {
     let mut summary = parts.join(", ");
     if stats.packs_uploaded > 0 {
         let mut inner = human_bytes(stats.bytes_uploaded);
-        if stats.elapsed_ms > 0 {
+        if stats.upload_ms > 0 {
+            // Rate over upload_ms, not elapsed_ms: a "/s" figure next to
+            // uploaded bytes reads as upload throughput, and dividing by
+            // whole-drain wall time understated it severalfold.
             inner.push_str(&format!(
                 " in {}, {}/s",
                 seconds(stats.elapsed_ms),
-                human_bytes(throughput(stats.bytes_uploaded, stats.elapsed_ms))
+                human_bytes(throughput(stats.bytes_uploaded, stats.upload_ms))
             ));
         }
         summary.push_str(&format!(" ({inner})"));
@@ -92,7 +97,10 @@ pub fn stage_breakdown(stats: &DrainStats) -> String {
         format!("load {}", seconds(stats.load_ms)),
         format!("chunk {}", seconds(stats.chunk_ms)),
     ];
-    if stats.packs_uploaded > 0 {
+    // Gate on new_chunks, not packs_uploaded: when a concurrent job won the
+    // upload race every pack comes back already_exists, yet the pack and
+    // upload stages still consumed most of the wall time and must show up.
+    if stats.new_chunks > 0 {
         stages.push(format!(
             "pack {} ({}, {})",
             seconds(stats.pack_ms),
@@ -190,7 +198,7 @@ mod tests {
         assert_eq!(
             summarize(&stats),
             "pushed 4 paths, 3 already cached, 2 upstream-signed, 1 invalid \
-             (446.1 KiB in 2.0s, 223.0 KiB/s); manifest m#7"
+             (446.1 KiB in 2.0s, 2.2 MiB/s); manifest m#7"
         );
         assert_eq!(
             stage_breakdown(&stats),
@@ -218,6 +226,31 @@ mod tests {
     }
 
     #[test]
+    fn dedup_race_still_shows_pack_and_upload_stages() {
+        // Every pack came back already_exists (a concurrent job won the
+        // race): packs_uploaded is 0, but the pack and upload stages still
+        // consumed the bulk of the drain and must appear in the breakdown.
+        let stats = DrainStats {
+            pushed: 2,
+            new_chunks: 50,
+            packs_uploaded: 0,
+            manifest_version: 3,
+            load_ms: 100,
+            chunk_ms: 400,
+            pack_ms: 700,
+            upload_ms: 900,
+            commit_ms: 100,
+            elapsed_ms: 2_300,
+            ..DrainStats::default()
+        };
+        assert_eq!(
+            stage_breakdown(&stats),
+            "load 0.1s, chunk 0.4s, pack 0.7s (50 chunks, 0 packs), \
+             upload 0.9s (0 B/s), commit 0.1s, total 2.3s"
+        );
+    }
+
+    #[test]
     fn singular_counts_have_no_plural_s() {
         let stats = DrainStats {
             pushed: 1,
@@ -234,7 +267,7 @@ mod tests {
         };
         assert_eq!(
             summarize(&stats),
-            "pushed 1 path (1.0 MiB in 1.0s, 1.0 MiB/s); manifest m#1"
+            "pushed 1 path (1.0 MiB in 1.0s, 2.0 MiB/s); manifest m#1"
         );
         assert_eq!(
             stage_breakdown(&stats),
@@ -257,6 +290,8 @@ mod tests {
         assert_eq!(human_bytes(1023), "1023 B");
         assert_eq!(human_bytes(1024), "1.0 KiB");
         assert_eq!(human_bytes(456_789), "446.1 KiB");
+        // One byte short of 1 MiB must not render as "1024.0 KiB".
+        assert_eq!(human_bytes(1_048_575), "1.0 MiB");
         assert_eq!(human_bytes(67_694_023), "64.6 MiB");
         assert_eq!(human_bytes(3_000_000_000), "2.8 GiB");
         assert_eq!(human_bytes(5_000_000_000_000), "4.5 TiB");
