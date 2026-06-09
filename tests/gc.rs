@@ -999,6 +999,65 @@ async fn stale_drain_resurrecting_dropped_path_keeps_its_pack() {
     .await;
 }
 
+#[tokio::test]
+async fn cas_dedup_touch_shields_orphan_from_the_sweep() {
+    // Regression (found by docs/gc.als, DedupTargetSafe/InFlightUploadSafe):
+    // a drain whose pack upload is a CAS no-op depends on an existing entry
+    // it never transferred -- possibly an aged orphan from a crashed push.
+    // The no-op touches the pack (upload_pack), and GC's recency guard
+    // (created OR accessed within min_age) must skip it until the drain had
+    // time to commit.
+    timed(async {
+        let fake = FakeGha::start().await;
+        let http = client();
+        let sim = SimCache::new(&fake, &http);
+
+        // Keep one live path so the cache is non-trivial.
+        let app = SimPath::new("the-app", 1, 60_000);
+        fake.set_clock(T0);
+        sim.push(
+            "main",
+            std::slice::from_ref(&app),
+            std::slice::from_ref(&app),
+            T0,
+        )
+        .await;
+        // An orphan from a push that crashed before its commit.
+        let orphan_key = sim.upload_orphan_pack(99).await;
+
+        // Two days later a retried push re-produces the identical pack:
+        // CAS no-op + touch.
+        let t1 = T0 + 2 * DAY;
+        fake.set_clock(t1);
+        sim.push("main", &[], std::slice::from_ref(&app), t1).await;
+        sim.upload_orphan_pack(99).await;
+        assert!(
+            one_byte_reads(&fake, &orphan_key) >= 1,
+            "the CAS no-op upload must touch the existing pack"
+        );
+
+        // GC minutes later: the orphan is old by creation time but was
+        // accessed within min_age -> protected.
+        let t2 = t1 + 600;
+        fake.set_clock(t2);
+        let report = sim.gc(GcPolicy::default()).run(false, t2).await.unwrap();
+        assert_eq!(
+            report.orphans_deleted, 0,
+            "a recently touched pack belongs to an in-flight push and must \
+             not be swept"
+        );
+        assert!(sim.stored_pack_keys().await.contains(&orphan_key));
+
+        // Once the touch has aged past min_age, the orphan is collected.
+        let t3 = t1 + DAY;
+        fake.set_clock(t3);
+        let report = sim.gc(GcPolicy::default()).run(false, t3).await.unwrap();
+        assert_eq!(report.orphans_deleted, 1, "the aged orphan is swept");
+        assert!(!sim.stored_pack_keys().await.contains(&orphan_key));
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Crash safety
 // ---------------------------------------------------------------------------

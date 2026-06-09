@@ -24,7 +24,8 @@
 //! either the old state or a state the next GC run converges from (orphaned
 //! uploads are cleaned by the orphan sweep once they are old enough).
 //!
-//! Deletion is deferred (design model-checked in `docs/gc.als`):
+//! Deletion is deferred and double-guarded (design model-checked in
+//! `docs/gc.als`):
 //!
 //! * **Version protection**: packs referenced by *any surviving manifest
 //!   version* are never deleted. A drain's commit merges its drain-start
@@ -32,6 +33,12 @@
 //!   but the snapshot is one of the surviving versions, so everything it
 //!   can resurrect stays protected until cleanup ages the version out.
 //!   Garbage therefore survives one extra run.
+//! * **Recency**: packs whose newest REST entry was created *or accessed*
+//!   within min_age are never deleted — a drain may have just uploaded
+//!   the pack, or CAS-deduped onto it (which touches it; see
+//!   [`crate::pipeline::upload_pack`]). Recency is re-checked with a fresh
+//!   listing right before the REST deletes, so a re-upload landing after
+//!   the commit wins over the stale delete set.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
@@ -360,20 +367,7 @@ pub fn plan(
             *last_accessed = observation.last_accessed;
         }
     }
-    // Newest creation time per key across refs; 0 when any duplicate's
-    // timestamp failed to parse. Deletion is by key across all refs, so a
-    // key is only safe to judge by its newest entry.
-    let mut newest_created: BTreeMap<&str, u64> = BTreeMap::new();
-    for observation in observations.iter().filter(|o| o.pack.is_some()) {
-        let created = newest_created
-            .entry(observation.key.as_str())
-            .or_insert(observation.created);
-        *created = if *created == 0 || observation.created == 0 {
-            0
-        } else {
-            (*created).max(observation.created)
-        };
-    }
+    let recent = recent_packs(observations, now, policy.min_age);
 
     // ① Reconcile: packs GitHub already evicted
     // Packs younger than min_age are never judged evicted: they may have been
@@ -562,17 +556,13 @@ pub fn plan(
             let Some(pack) = observation.pack else {
                 return false;
             };
-            // Judge the key by its *newest* entry across refs: a fresh
-            // duplicate on another ref is an in-flight push's upload, and
-            // deletion removes every ref's copy. `newest == 0` means the
-            // age is unknown: treat it as too young to judge. A pack some
-            // surviving manifest version still references is not an orphan
-            // either: a drain commit can resurrect exactly those references.
-            let newest = newest_created[observation.key.as_str()];
+            // Not an orphan: a recent entry (in-flight push's upload or
+            // CAS-dedup touch, no committed manifest yet), or a pack some
+            // surviving manifest version still references (a drain commit
+            // can resurrect exactly those references).
             !manifest.packs.contains_key(&pack)
                 && !protected.contains(&pack)
-                && newest != 0
-                && now.saturating_sub(newest) > policy.min_age
+                && !recent.contains(&pack)
         })
         .map(|observation| observation.key.clone())
         .collect();
@@ -695,6 +685,35 @@ fn retained_orphans(
         })
         .cloned()
         .collect()
+}
+
+/// Pack hashes whose newest REST entry was created **or accessed** within
+/// `min_age`. These are never deleted: a concurrent drain may have just
+/// uploaded the pack, or CAS-deduped onto it and touched it, without having
+/// committed its manifest yet. Unparsable clocks count as recent (the age
+/// is unknown, so the pack cannot be judged old).
+fn recent_packs(observations: &[PackObservation], now: u64, min_age: u64) -> BTreeSet<PackHash> {
+    let mut recent: BTreeSet<PackHash> = BTreeSet::new();
+    let mut newest: BTreeMap<PackHash, u64> = BTreeMap::new();
+    for observation in observations {
+        let Some(pack) = observation.pack else {
+            continue;
+        };
+        if observation.created == 0 || observation.last_accessed == 0 {
+            recent.insert(pack);
+            continue;
+        }
+        let clock = observation.created.max(observation.last_accessed);
+        let newest_clock = newest.entry(pack).or_insert(clock);
+        *newest_clock = (*newest_clock).max(clock);
+    }
+    recent.extend(
+        newest
+            .into_iter()
+            .filter(|(_, clock)| now.saturating_sub(*clock) <= min_age)
+            .map(|(pack, _)| pack),
+    );
+    recent
 }
 
 /// Outcome of the manifest commit step.
@@ -1047,13 +1066,14 @@ impl GcContext {
         // heal away the drain's just-committed paths.
         let observations = self.observe_packs().await?;
         let observations = observations.as_slice();
-        // Version protection (see the module docs), applied to every
-        // deletable set computed below.
+        // Both delete guards (see the module docs): version protection and
+        // recency. Applied to every deletable/orphan set computed below.
         let protected = self.protected_packs().await?;
+        let recent = recent_packs(observations, now, self.policy.min_age);
         let guard = |deletable: Vec<PackHash>| -> Vec<PackHash> {
             deletable
                 .into_iter()
-                .filter(|pack| !protected.contains(pack))
+                .filter(|pack| !protected.contains(pack) && !recent.contains(pack))
                 .collect()
         };
 
@@ -1210,9 +1230,26 @@ impl GcContext {
         let outcome = self.commit(&repacks, now).await?;
         report.manifest_version = outcome.version;
 
-        // 4-6. Deletes happen strictly after the commit landed.
-        report.packs_deleted = self.delete_packs(&outcome.deletable).await?;
-        report.orphans_deleted = self.delete_orphans(&outcome.orphan_keys).await?;
+        // 4-6. Deletes happen strictly after the commit landed. Recency is
+        // re-checked against a fresh listing right before deleting: between
+        // the commit and here, a drain can have re-uploaded (or CAS-touched)
+        // a pack in the stale delete sets, and that drain must win.
+        let listing = self.observe_packs().await?;
+        let recent = recent_packs(&listing, now, self.policy.min_age);
+        let deletable: Vec<PackHash> = outcome
+            .deletable
+            .iter()
+            .filter(|pack| !recent.contains(pack))
+            .copied()
+            .collect();
+        let orphan_keys: BTreeSet<String> = outcome
+            .orphan_keys
+            .iter()
+            .filter(|key| parse_pack_key(key).is_none_or(|pack| !recent.contains(&pack)))
+            .cloned()
+            .collect();
+        report.packs_deleted = self.delete_packs(&deletable).await?;
+        report.orphans_deleted = self.delete_orphans(&orphan_keys).await?;
         report.manifests_deleted = self.cleanup_manifests(now).await?;
 
         Ok(report)
@@ -1826,6 +1863,14 @@ mod tests {
             created: NOW - 60,
             last_accessed: NOW - 60,
         });
+        // An old pack accessed minutes ago → an in-flight drain CAS-deduped
+        // onto it (the upload no-op touches); not an orphan.
+        observations.push(PackObservation {
+            key: pack_cache_key(&pack_hash(11)),
+            pack: Some(pack_hash(11)),
+            created: NOW - 7 * SECS_PER_DAY,
+            last_accessed: NOW - 60,
+        });
         // A key that merely shares the prefix → foreign entry, never touched.
         observations.push(PackObservation {
             key: "pack-not-a-hash".to_string(),
@@ -1933,6 +1978,48 @@ mod tests {
             "a version-protected pack must not be judged an orphan: {:?}",
             shielded.orphan_keys
         );
+    }
+
+    #[test]
+    fn recent_packs_judges_creation_and_access_clocks() {
+        let observation = |seed: u8, created: u64, last_accessed: u64| PackObservation {
+            key: pack_cache_key(&pack_hash(seed)),
+            pack: Some(pack_hash(seed)),
+            created,
+            last_accessed,
+        };
+        let observations = [
+            // Old and idle -> not recent.
+            observation(1, NOW - SECS_PER_DAY, NOW - SECS_PER_DAY),
+            // Just created -> recent.
+            observation(2, NOW - 60, NOW - 60),
+            // Old but touched minutes ago (CAS dedup) -> recent.
+            observation(3, NOW - SECS_PER_DAY, NOW - 60),
+            // Unparsable clock -> age unknown -> recent.
+            observation(4, 0, NOW),
+        ];
+        let recent = recent_packs(&observations, NOW, policy().min_age);
+        assert!(!recent.contains(&pack_hash(1)));
+        assert!(recent.contains(&pack_hash(2)));
+        assert!(recent.contains(&pack_hash(3)));
+        assert!(recent.contains(&pack_hash(4)));
+    }
+
+    #[test]
+    fn recent_packs_judges_a_key_by_its_newest_entry() {
+        // The listing repeats a key per ref; deletion is by key, so one
+        // recent duplicate makes the whole key recent.
+        let observations: Vec<PackObservation> = [NOW - SECS_PER_DAY, NOW - 60]
+            .into_iter()
+            .map(|clock| PackObservation {
+                key: pack_cache_key(&pack_hash(1)),
+                pack: Some(pack_hash(1)),
+                created: clock,
+                last_accessed: clock,
+            })
+            .collect();
+        let recent = recent_packs(&observations, NOW, policy().min_age);
+        assert!(recent.contains(&pack_hash(1)));
     }
 
     #[test]
