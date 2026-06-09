@@ -39,8 +39,9 @@
 // drain.
 //
 // Not modeled: SaveMutable's reservation mechanics (commits are an atomic
-// CAS here), the ManifestLookupInconsistent guard, plain LRU touches
-// (eviction is already fully nondeterministic), overlapping GC runs (the
+// CAS here; docs/savemutable.als models that layer separately), the
+// ManifestLookupInconsistent guard, plain LRU touches (eviction is
+// already fully nondeterministic), overlapping GC runs (the
 // gc.yml concurrency group prevents them), and chunk integrity checks
 // (corrupt frames abort the run). There are no clocks either: grace/TTL
 // expiry becomes "an unrooted path MAY be dropped", which
