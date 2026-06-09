@@ -197,12 +197,22 @@ impl<'a> SaveMutable<'a> {
         // versions (non-monotonic reads), and a streak that resets on every
         // index change would never reach the stale-skip threshold.
         let mut conflicts: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+        // Newest version seen across iterations (the base ratchet): after
+        // a stale-skip, a regressed load would otherwise move the merge
+        // base backwards past a version this writer already saw, dropping
+        // that version's changes from every later one (docs/savemutable.als,
+        // NoLostUpdate).
+        let mut newest: Option<MutableEntry> = None;
 
         loop {
             let current = self.load().await?;
-            let data = Bytes::from(merge(current.as_ref())?);
+            if current.as_ref().map(|entry| entry.index) > newest.as_ref().map(|entry| entry.index)
+            {
+                newest = current;
+            }
+            let data = Bytes::from(merge(newest.as_ref())?);
 
-            let base = current.as_ref().map(|entry| entry.index).unwrap_or(0);
+            let base = newest.as_ref().map(|entry| entry.index).unwrap_or(0);
             let index = base.max(skip_through) + 1;
             let key = key_for(&self.prefix, index);
 

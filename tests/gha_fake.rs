@@ -344,6 +344,47 @@ async fn savemutable_recovers_from_many_consecutive_dead_reservations() {
 }
 
 #[tokio::test]
+async fn savemutable_regressed_lookup_after_skip_keeps_newest_base() {
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let twirp = fake.twirp(&http);
+
+    store_entry(&twirp, &http, "m#1", b"v1").await;
+    store_entry(&twirp, &http, "m#2", b"v2").await;
+
+    // m#3 is reserved by a crashed writer, so the saver conflicts there
+    // twice (stale_skip_after = 2) and skips it.
+    let Reservation::Created { .. } = twirp.create_cache_entry("m#3").await.unwrap() else {
+        panic!("expected reservation");
+    };
+
+    // Non-monotonic reads: the two lookups during the conflicts see m#2,
+    // every lookup after the skip regresses to m#1. Without the base
+    // ratchet the saver would merge against m#1 and finalize m#4 without
+    // m#2's contents -- a lost update (docs/savemutable.als, NoLostUpdate).
+    fake.set_stale_lookups_after(&http, 2, u64::MAX).await;
+
+    let save = SaveMutable::new(&twirp, &http, "m").with_retry(Duration::from_millis(1), 10, 2);
+    let index = save
+        .save(|current| {
+            let mut data = current.expect("a version is visible").data.to_vec();
+            data.extend_from_slice(b"+w");
+            Ok(data)
+        })
+        .await
+        .unwrap();
+    assert_eq!(index, 4, "saver must land right after the skipped index");
+
+    fake.set_stale_lookups_for(&http, 0).await;
+    let entry = save.load().await.unwrap().expect("entry exists");
+    assert_eq!(
+        entry.data.as_ref(),
+        b"v2+w",
+        "merge base must be the newest version ever seen, not the regressed lookup"
+    );
+}
+
+#[tokio::test]
 async fn savemutable_conflict_gives_up_eventually() {
     let fake = FakeGha::start().await;
     let http = reqwest::Client::new();
