@@ -21,8 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunker::{self, PackBuilder, chunk_path, compress_chunks, nar_hash_from_chunks};
 use crate::gha::Error as GhaError;
+use crate::gha::blob;
 use crate::gha::savemutable::SaveMutable;
-use crate::gha::twirp::{Reservation, TwirpClient};
+use crate::gha::twirp::{DownloadUrl, Reservation, TwirpClient};
 use crate::manifest::{Manifest, PackInfo, PathEntry, PathHash, Root};
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
@@ -147,6 +148,12 @@ pub fn decode_manifest_or_empty(data: &[u8]) -> Manifest {
 /// the write pipeline and GC repack. Returns
 /// `false` when the cache already has it: pack keys are content-addressed,
 /// so an existing entry is guaranteed to hold identical content.
+///
+/// The no-op case touches the existing pack (1-byte Range read): the
+/// caller now depends on an entry it never transferred, and the touch
+/// resets the LRU clock and makes the dependency visible to GC's recency
+/// guard — without it, a concurrent GC could delete the pack before this
+/// writer commits the manifest referencing it (see docs/gc.als).
 pub async fn upload_pack(
     twirp: &TwirpClient,
     http: &reqwest::Client,
@@ -155,7 +162,15 @@ pub async fn upload_pack(
     let key = pack.cache_key();
 
     match twirp.create_cache_entry(&key).await? {
-        Reservation::AlreadyExists => Ok(false),
+        Reservation::AlreadyExists => {
+            // A Miss means the entry vanished between reserve and lookup
+            // (evicted); nothing to touch — the commit still goes through
+            // and the next GC heals the path.
+            if let DownloadUrl::Hit { url, .. } = twirp.get_download_url(&key, &[]).await? {
+                blob::get(http, &url, Some(0..1)).await?;
+            }
+            Ok(false)
+        }
         Reservation::Created { upload_url } => {
             twirp
                 .upload_and_finalize(http, &key, upload_url, pack.data.clone())
