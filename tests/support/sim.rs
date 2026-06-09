@@ -256,6 +256,42 @@ impl SimCache {
             .expect("manifest commit");
     }
 
+    /// Commit a drain whose manifest snapshot was taken earlier (passed in
+    /// instead of loaded): mirrors a long drain racing GC, whose
+    /// merge-commit resurrects everything GC dropped since the snapshot.
+    pub async fn commit_stale_drain(
+        &self,
+        snapshot: &Manifest,
+        root_key: &str,
+        closure: &[SimPath],
+        now: u64,
+    ) {
+        let mut delta = Manifest::new();
+        delta.roots.insert(
+            root_key.to_string(),
+            Root {
+                paths: closure.iter().map(SimPath::path_hash).collect(),
+                updated: now,
+                run_id: None,
+            },
+        );
+        let snapshot = snapshot.clone();
+        self.save_mutable()
+            .save(move |existing| {
+                let base = match existing {
+                    Some(entry) => Manifest::decode(&entry.data)
+                        .map_err(|err| GhaError::InvalidResponse(err.to_string()))?,
+                    None => Manifest::new(),
+                };
+                base.merge(snapshot.clone())
+                    .merge(delta.clone())
+                    .encode()
+                    .map_err(|err| GhaError::InvalidResponse(err.to_string()))
+            })
+            .await
+            .expect("stale drain commit");
+    }
+
     /// Upload a pack blob without ever referencing it from a manifest
     /// (simulates a push that crashed before its manifest commit).
     pub async fn upload_orphan_pack(&self, seed: u64) -> String {

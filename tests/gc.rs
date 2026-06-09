@@ -202,8 +202,10 @@ async fn repack_copies_live_chunks_and_deletes_old_pack_after_commit() {
             report.bytes_uploaded
         );
         assert_eq!(
-            report.packs_deleted, 1,
-            "the old pack is deleted after commit"
+            report.packs_deleted, 0,
+            "deletion is deferred: the superseded manifest version still \
+             references the old pack, so a drain whose snapshot predates \
+             this commit could still resurrect it"
         );
 
         // Manifest: big gone, small alive with relocated chunks.
@@ -217,7 +219,31 @@ async fn repack_copies_live_chunks_and_deletes_old_pack_after_commit() {
             assert!(manifest.packs.contains_key(&location.pack));
         }
 
-        // Cache: old pack physically gone, new pack present.
+        // The old pack stays stored while any surviving manifest version
+        // references it; once cleanup has aged those versions out, the
+        // orphan sweep collects it (within two further nightly runs).
+        let stored = sim.stored_pack_keys().await;
+        assert!(stored.contains(&pack_cache_key(&original_pack)));
+        let mut swept_at = None;
+        for run in 1..=2u64 {
+            let t = t1 + run * DAY;
+            fake.set_clock(t);
+            let report = sim
+                .gc(GcPolicy::default())
+                .run(false, t)
+                .await
+                .expect("follow-up gc run failed");
+            if report.orphans_deleted == 1 {
+                swept_at = Some(run);
+                break;
+            }
+        }
+        assert_eq!(
+            swept_at,
+            Some(2),
+            "the old pack must be swept exactly once every protecting \
+             version aged out (not earlier, not never)"
+        );
         let stored = sim.stored_pack_keys().await;
         assert!(!stored.contains(&pack_cache_key(&original_pack)));
         sim.assert_no_dangling_pack_references().await;
@@ -907,6 +933,72 @@ async fn commit_relists_packs_so_a_long_drain_is_not_judged_evicted() {
     .await;
 }
 
+#[tokio::test]
+async fn stale_drain_resurrecting_dropped_path_keeps_its_pack() {
+    // Regression (found by docs/gc.als, DeleteRespectsCommit): a drain that
+    // loaded the manifest before GC's commit lands its own commit in the
+    // window between GC's commit and GC's REST deletes. The drain's merge
+    // resurrects the dropped path and its chunk locations; the pack they
+    // point at must survive, because the superseded manifest version (the
+    // drain's snapshot) still references it and is therefore protected.
+    timed(async {
+        let fake = FakeGha::start().await;
+        let http = client();
+        let sim = SimCache::new(&fake, &http);
+
+        let big = SimPath::new("big-app", 1, 200_000);
+        let small = SimPath::new("small-lib", 2, 40_000);
+        fake.set_clock(T0);
+        sim.push(
+            "main",
+            &[big.clone(), small.clone()],
+            &[big.clone(), small.clone()],
+            T0,
+        )
+        .await;
+        let original_pack = *sim.manifest().await.packs.keys().next().unwrap();
+
+        // A slow drain takes its manifest snapshot now: big is still alive.
+        let snapshot = sim.manifest().await;
+
+        // 20 days later big is dead; GC repacks small out and commits.
+        let t1 = T0 + 20 * DAY;
+        fake.set_clock(t1);
+        sim.push("main", &[], std::slice::from_ref(&small), t1)
+            .await;
+        let gc = sim.gc(GcPolicy::default());
+        let (_, _, plan) = gc.plan(t1).await.unwrap();
+        let repacks = gc.execute_repacks(&plan).await.unwrap();
+        let outcome = gc.commit(&repacks, t1).await.unwrap();
+
+        // The stale drain commits between GC's commit and GC's deletes,
+        // resurrecting big (and re-rooting it).
+        sim.commit_stale_drain(&snapshot, "main", &[big.clone(), small.clone()], t1 + 60)
+            .await;
+
+        gc.delete_packs(&outcome.deletable).await.unwrap();
+        gc.delete_orphans(&outcome.orphan_keys).await.unwrap();
+
+        // The resurrected path's pack must still be stored and readable.
+        assert!(
+            sim.stored_pack_keys()
+                .await
+                .contains(&pack_cache_key(&original_pack)),
+            "the pack the resurrected path references must not be deleted"
+        );
+        sim.assert_no_dangling_pack_references().await;
+        sim.assert_readable(&[&big, &small]).await;
+
+        // And the next full GC run still respects the now-live reference.
+        let t2 = t1 + DAY;
+        fake.set_clock(t2);
+        sim.gc(GcPolicy::default()).run(false, t2).await.unwrap();
+        sim.assert_no_dangling_pack_references().await;
+        sim.assert_readable(&[&big, &small]).await;
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Crash safety
 // ---------------------------------------------------------------------------
@@ -983,19 +1075,23 @@ async fn crash_between_any_two_execute_steps_never_loses_live_paths() {
             sim.assert_no_dangling_pack_references().await;
             sim.assert_readable(&[&surviving]).await;
 
-            // RECOVERY: the next scheduled GC run (2 hours later, so the
-            // crashed run's uploads are old enough for the orphan sweep).
-            let t2 = t1 + 2 * HOUR;
-            fake.set_clock(t2);
-            sim.gc(GcPolicy::default())
-                .run(false, t2)
-                .await
-                .unwrap_or_else(|err| {
-                    panic!("recovery GC failed (stop_after={stop_after}): {err}")
-                });
-
-            sim.assert_no_dangling_pack_references().await;
-            sim.assert_readable(&[&surviving]).await;
+            // RECOVERY: the following scheduled GC runs. Deletion is
+            // deferred -- a pack survives while any manifest version still
+            // references it and while its entry is recent -- so convergence
+            // takes up to three runs: drop the refs, age the superseded
+            // versions out, sweep the unprotected orphans.
+            for run in 0..3u64 {
+                let t2 = t1 + 2 * HOUR + run * DAY;
+                fake.set_clock(t2);
+                sim.gc(GcPolicy::default())
+                    .run(false, t2)
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("recovery GC failed (stop_after={stop_after}): {err}")
+                    });
+                sim.assert_no_dangling_pack_references().await;
+                sim.assert_readable(&[&surviving]).await;
+            }
 
             // Converged: the dead path is gone and storage holds exactly one
             // pack (the repacked one) — the old pack, the orphan, and any
@@ -1141,7 +1237,31 @@ async fn thirty_day_history_converges_to_live_set_storage() {
             sim.assert_no_dangling_pack_references().await;
         }
 
-        let final_now = T0 + 29 * DAY + HOUR;
+        // Quiet tail: deletion is deferred (a pack stays while any
+        // surviving manifest version references it), so garbage trails the
+        // churn by PathGrace + two GC cycles. A few churn-free days let the
+        // day-28 nixpkgs bump's garbage age out before measuring
+        // convergence.
+        let mut final_now = T0 + 29 * DAY + HOUR;
+        for day in 30..35u64 {
+            let now = T0 + day * DAY;
+            fake.set_clock(now);
+            let closure: Vec<SimPath> = base
+                .iter()
+                .chain(apps.iter())
+                .chain(dailies.iter())
+                .cloned()
+                .collect();
+            sim.push("main-x86_64-linux", &[], &closure, now).await;
+            let gc_now = now + HOUR;
+            fake.set_clock(gc_now);
+            sim.gc(policy.clone())
+                .run(false, gc_now)
+                .await
+                .unwrap_or_else(|err| panic!("GC failed on day {day}: {err}"));
+            sim.assert_no_dangling_pack_references().await;
+            final_now = gc_now;
+        }
 
         // --- The eviction actually happened and healed -------------------
         assert!(

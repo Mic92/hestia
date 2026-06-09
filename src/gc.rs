@@ -16,13 +16,22 @@
 //!               fully live but idle packs → touch (1-byte Range read)
 //! ⑤ Execute     Range-copy verified frames → upload new packs → commit
 //!               manifest (SaveMutable; re-plan on conflict) → REST DELETE
-//!               replaced/garbage packs and orphans
+//!               unprotected garbage packs and orphans
 //! ```
 //!
 //! Crash-safe ordering: replaced packs stay referenced by the manifest until
 //! the commit lands; only then are they deleted. A crash at any point leaves
 //! either the old state or a state the next GC run converges from (orphaned
 //! uploads are cleaned by the orphan sweep once they are old enough).
+//!
+//! Deletion is deferred (design model-checked in `docs/gc.als`):
+//!
+//! * **Version protection**: packs referenced by *any surviving manifest
+//!   version* are never deleted. A drain's commit merges its drain-start
+//!   snapshot back in, which can resurrect references GC just dropped —
+//!   but the snapshot is one of the surviving versions, so everything it
+//!   can resurrect stays protected until cleanup ages the version out.
+//!   Garbage therefore survives one extra run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
@@ -325,6 +334,7 @@ impl PackStats {
 pub fn plan(
     manifest: &Manifest,
     observations: &[PackObservation],
+    protected: &BTreeSet<PackHash>,
     now: u64,
     policy: &GcPolicy,
 ) -> GcPlan {
@@ -553,12 +563,14 @@ pub fn plan(
                 return false;
             };
             // Judge the key by its *newest* entry across refs: a fresh
-            // duplicate on another ref is an in-flight push's upload (or a
-            // retried push's dedup re-use), and deletion removes every
-            // ref's copy. `newest == 0` means the age is unknown: treat it
-            // as too young to judge.
+            // duplicate on another ref is an in-flight push's upload, and
+            // deletion removes every ref's copy. `newest == 0` means the
+            // age is unknown: treat it as too young to judge. A pack some
+            // surviving manifest version still references is not an orphan
+            // either: a drain commit can resurrect exactly those references.
             let newest = newest_created[observation.key.as_str()];
             !manifest.packs.contains_key(&pack)
+                && !protected.contains(&pack)
                 && newest != 0
                 && now.saturating_sub(newest) > policy.min_age
         })
@@ -664,14 +676,23 @@ pub fn apply(
     (manifest, deletable)
 }
 
-/// Filter orphan keys: anything the committed manifest references is not an
-/// orphan, no matter what the pre-commit plan thought. Without this, a GC
-/// run recovering from a crashed predecessor could commit a manifest that
-/// references a previously-orphaned pack and then delete that very pack.
-fn retained_orphans(orphan_keys: &BTreeSet<String>, committed: &Manifest) -> BTreeSet<String> {
+/// Filter orphan keys: anything the committed manifest (or any other
+/// surviving manifest version) references is not an orphan, no matter what
+/// the pre-commit plan thought. Without this, a GC run recovering from a
+/// crashed predecessor could commit a manifest that references a
+/// previously-orphaned pack and then delete that very pack.
+fn retained_orphans(
+    orphan_keys: &BTreeSet<String>,
+    committed: &Manifest,
+    protected: &BTreeSet<PackHash>,
+) -> BTreeSet<String> {
     orphan_keys
         .iter()
-        .filter(|key| parse_pack_key(key).is_none_or(|pack| !committed.packs.contains_key(&pack)))
+        .filter(|key| {
+            parse_pack_key(key).is_none_or(|pack| {
+                !committed.packs.contains_key(&pack) && !protected.contains(&pack)
+            })
+        })
         .cloned()
         .collect()
 }
@@ -788,11 +809,38 @@ impl GcContext {
             .collect())
     }
 
+    /// Union of the pack tables of every surviving manifest version —
+    /// exactly the references a concurrent drain commit can resurrect (its
+    /// snapshot is one of these versions), so nothing in this set may be
+    /// deleted. A version that vanished since the listing protects
+    /// nothing; one that fails to decode aborts the run (deleting with
+    /// unknown references is unsafe).
+    pub async fn protected_packs(&self) -> Result<BTreeSet<PackHash>, Error> {
+        let prefix = format!("{}#", self.manifest_prefix);
+        let entries = self.rest.list_caches(&prefix).await?;
+        let mut protected: BTreeSet<PackHash> = BTreeSet::new();
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.version == self.twirp.version())
+        {
+            match self.twirp.get_download_url(&entry.key, &[]).await? {
+                DownloadUrl::Hit { url, .. } => {
+                    let data = blob::get(&self.http, &url, None).await?;
+                    let manifest = Manifest::decode(&data)?;
+                    protected.extend(manifest.packs.keys().copied());
+                }
+                DownloadUrl::Miss => {}
+            }
+        }
+        Ok(protected)
+    }
+
     /// Read-only planning step (serves `--dry-run`).
     pub async fn plan(&self, now: u64) -> Result<(Manifest, Vec<PackObservation>, GcPlan), Error> {
         let manifest = self.load_manifest().await?;
         let observations = self.observe_packs().await?;
-        let plan = plan(&manifest, &observations, now, &self.policy);
+        let protected = self.protected_packs().await?;
+        let plan = plan(&manifest, &observations, &protected, now, &self.policy);
         Ok((manifest, observations, plan))
     }
 
@@ -999,6 +1047,15 @@ impl GcContext {
         // heal away the drain's just-committed paths.
         let observations = self.observe_packs().await?;
         let observations = observations.as_slice();
+        // Version protection (see the module docs), applied to every
+        // deletable set computed below.
+        let protected = self.protected_packs().await?;
+        let guard = |deletable: Vec<PackHash>| -> Vec<PackHash> {
+            deletable
+                .into_iter()
+                .filter(|pack| !protected.contains(pack))
+                .collect()
+        };
 
         // Skip the commit when it would be a byte-identical no-op. Note
         // this only fires for an empty or fully-unreachable manifest:
@@ -1015,13 +1072,13 @@ impl GcContext {
             Some(entry) => Manifest::decode(&entry.data)?,
             None => Manifest::new(),
         };
-        let base_plan = plan(&base, observations, now, &self.policy);
+        let base_plan = plan(&base, observations, &protected, now, &self.policy);
         let (transformed, deletable) = apply(base.clone(), &base_plan, repacks);
         if transformed == base {
-            let orphan_keys = retained_orphans(&base_plan.orphan_keys, &base);
+            let orphan_keys = retained_orphans(&base_plan.orphan_keys, &base, &protected);
             return Ok(CommitOutcome {
                 version: None,
-                deletable,
+                deletable: guard(deletable),
                 orphan_keys,
             });
         }
@@ -1036,7 +1093,7 @@ impl GcContext {
                     None => Manifest::new(),
                 };
                 // Re-plan against the latest manifest (concurrent pushes).
-                let fresh = plan(&latest, observations, now, &self.policy);
+                let fresh = plan(&latest, observations, &protected, now, &self.policy);
                 let (next, deletable) = apply(latest, &fresh, repacks);
                 let encoded = next
                     .encode()
@@ -1044,8 +1101,8 @@ impl GcContext {
                 // Orphans were judged against the pre-commit manifest; a key
                 // the *committed* manifest references (e.g. a repack output
                 // recovered from a crashed earlier run) is not an orphan.
-                let orphans = retained_orphans(&fresh.orphan_keys, &next);
-                committed = Some((deletable, orphans));
+                let orphans = retained_orphans(&fresh.orphan_keys, &next, &protected);
+                committed = Some((guard(deletable), orphans));
                 Ok(encoded)
             })
             .await?;
@@ -1367,6 +1424,11 @@ mod tests {
         GcPolicy::default()
     }
 
+    /// [`plan`] with the default policy, clock, and no version protection.
+    fn plan_unprotected(manifest: &Manifest, observations: &[PackObservation]) -> GcPlan {
+        plan(manifest, observations, &BTreeSet::new(), NOW, &policy())
+    }
+
     #[test]
     fn pack_key_round_trips() {
         let hash = Hash32::digest(b"some pack");
@@ -1402,7 +1464,7 @@ mod tests {
             .root("live-branch", &[1], NOW - 13 * SECS_PER_DAY)
             .build();
 
-        let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         assert_eq!(plan.drop_roots, vec!["dead-branch".to_string()]);
         // The path stays alive: the live root still pins it.
         assert!(plan.drop_paths.is_empty());
@@ -1428,7 +1490,7 @@ mod tests {
             .root("main", &[1], NOW)
             .build();
 
-        let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         assert_eq!(plan.drop_paths, vec![path_hash(4)]);
     }
 
@@ -1448,7 +1510,7 @@ mod tests {
             .root("main", &[1], NOW)
             .build();
 
-        let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         assert_eq!(plan.drop_paths, vec![path_hash(3)]);
     }
 
@@ -1464,7 +1526,7 @@ mod tests {
             .root("deleted-branch", &[1], NOW - 20 * SECS_PER_DAY)
             .build();
 
-        let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         assert_eq!(plan.drop_roots, vec!["deleted-branch".to_string()]);
         assert_eq!(plan.drop_paths, vec![path_hash(1)]);
         // Everything referenced only by the dead path becomes garbage.
@@ -1490,7 +1552,7 @@ mod tests {
             .filter(|observation| observation.pack != Some(pack_hash(2)))
             .collect();
 
-        let plan = plan(&manifest, &observations, NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observations);
         assert_eq!(plan.evicted_packs, vec![pack_hash(2)]);
         assert_eq!(
             plan.heal_paths,
@@ -1516,7 +1578,7 @@ mod tests {
             .root("main", &[1], NOW)
             .build();
 
-        let plan = plan(&manifest, &[], NOW, &policy());
+        let plan = plan_unprotected(&manifest, &[]);
         assert!(plan.evicted_packs.is_empty());
         assert!(plan.heal_paths.is_empty());
     }
@@ -1535,7 +1597,7 @@ mod tests {
             .root("main", &[1], NOW)
             .build();
 
-        let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         assert_eq!(plan.drop_paths, vec![path_hash(2)]);
         assert_eq!(plan.repack_jobs.len(), 1);
         let job = &plan.repack_jobs[0];
@@ -1559,7 +1621,7 @@ mod tests {
             .path(1, &[1], &[], old, old)
             .build(); // no roots: path 1 is unreachable and out of TTL
 
-        let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         assert_eq!(plan.drop_paths, vec![path_hash(1)]);
         assert!(plan.repack_jobs.is_empty());
         assert_eq!(plan.delete_packs, vec![pack_hash(1)]);
@@ -1580,7 +1642,7 @@ mod tests {
 
         // Idle for 5 days → needs a touch.
         let observations = observe_all(&manifest, NOW - 5 * SECS_PER_DAY);
-        let idle_plan = plan(&manifest, &observations, NOW, &policy());
+        let idle_plan = plan_unprotected(&manifest, &observations);
         assert!(
             idle_plan.repack_jobs.is_empty(),
             "{:?}",
@@ -1591,7 +1653,7 @@ mod tests {
 
         // Recently accessed → nothing to do at all.
         let observations = observe_all(&manifest, NOW - SECS_PER_DAY);
-        let fresh_plan = plan(&manifest, &observations, NOW, &policy());
+        let fresh_plan = plan_unprotected(&manifest, &observations);
         assert!(fresh_plan.touch_packs.is_empty());
     }
 
@@ -1610,7 +1672,7 @@ mod tests {
             .root("main", &[1], NOW)
             .build();
 
-        let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         assert_eq!(plan.repack_jobs.len(), 1);
         assert_eq!(
             plan.repack_jobs[0].tier, TIER_STABLE,
@@ -1632,7 +1694,7 @@ mod tests {
         }
         let manifest = builder.root("main", &[1, 2, 3, 4, 5], NOW).build();
 
-        let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         assert_eq!(plan.repack_jobs.len(), 1);
         assert_eq!(plan.repack_jobs[0].copies.len(), 5);
         assert_eq!(plan.delete_packs.len(), 5);
@@ -1657,7 +1719,7 @@ mod tests {
             .root("main", &[1], NOW)
             .build();
 
-        let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         assert_eq!(plan.repack_jobs.len(), 2);
         let stable = plan
             .repack_jobs
@@ -1700,7 +1762,7 @@ mod tests {
 
         // Every pack has been idle past TouchAge.
         let observations = observe_all(&manifest, NOW - 5 * SECS_PER_DAY);
-        let plan = plan(&manifest, &observations, NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observations);
 
         // The genuine consolidation (packs 2-5 -> one new pack) goes ahead.
         assert_eq!(plan.repack_jobs.len(), 1, "{}", plan.summary());
@@ -1732,7 +1794,7 @@ mod tests {
             .root("main", &[1], NOW)
             .build();
 
-        let plan = plan(&manifest, &observe_all(&manifest, 0), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, 0));
         assert!(
             plan.touch_packs.is_empty(),
             "a pack of unknown idle time must not be force-touched: {:?}",
@@ -1750,19 +1812,19 @@ mod tests {
             .build();
 
         let mut observations = observe_all(&manifest, NOW);
-        // An old pack nobody references → orphan.
+        // An old, idle pack nobody references → orphan.
         observations.push(PackObservation {
             key: pack_cache_key(&pack_hash(9)),
             pack: Some(pack_hash(9)),
             created: NOW - 2 * SECS_PER_HOUR,
-            last_accessed: NOW,
+            last_accessed: NOW - 2 * SECS_PER_HOUR,
         });
         // A young unreferenced pack → in-flight push, leave it alone.
         observations.push(PackObservation {
             key: pack_cache_key(&pack_hash(10)),
             pack: Some(pack_hash(10)),
             created: NOW - 60,
-            last_accessed: NOW,
+            last_accessed: NOW - 60,
         });
         // A key that merely shares the prefix → foreign entry, never touched.
         observations.push(PackObservation {
@@ -1772,7 +1834,7 @@ mod tests {
             last_accessed: NOW,
         });
 
-        let plan = plan(&manifest, &observations, NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observations);
         assert_eq!(
             plan.orphan_keys,
             BTreeSet::from([pack_cache_key(&pack_hash(9))])
@@ -1796,11 +1858,11 @@ mod tests {
                 key: pack_cache_key(&pack_hash(9)),
                 pack: Some(pack_hash(9)),
                 created: NOW - 2 * SECS_PER_HOUR,
-                last_accessed: NOW,
+                last_accessed: NOW - 2 * SECS_PER_HOUR,
             });
         }
 
-        let plan = plan(&manifest, &observations, NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observations);
         assert_eq!(
             plan.orphan_keys,
             BTreeSet::from([pack_cache_key(&pack_hash(9))])
@@ -1829,11 +1891,47 @@ mod tests {
             });
         }
 
-        let plan = plan(&manifest, &observations, NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observations);
         assert!(
             plan.orphan_keys.is_empty(),
             "a key with a fresh duplicate on another ref must not be deleted: {:?}",
             plan.orphan_keys
+        );
+    }
+
+    #[test]
+    fn orphan_keys_respect_protected_versions() {
+        // A pack absent from the head manifest but still referenced by a
+        // surviving superseded version (a drain snapshot could resurrect
+        // it) is not an orphan.
+        let manifest = ManifestBuilder::new()
+            .pack(1, TIER_VOLATILE, NOW - SECS_PER_DAY)
+            .chunk(1, 1, 100, 0)
+            .path(1, &[1], &[], NOW, NOW)
+            .root("main", &[1], NOW)
+            .build();
+
+        let mut observations = observe_all(&manifest, NOW);
+        observations.push(PackObservation {
+            key: pack_cache_key(&pack_hash(9)),
+            pack: Some(pack_hash(9)),
+            created: NOW - 2 * SECS_PER_HOUR,
+            last_accessed: NOW - 2 * SECS_PER_HOUR,
+        });
+
+        let unprotected = plan_unprotected(&manifest, &observations);
+        assert!(
+            unprotected
+                .orphan_keys
+                .contains(&pack_cache_key(&pack_hash(9)))
+        );
+
+        let protected = BTreeSet::from([pack_hash(9)]);
+        let shielded = plan(&manifest, &observations, &protected, NOW, &policy());
+        assert!(
+            shielded.orphan_keys.is_empty(),
+            "a version-protected pack must not be judged an orphan: {:?}",
+            shielded.orphan_keys
         );
     }
 
@@ -1860,7 +1958,7 @@ mod tests {
             last_accessed: NOW,
         });
 
-        let plan = plan(&manifest, &observations, NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observations);
         assert_eq!(
             plan.touch_packs,
             vec![pack_hash(1)],
@@ -1891,7 +1989,7 @@ mod tests {
             last_accessed: 0,
         });
 
-        let plan = plan(&manifest, &observations, NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observations);
         assert!(
             plan.orphan_keys.is_empty(),
             "a pack of unknown age must never be judged an orphan: {:?}",
@@ -1922,7 +2020,7 @@ mod tests {
             last_accessed: NOW - 30 * SECS_PER_DAY,
         });
 
-        let plan = plan(&manifest, &observations, NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observations);
         assert!(
             plan.orphan_keys.is_empty(),
             "foreign cache entries must never be deleted: {:?}",
@@ -1939,7 +2037,7 @@ mod tests {
             .root("main", &[1], NOW)
             .build();
 
-        let plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         let noop = GcPlan {
             now: NOW,
             ..GcPlan::default()
@@ -2040,7 +2138,7 @@ mod tests {
             .root("dead", &[2], NOW - 20 * SECS_PER_DAY)
             .build();
 
-        let gc_plan = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let gc_plan = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         let repacks = fake_repack_output(&gc_plan);
         let (committed, deletable) = apply(manifest, &gc_plan, &repacks);
 
@@ -2084,7 +2182,7 @@ mod tests {
         let observations = observe_all(&v1, NOW);
 
         // Stale plan + executed repack against V1: copies only chunk 1.
-        let stale_plan = plan(&v1, &observations, NOW, &policy());
+        let stale_plan = plan_unprotected(&v1, &observations);
         let repacks = fake_repack_output(&stale_plan);
         assert!(repacks.locations.contains_key(&chunk_hash(1)));
         assert!(!repacks.locations.contains_key(&chunk_hash(2)));
@@ -2115,7 +2213,7 @@ mod tests {
         );
 
         // Commit re-plans against V2 and applies the old repack output.
-        let fresh_plan = plan(&v2, &observations, NOW, &policy());
+        let fresh_plan = plan_unprotected(&v2, &observations);
         let (committed, deletable) = apply(v2, &fresh_plan, &repacks);
 
         // Path 3 and chunk 2 survive.
@@ -2149,11 +2247,11 @@ mod tests {
             .root("main", &[1], NOW)
             .build();
 
-        let first = plan(&manifest, &observe_all(&manifest, NOW), NOW, &policy());
+        let first = plan_unprotected(&manifest, &observe_all(&manifest, NOW));
         let repacks = fake_repack_output(&first);
         let (committed, _) = apply(manifest, &first, &repacks);
 
-        let second = plan(&committed, &observe_all(&committed, NOW), NOW, &policy());
+        let second = plan_unprotected(&committed, &observe_all(&committed, NOW));
         let noop = GcPlan {
             now: NOW,
             ..GcPlan::default()
