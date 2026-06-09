@@ -93,6 +93,8 @@ struct Inner {
     /// not exist yet (simulates the real service's eventual consistency).
     /// Decremented per lookup; `u64::MAX` is effectively "until turned off".
     stale_lookups_remaining: u64,
+    /// Lookups that stay fresh before `stale_lookups_remaining` kicks in.
+    stale_lookups_after: u64,
     /// Number of upcoming signed URLs that are minted already-expired
     /// (simulates a SAS URL that expires between issuance and use).
     dead_sigs_remaining: u64,
@@ -250,10 +252,12 @@ async fn twirp_download_url(State(state): State<AppState>, body: Bytes) -> Respo
         matching.sort_by_key(|e| std::cmp::Reverse(e.created_at));
         // Eventual-consistency injection: the newest entry is not visible
         // yet, so the lookup returns the previous one (or misses).
-        let skip = usize::from(inner.stale_lookups_remaining > 0);
-        matching.get(skip).copied().cloned()
+        let stale = inner.stale_lookups_after == 0 && inner.stale_lookups_remaining > 0;
+        matching.get(usize::from(stale)).copied().cloned()
     });
-    if inner.stale_lookups_remaining > 0 && inner.stale_lookups_remaining < u64::MAX {
+    if inner.stale_lookups_after > 0 {
+        inner.stale_lookups_after -= 1;
+    } else if inner.stale_lookups_remaining > 0 && inner.stale_lookups_remaining < u64::MAX {
         inner.stale_lookups_remaining -= 1;
     }
 
@@ -559,6 +563,17 @@ async fn test_stale_lookups_for(
     Json(json!({ "stale_lookups_remaining": lookups })).into_response()
 }
 
+async fn test_stale_lookups_after(
+    State(state): State<AppState>,
+    Path((fresh, lookups)): Path<(u64, u64)>,
+) -> Response {
+    let mut inner = state.inner.lock().unwrap();
+    inner.stale_lookups_after = fresh;
+    inner.stale_lookups_remaining = lookups;
+    Json(json!({ "stale_lookups_after": fresh, "stale_lookups_remaining": lookups }))
+        .into_response()
+}
+
 async fn test_dead_sigs(State(state): State<AppState>, Path(sigs): Path<u64>) -> Response {
     state.inner.lock().unwrap().dead_sigs_remaining = sigs;
     Json(json!({ "dead_sigs_remaining": sigs })).into_response()
@@ -600,6 +615,7 @@ impl FakeGha {
             creates_until_quota: None,
             blob_read_failures: 0,
             stale_lookups_remaining: 0,
+            stale_lookups_after: 0,
             dead_sigs_remaining: 0,
         }));
         let state = AppState {
@@ -629,6 +645,10 @@ impl FakeGha {
             .route(
                 "/test/stale-lookups-for/{lookups}",
                 post(test_stale_lookups_for),
+            )
+            .route(
+                "/test/stale-lookups-after/{fresh}/{lookups}",
+                post(test_stale_lookups_after),
             )
             .route("/test/dead-sigs/{sigs}", post(test_dead_sigs))
             .with_state(state);
@@ -747,6 +767,17 @@ impl FakeGha {
     /// caught-up one inside a single client call).
     pub async fn set_stale_lookups_for(&self, http: &reqwest::Client, lookups: u64) {
         let url = format!("{}/test/stale-lookups-for/{lookups}", self.base_url);
+        let response = http.post(&url).send().await.expect("stale-lookups request");
+        assert!(response.status().is_success());
+    }
+
+    /// Like [`Self::set_stale_lookups_for`], but the next `fresh` lookups
+    /// stay accurate first (non-monotonic reads: fresh, then regressed).
+    pub async fn set_stale_lookups_after(&self, http: &reqwest::Client, fresh: u64, lookups: u64) {
+        let url = format!(
+            "{}/test/stale-lookups-after/{fresh}/{lookups}",
+            self.base_url
+        );
         let response = http.post(&url).send().await.expect("stale-lookups request");
         assert!(response.status().is_success());
     }
