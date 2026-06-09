@@ -927,16 +927,9 @@ impl GcContext {
         output: &mut RepackOutput,
     ) -> Result<(), Error> {
         let pack = builder.finish();
+        // A CAS no-op (pack already exists) is touched inside upload_pack.
         if upload_pack(&self.twirp, &self.http, &pack).await? {
             output.uploaded += pack.data.len() as u64;
-        } else {
-            // CAS no-op: the pack already existed, so nothing was
-            // transferred and the LRU clock was not reset by an upload.
-            // Touch it so the pack does not idle into the 7-day eviction
-            // while still referenced.
-            if let Some(url) = self.pack_url(&pack.hash).await? {
-                blob::get(&self.http, &url, Some(0..1)).await?;
-            }
         }
         output.packs.insert(
             pack.hash,
