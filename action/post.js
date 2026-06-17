@@ -2,8 +2,12 @@
 //
 // Runs after the job finished (whatever its outcome): tells the daemon to
 // upload all locally-built paths and commit the manifest, then prints what
-// happened. A failed drain marks this post step as failed so it is visible,
-// but it cannot change the job's outcome (post steps never can).
+// happened. The cache is best-effort, so this step always exits 0: the build
+// already succeeded, and any paths left uncached are simply rebuilt next time.
+// A failed or timed-out drain is therefore surfaced as a GitHub warning and
+// never fails the job — matching `hestia hook`, which also always exits 0.
+// (A non-zero post-step exit *does* mark the job failed, so exiting 0 here is
+// load-bearing, not incidental.)
 
 'use strict';
 
@@ -19,7 +23,7 @@ function main() {
   const binary = getState('bin');
   if (!binary) {
     console.log('hestia-cache: no daemon was started in this job; nothing to drain');
-    return 0;
+    return;
   }
 
   const socket = getState('socket');
@@ -32,8 +36,8 @@ function main() {
   if (drain.error) {
     // spawnSync does not throw on launch failures (e.g. ENOENT when the
     // temp dir was cleaned mid-job); without this the only output is the
-    // generic drain-failed error below.
-    console.error(`::error::failed to run ${binary}: ${drain.error}`);
+    // generic drain-failed warning below.
+    console.warn(`::warning::failed to run ${binary}: ${drain.error}`);
   }
 
   // The daemon log carries what the drain summary does not: per-stage drain
@@ -53,7 +57,7 @@ function main() {
   }
 
   if (drain.status !== 0) {
-    console.error('::error::hestia drain failed; the paths built by this job were not cached');
+    console.warn('::warning::hestia drain failed; the paths built by this job were not cached (the build is unaffected; they will be rebuilt next time)');
   }
 
   // The daemon is spawned detached and never exits on its own; on
@@ -69,10 +73,11 @@ function main() {
       // Already gone.
     }
   }
-
-  return drain.status === null ? 1 : drain.status;
 }
 
-// Not process.exit(): that drops pending async stdout writes, truncating
-// the daemon log dump exactly when it is needed.
-process.exitCode = main();
+main();
+
+// Always 0: a failed drain is a warning, not a job failure (see the header).
+// Not process.exit(): that drops pending async stdout writes, truncating the
+// daemon log dump exactly when it is needed.
+process.exitCode = 0;
