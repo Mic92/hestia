@@ -1,5 +1,10 @@
 # hestia-cache action
 
+> ⚠️ **Deprecated path**: this action moved to the repository root. Reference
+> it as `Mic92/hestia@<ref>` instead of `Mic92/hestia/action@<ref>`. The
+> subdirectory copy keeps working for one release cycle and emits a
+> deprecation warning.
+
 This action runs [hestia](https://github.com/Mic92/hestia) inside your job,
 turning the GitHub Actions cache into a Nix binary cache.
 

@@ -77,6 +77,6 @@ inputs:
 
 runs:
   using: node24
-  # Deprecated entry point; see deprecated-main.js.
-  main: deprecated-main.js
-  post: deprecated-post.js
+  # Implementation lives in action/ so the deprecated subdir entry can reuse it.
+  main: action/main.js
+  post: action/post.js

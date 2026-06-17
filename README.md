@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
-      - uses: Mic92/hestia/action@v1
+      - uses: Mic92/hestia@v1
       - run: nix build .#
 ```
 

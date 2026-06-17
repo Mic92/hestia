@@ -47,11 +47,11 @@ jobs:
       # needs the cache API tokens, not the daemon).
       - name: Install hestia (released binary)
         if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./action
+        uses: ./
       - name: Build hestia
         if: vars.HESTIA_DOGFOOD != 'true'
         run: nix build .# -o hestia-bin
-      - uses: ./action
+      - uses: ./
         if: vars.HESTIA_DOGFOOD != 'true'
         with:
           # Explicitly empty: token-capture-only mode (version defaults to

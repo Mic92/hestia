@@ -47,7 +47,7 @@ jobs:
         # unwinding and symbol names.
         run: nix develop --command env CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --release
       - name: Start hestia cache
-        uses: ./action
+        uses: ./
         with:
           binary: target/release/hestia
       - name: Install perf
