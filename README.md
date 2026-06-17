@@ -1,9 +1,5 @@
 # hestia
 
-> ⚠️ **Beta software**: the cache format and behavior are stabilizing, but
-> breaking changes are still possible before 1.0. Suitable for trying in
-> real CI; expect occasional cache resets on upgrades.
-
 Hestia is a Nix binary cache for GitHub Actions. It stores build results in
 the GitHub Actions cache, so later runs download them instead of rebuilding.
 There is nothing to set up: no accounts, no secrets, no server to run. Add
@@ -34,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
-      - uses: Mic92/hestia/action@main
+      - uses: Mic92/hestia/action@v1
       - run: nix build .#
 ```
 
@@ -55,7 +51,7 @@ See [Configuration](#configuration) for all action inputs.
 
 |  | **hestia** | **magic-nix-cache** | **cachix** | **attic** |
 |---|---|---|---|---|
-| Status | beta | maintained | commercial service | self-hosted |
+| Status | stable | maintained | commercial service | self-hosted |
 | Storage | GHA cache (free, 10 GB/repo) | GHA cache (free, 10 GB/repo) | cachix.org | your S3/disk |
 | Accounts / secrets needed | none | none | auth token | server + token |
 | Infrastructure to run | none | none | none | server, database, storage |
@@ -116,7 +112,7 @@ All inputs are optional; the defaults work for the quick start above.
 | Input | Default | Description |
 |---|---|---|
 | `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
-| `version` | latest release | Release tag to download (e.g. `v0.1.0-beta.1`). The download is verified against GitHub's build attestations. |
+| `version` | latest release | Release tag to download (e.g. `v1.0.0`). The download is verified against GitHub's build attestations. |
 | `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
 | `listen` | `127.0.0.1:37515` | Substituter listen address. |
 | `socket` | `/tmp/hestia/hook.sock` | Post-build-hook unix socket path. |

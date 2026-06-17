@@ -74,6 +74,12 @@ git pull --ff-only origin main
 git tag "$tag"
 git push origin "$tag"
 
+# Move the floating major-version tag (e.g. v1) so README's `@v1` ref
+# always tracks the latest 1.x release, matching GitHub Actions convention.
+major_tag="v${version%%.*}"
+git tag -f "$major_tag"
+git push -f origin "$major_tag"
+
 echo "waiting for the release workflow..."
 # The run may take a moment to appear after the tag push.
 run_id=""

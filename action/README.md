@@ -1,9 +1,5 @@
 # hestia-cache action
 
-> ⚠️ **Beta software**: the cache format and behavior are stabilizing, but
-> breaking changes are still possible before 1.0. Suitable for trying in
-> real CI; expect occasional cache resets on upgrades.
-
 This action runs [hestia](https://github.com/Mic92/hestia) inside your job,
 turning the GitHub Actions cache into a Nix binary cache.
 
@@ -37,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
-      - uses: Mic92/hestia/action@main
+      - uses: Mic92/hestia/action@v1
       - run: nix build .#
 ```
 
@@ -50,7 +46,7 @@ to trust release binaries, pass a path instead:
 
 ```yaml
       - run: nix build github:Mic92/hestia -o hestia-bin
-      - uses: Mic92/hestia/action@main
+      - uses: Mic92/hestia/action@v1
         with:
           binary: ./hestia-bin/bin/hestia
 ```
@@ -62,7 +58,7 @@ action only exports the cache API tokens and starts nothing (`version`
 defaults to `latest` when omitted, so a bare invocation starts a daemon):
 
 ```yaml
-      - uses: Mic92/hestia/action@main
+      - uses: Mic92/hestia/action@v1
         with:
           version: ""
 ```
@@ -75,7 +71,7 @@ integration tests use it.
 | Input | Default | Description |
 |---|---|---|
 | `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
-| `version` | latest release | Release tag to download (e.g. `v0.1.0-beta.1`). The download is verified against GitHub's build attestations. |
+| `version` | latest release | Release tag to download (e.g. `v1.0.0`). The download is verified against GitHub's build attestations. |
 | `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
 | `listen` | free port per invocation | Substituter listen address. |
 | `socket` | per-invocation temp path | Post-build-hook unix socket path. |
