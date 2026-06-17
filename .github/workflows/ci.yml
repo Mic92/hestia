@@ -33,7 +33,7 @@ jobs:
       - uses: NixOS/nix-installer-action@main
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./action
+        uses: ./
       - name: Run flake checks
         run: nix flake check --print-build-logs
       # No-op after the flake checks; asserts the closures the dependent
@@ -61,10 +61,10 @@ jobs:
       # compiling. Must run before the token-only invocation below.
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./action
+        uses: ./
       # Explicitly empty binary/version: token-capture-only mode (must
       # stay tested). version defaults to "latest" when omitted.
-      - uses: ./action
+      - uses: ./
         with:
           version: ""
       - name: Assert cache tokens are visible to shell steps
@@ -121,11 +121,11 @@ jobs:
       # GC needs to read manifests.
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./action
+        uses: ./
       # Token-capture-only mode when dogfooding is off (forks). Explicitly
       # empty version: it defaults to "latest" when omitted, which would
       # start an unwanted daemon.
-      - uses: ./action
+      - uses: ./
         if: vars.HESTIA_DOGFOOD != 'true'
         with:
           version: ""
@@ -157,12 +157,12 @@ jobs:
       # compiling (forks without the variables build from source).
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./action
+        uses: ./
       - name: Build hestia
         run: nix build .# -o hestia-bin
       # Instance under test on its own port/socket, started last: the
       # HESTIA_* variables and the post-build-hook then point at it.
-      - uses: ./action
+      - uses: ./
         with:
           binary: ./hestia-bin/bin/hestia
           listen: 127.0.0.1:37516

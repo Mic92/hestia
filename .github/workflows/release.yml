@@ -49,7 +49,7 @@ jobs:
       # toolchain changes.
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
-        uses: ./action
+        uses: ./
       - name: Build release binary
         run: nix build .#
       - name: Prepare release asset
@@ -102,7 +102,7 @@ jobs:
           ## Usage
 
           \`\`\`yaml
-          - uses: Mic92/hestia/action@${tag}
+          - uses: Mic92/hestia@${tag}
             with:
               version: ${tag}
           \`\`\`
