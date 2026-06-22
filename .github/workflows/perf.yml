@@ -31,7 +31,7 @@ jobs:
       # expire via GitHub's normal eviction.
       HESTIA_CACHE_VERSION_SALT: ${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
       # rust-cache derives its cache key from `rustc -vV`, so the devshell
       # toolchain has to be on PATH before it runs.

@@ -29,7 +29,7 @@ jobs:
       actions: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
       - name: Start hestia cache (dogfood)
         if: vars.HESTIA_DOGFOOD == 'true'
@@ -55,7 +55,7 @@ jobs:
       actions: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
       # Dogfood substituter, so the nix build below substitutes instead of
       # compiling. Must run before the token-only invocation below.
@@ -115,7 +115,7 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
       # Substituter for the nix build below; also exports the cache tokens
       # GC needs to read manifests.
@@ -151,7 +151,7 @@ jobs:
       actions: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
       # Dogfood substituter, so the nix build below substitutes instead of
       # compiling (forks without the variables build from source).

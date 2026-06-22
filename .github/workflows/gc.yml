@@ -39,7 +39,7 @@ jobs:
       actions: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
       # With HESTIA_DOGFOOD set, run GC with the latest released binary:
       # no nix build, the nightly job takes seconds. Without it, build

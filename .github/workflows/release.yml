@@ -38,7 +38,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: NixOS/nix-installer-action@main
       # Cache the static toolchain and build through hestia itself (same
       # repository variables as ci.yml). Note GHA cache scoping: a tag
