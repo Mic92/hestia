@@ -1,10 +1,9 @@
 name: hestia-cache
+# Marketplace limits this to 125 characters; the long-form blurb lives in
+# action/README.md.
 description: >
-  Nix binary cache backed by the GitHub Actions cache (v2 API). Captures the
-  Actions runtime token (only visible to JS actions, never to `run:` steps),
-  installs the hestia binary, starts the daemon (post-build-hook listener +
-  substituter), wires it into nix.conf, and uploads everything that was built
-  when the job ends.
+  Nix binary cache backed by the GitHub Actions cache (v2 API). Wires a
+  substituter and post-build-hook into nix.conf.
 
 branding:
   icon: archive
