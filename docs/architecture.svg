@@ -46,7 +46,7 @@
     <text x="660" y="114" class="m" text-anchor="middle">pack-3fa92c&#8230;</text>
     <rect x="560" y="136" width="200" height="36" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
     <text x="660" y="158" class="m" text-anchor="middle">pack-b21c07&#8230;</text>
-    <text x="560" y="196" class="ts">named after their SHA-256, about 64 MiB each</text>
+    <text x="560" y="196" class="ts">named after their BLAKE3, about 64 MiB each</text>
   </g>
 
   <!-- Pack interior strip -->

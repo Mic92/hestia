@@ -21,6 +21,7 @@ use crate::manifest::{
     ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Hash32, PackHash,
     Regular, Symlink,
 };
+use crate::refnorm::RefTable;
 
 /// FastCDC parameters. Pinned: changing them changes every chunk boundary
 /// and therefore invalidates all existing chunks in the cache.
@@ -65,12 +66,15 @@ pub enum Error {
          (corrupt or malicious pack data)"
     )]
     OversizedChunk,
+
+    #[error("reference restore failed: {0}")]
+    Restore(#[from] crate::refnorm::Error),
 }
 
 /// One content-defined chunk of a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
-    /// SHA-256 of the uncompressed chunk data.
+    /// BLAKE3 (truncated) of the uncompressed chunk data.
     pub hash: ChunkHash,
     /// Uncompressed chunk data (zero-copy slice of the source).
     pub data: Bytes,
@@ -185,11 +189,11 @@ impl PackBuilder {
         self.buffer.len() as u64
     }
 
-    /// Finalize: the pack hash is the SHA-256 of the complete blob, which
+    /// Finalize: the pack hash is the BLAKE3 of the complete blob, which
     /// makes packs content-addressed (`pack-{hash}` cache keys).
     pub fn finish(self) -> Pack {
         Pack {
-            hash: Hash32::digest(&self.buffer),
+            hash: PackHash::digest(&self.buffer),
             data: Bytes::from(self.buffer),
             chunks: self.chunks,
         }
@@ -278,7 +282,7 @@ pub fn coalesce_adjacent<T>(
     runs
 }
 
-/// GHA cache key for a pack blob (`pack-<sha256 hex>`).
+/// GHA cache key for a pack blob (`pack-<blake3 hex>`).
 pub fn pack_cache_key(hash: &PackHash) -> String {
     format!("pack-{}", hash.to_hex())
 }
@@ -402,10 +406,16 @@ fn name_to_string(name: &[u8], what: &str) -> Result<String, Error> {
 /// Walk `path` with harmonia's NAR dumper, splitting every regular file into
 /// content-defined chunks.
 ///
+/// Reference occurrences are normalized out of each file with `refs` before
+/// chunking, so chunks stay stable when a dependency's
+/// hash changes; the position table needed to restore them is recorded in
+/// each file's [`ChunkList::rewrites`]. Pass an empty [`RefTable`] to chunk
+/// verbatim.
+///
 /// Returns the file tree (for the manifest `PathEntry`) plus the unique
 /// chunks in pack order. Identical chunks appearing in multiple files are
 /// returned once.
-pub async fn chunk_path(path: impl Into<PathBuf>) -> Result<ChunkedPath, Error> {
+pub async fn chunk_path(path: impl Into<PathBuf>, refs: &RefTable) -> Result<ChunkedPath, Error> {
     let mut events = harmonia_file_nar::dump(path.into());
     let mut builder = TreeBuilder::new();
     let mut chunks: Vec<Chunk> = Vec::new();
@@ -434,9 +444,11 @@ pub async fn chunk_path(path: impl Into<PathBuf>) -> Result<ChunkedPath, Error> 
                 reader,
             } => {
                 let data = reader.into_bytes();
-                let file_chunks = chunk_data(&data);
+                let (normalized, rewrites) = refs.normalize(&data);
+                let file_chunks = chunk_data(&normalized);
                 let list = ChunkList {
                     chunks: file_chunks.iter().map(|chunk| chunk.hash).collect(),
+                    rewrites,
                 };
                 for chunk in file_chunks {
                     if seen.insert(chunk.hash) {
@@ -576,23 +588,26 @@ fn collect_events(
     name: Bytes,
     node: &TreeNode,
     chunks: &BTreeMap<ChunkHash, Bytes>,
+    refs: &RefTable,
     out: &mut Vec<NarEvent<Cursor<Bytes>>>,
 ) -> Result<(), Error> {
     match node {
         FileSystemObject::Regular(regular) => {
-            // Concatenate the file's chunks. Single-chunk files (the common
-            // case) reuse the chunk's Bytes without copying.
-            let data = match regular.contents.chunks.as_slice() {
-                [] => Bytes::new(),
-                [hash] => chunks.get(hash).ok_or(Error::MissingChunk(*hash))?.clone(),
-                hashes => {
-                    let mut data = Vec::new();
-                    for hash in hashes {
-                        let chunk = chunks.get(hash).ok_or(Error::MissingChunk(*hash))?;
-                        data.extend_from_slice(chunk);
-                    }
-                    Bytes::from(data)
+            let rewrites = &regular.contents.rewrites;
+            let data = if rewrites.is_empty() {
+                // Verbatim (v1 or reference-free): reuse chunk Bytes without
+                // copying in the single-chunk common case.
+                match regular.contents.chunks.as_slice() {
+                    [] => Bytes::new(),
+                    [hash] => chunks.get(hash).ok_or(Error::MissingChunk(*hash))?.clone(),
+                    hashes => Bytes::from(concat_chunks(hashes, chunks)?),
                 }
+            } else {
+                // Normalized (v2): reference occurrences must be restored
+                // before the bytes go back into the NAR.
+                let mut data = concat_chunks(&regular.contents.chunks, chunks)?;
+                refs.restore(&mut data, rewrites)?;
+                Bytes::from(data)
             };
             out.push(NarEvent::File {
                 name,
@@ -614,6 +629,7 @@ fn collect_events(
                     Bytes::copy_from_slice(child_name.as_bytes()),
                     &child.0,
                     chunks,
+                    refs,
                     out,
                 )?;
             }
@@ -621,6 +637,19 @@ fn collect_events(
         }
     }
     Ok(())
+}
+
+/// Concatenate a file's chunk data in order.
+fn concat_chunks(
+    hashes: &[ChunkHash],
+    chunks: &BTreeMap<ChunkHash, Bytes>,
+) -> Result<Vec<u8>, Error> {
+    let mut data = Vec::new();
+    for hash in hashes {
+        let chunk = chunks.get(hash).ok_or(Error::MissingChunk(*hash))?;
+        data.extend_from_slice(chunk);
+    }
+    Ok(data)
 }
 
 /// NAR hash and size of a path, computed from its *stored representation*
@@ -633,9 +662,10 @@ fn collect_events(
 pub async fn nar_hash_from_chunks(
     tree: &FileTree<ChunkList>,
     chunks: &BTreeMap<ChunkHash, Bytes>,
+    refs: &RefTable,
 ) -> Result<(Hash32, u64), Error> {
     let mut sink = HashSink::new();
-    write_nar(tree, chunks, &mut sink).await?;
+    write_nar(tree, chunks, refs, &mut sink).await?;
     sink.finish()
 }
 
@@ -650,9 +680,10 @@ pub async fn nar_hash_from_chunks(
 pub async fn nar_from_chunks(
     tree: &FileTree<ChunkList>,
     chunks: &BTreeMap<ChunkHash, Bytes>,
+    refs: &RefTable,
 ) -> Result<Vec<u8>, Error> {
     let mut buffer: Vec<u8> = Vec::new();
-    write_nar(tree, chunks, &mut buffer).await?;
+    write_nar(tree, chunks, refs, &mut buffer).await?;
     Ok(buffer)
 }
 
@@ -661,12 +692,13 @@ pub async fn nar_from_chunks(
 async fn write_nar<W: tokio::io::AsyncWrite + Unpin>(
     tree: &FileTree<ChunkList>,
     chunks: &BTreeMap<ChunkHash, Bytes>,
+    refs: &RefTable,
     sink: &mut W,
 ) -> Result<(), Error> {
     let mut events = Vec::new();
     // The root node's name is ignored by the NAR format (only nested entries
     // carry names), so any value works here.
-    collect_events(Bytes::new(), &tree.0, chunks, &mut events)?;
+    collect_events(Bytes::new(), &tree.0, chunks, refs, &mut events)?;
 
     let mut writer = NarWriter::new(sink);
     for event in events {
@@ -817,7 +849,7 @@ mod tests {
             assert!(builder.add(chunk).unwrap());
         }
         let pack = builder.finish();
-        assert_eq!(pack.hash, Hash32::digest(&pack.data));
+        assert_eq!(pack.hash, PackHash::digest(&pack.data));
         assert_eq!(pack.cache_key(), format!("pack-{}", pack.hash.to_hex()));
 
         // Every chunk must be recoverable from its (offset, compressed_size)
@@ -966,6 +998,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normalized_path_round_trips_and_dedups() {
+        use crate::manifest::StorePath;
+
+        // Two "builds" of the same file differing only in an embedded
+        // dependency hash: they must chunk to identical normalized chunks
+        // (dedup) yet each reassemble byte-identically to its own original
+        // NAR (correctness).
+        const DEP_A: &str = "0d71ygfwbmy1xjlbj1v027dfmy9cjm9c";
+        const DEP_B: &str = "1a2b3c4d5f6g7h8j9k0lmnpqrsvwxyz1";
+
+        async fn build(dep: &str) -> (ChunkedPath, (Hash32, u64), RefTable) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("out");
+            std::fs::create_dir_all(&root).unwrap();
+            // Embed the dependency's store-path hash in a binary-ish blob
+            // large enough to span several chunks.
+            let mut content = test_data(400_000, 3).to_vec();
+            let marker = format!("/nix/store/{dep}-libdep.so");
+            content.splice(200_000..200_000, marker.bytes());
+            std::fs::write(root.join("prog"), &content).unwrap();
+
+            let reference: StorePath = format!("{dep}-libdep").parse().unwrap();
+            let refs = RefTable::new(std::slice::from_ref(&reference));
+            let chunked = chunk_path(&root, &refs).await.unwrap();
+            let from_disk = nar_hash_and_size(&root).await.unwrap();
+            (chunked, from_disk, refs)
+        }
+
+        let (a, disk_a, refs_a) = build(DEP_A).await;
+        let (b, disk_b, refs_b) = build(DEP_B).await;
+
+        // Correctness: each reassembles to its own original NAR.
+        assert_eq!(
+            nar_hash_from_chunks(&a.tree, &a.chunk_map(), &refs_a)
+                .await
+                .unwrap(),
+            disk_a
+        );
+        assert_eq!(
+            nar_hash_from_chunks(&b.tree, &b.chunk_map(), &refs_b)
+                .await
+                .unwrap(),
+            disk_b
+        );
+        assert_ne!(disk_a, disk_b, "the two builds are genuinely different");
+
+        // Dedup: the normalized chunk sets are identical despite the
+        // dependency hash differing.
+        let set_a: BTreeSet<ChunkHash> = a.chunks.iter().map(|c| c.hash).collect();
+        let set_b: BTreeSet<ChunkHash> = b.chunks.iter().map(|c| c.hash).collect();
+        assert_eq!(
+            set_a, set_b,
+            "reference normalization must dedup the chunks"
+        );
+    }
+
+    #[tokio::test]
     async fn nar_hash_from_chunks_matches_disk_walk() {
         // Build a small tree on disk, chunk it, then verify that replaying
         // the chunked representation produces the same NAR hash as hashing
@@ -978,11 +1067,12 @@ mod tests {
         std::fs::write(root.join("sub/large"), test_data(700_000, 11)).unwrap();
         std::os::unix::fs::symlink("small", root.join("sub/link")).unwrap();
 
-        let chunked = chunk_path(&root).await.unwrap();
+        let chunked = chunk_path(&root, &RefTable::new(&[])).await.unwrap();
         let from_disk = nar_hash_and_size(&root).await.unwrap();
-        let from_chunks = nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map())
-            .await
-            .unwrap();
+        let from_chunks =
+            nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map(), &RefTable::new(&[]))
+                .await
+                .unwrap();
         assert_eq!(from_chunks, from_disk);
     }
 
@@ -993,11 +1083,12 @@ mod tests {
         let file = dir.path().join("single");
         std::fs::write(&file, test_data(200_000, 12)).unwrap();
 
-        let chunked = chunk_path(&file).await.unwrap();
+        let chunked = chunk_path(&file, &RefTable::new(&[])).await.unwrap();
         let from_disk = nar_hash_and_size(&file).await.unwrap();
-        let from_chunks = nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map())
-            .await
-            .unwrap();
+        let from_chunks =
+            nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map(), &RefTable::new(&[]))
+                .await
+                .unwrap();
         assert_eq!(from_chunks, from_disk);
     }
 
@@ -1012,8 +1103,8 @@ mod tests {
         std::fs::write(root.join("nested/blob"), test_data(400_000, 21)).unwrap();
         std::os::unix::fs::symlink("file", root.join("link")).unwrap();
 
-        let chunked = chunk_path(&root).await.unwrap();
-        let nar = nar_from_chunks(&chunked.tree, &chunked.chunk_map())
+        let chunked = chunk_path(&root, &RefTable::new(&[])).await.unwrap();
+        let nar = nar_from_chunks(&chunked.tree, &chunked.chunk_map(), &RefTable::new(&[]))
             .await
             .unwrap();
 
@@ -1025,9 +1116,10 @@ mod tests {
         assert_eq!(nar, from_disk, "synthesized NAR must match the disk walk");
 
         // And it agrees with the hash helper used by the write pipeline.
-        let (hash, size) = nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map())
-            .await
-            .unwrap();
+        let (hash, size) =
+            nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map(), &RefTable::new(&[]))
+                .await
+                .unwrap();
         assert_eq!(Hash32::digest(&nar), hash);
         assert_eq!(nar.len() as u64, size);
     }
@@ -1039,12 +1131,12 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("file"), test_data(100_000, 22)).unwrap();
 
-        let chunked = chunk_path(&root).await.unwrap();
+        let chunked = chunk_path(&root, &RefTable::new(&[])).await.unwrap();
         let mut chunks = chunked.chunk_map();
         chunks.pop_first().unwrap();
 
         assert!(matches!(
-            nar_from_chunks(&chunked.tree, &chunks).await,
+            nar_from_chunks(&chunked.tree, &chunks, &RefTable::new(&[])).await,
             Err(Error::MissingChunk(_))
         ));
     }
@@ -1056,11 +1148,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("file"), test_data(100_000, 13)).unwrap();
 
-        let chunked = chunk_path(&root).await.unwrap();
+        let chunked = chunk_path(&root, &RefTable::new(&[])).await.unwrap();
         let mut chunks = chunked.chunk_map();
         let (missing_hash, _) = chunks.pop_first().unwrap();
 
-        let result = nar_hash_from_chunks(&chunked.tree, &chunks).await;
+        let result = nar_hash_from_chunks(&chunked.tree, &chunks, &RefTable::new(&[])).await;
         match result {
             Err(Error::MissingChunk(hash)) => assert_eq!(hash, missing_hash),
             other => panic!("expected MissingChunk error, got {other:?}"),

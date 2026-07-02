@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod pathinfo;
 pub mod pipeline;
 pub mod protocol;
+pub mod refnorm;
 pub mod serve;
 pub mod substituter;
 pub mod upstream;

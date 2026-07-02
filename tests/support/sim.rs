@@ -30,6 +30,7 @@ use hestia::manifest::{
 };
 use hestia::pathinfo::StoreDir;
 use hestia::pipeline::{AccessLog, MANIFEST_PREFIX, upload_pack};
+use hestia::refnorm::RefTable;
 use hestia::substituter::{ManifestStore, Substituter};
 
 use super::fake_gha::FakeGha;
@@ -95,6 +96,7 @@ impl SimPath {
                     executable: false,
                     contents: ChunkList {
                         chunks: file_chunks.iter().map(|chunk| chunk.hash).collect(),
+                        ..Default::default()
                     },
                 }))),
             );
@@ -181,7 +183,7 @@ impl SimCache {
                 .iter()
                 .map(|chunk| (chunk.hash, chunk.data.clone()))
                 .collect();
-            let (nar_hash, nar_size) = nar_hash_from_chunks(&tree, &chunk_map)
+            let (nar_hash, nar_size) = nar_hash_from_chunks(&tree, &chunk_map, &RefTable::new(&[]))
                 .await
                 .expect("nar hash from chunks");
 

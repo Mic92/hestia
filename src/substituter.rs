@@ -47,6 +47,7 @@ use crate::manifest::{
     ChunkHash, ChunkLocation, FileSystemObject, Hash32, Manifest, PackHash, PathEntry, PathHash,
 };
 use crate::pipeline::AccessLog;
+use crate::refnorm::RefTable;
 
 /// Priority advertised in /nix-cache-info. Lower wins: 30 puts hestia ahead
 /// of cache.nixos.org (40), so Nix asks the local cache first and only falls
@@ -670,9 +671,13 @@ async fn nar(
     let tree = entry.tree.clone();
     let nar_size = entry.nar_size;
     let expected_hash = entry.nar_hash;
+    // Reference occurrences normalized out on the write side (dedup v2) are
+    // restored from the path's own references; v1 entries carry no rewrites,
+    // so the table is unused for them.
+    let refs = RefTable::new(&entry.references);
     let nar = tokio::task::spawn_blocking(move || {
         use futures_util::FutureExt as _;
-        let nar = nar_from_chunks(&tree, &chunks)
+        let nar = nar_from_chunks(&tree, &chunks, &refs)
             .now_or_never()
             .expect("NAR synthesis into a Vec sink never pends")
             .map_err(|err| format!("NAR synthesis failed: {err}"))?;
@@ -724,7 +729,7 @@ mod tests {
             deriver: None,
             tree: FileTree(FileSystemObject::Regular(Regular {
                 executable: false,
-                contents: ChunkList { chunks: vec![] },
+                contents: ChunkList::default(),
             })),
             last_reachable: 0,
             last_pushed: 0,

@@ -993,6 +993,7 @@ name = "hestia"
 version = "1.0.4"
 dependencies = [
  "axum",
+ "blake3",
  "bytes",
  "ciborium",
  "clap",

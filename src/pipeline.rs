@@ -27,12 +27,18 @@ use crate::gha::twirp::{DownloadUrl, Reservation, TwirpClient};
 use crate::manifest::{Manifest, PackInfo, PathEntry, PathHash, Root};
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
+use crate::refnorm::RefTable;
 use crate::substituter::ManifestStore;
 use crate::upstream::UpstreamFilter;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 
-/// SaveMutable family prefix for the manifest ("m" → keys `m#1`, `m#2`, …).
-pub const MANIFEST_PREFIX: &str = "m";
+/// SaveMutable family prefix for the manifest ("m2" → keys `m2#1`, `m2#2`,
+/// …). Bumped from "m" when reference normalization changed the chunk
+/// format: the pre-existing `m#N` sequence chunked NARs verbatim, so those
+/// chunks would never dedup against normalized ones. A fresh namespace
+/// ignores the old manifest outright rather than carrying dead entries
+/// forward; its orphaned packs age out through GC and eviction.
+pub const MANIFEST_PREFIX: &str = "m2";
 
 /// Compressed bytes per pack before a new pack is started.
 pub const PACK_TARGET_SIZE: u64 = 64 * 1024 * 1024;
@@ -358,7 +364,12 @@ impl PipelineContext {
                 // deterministic failure would then keep every later drain --
                 // including the final shutdown drain -- from caching
                 // anything at all.
-                let chunked = match chunk_path(&path).await {
+                // Normalize reference occurrences out before chunking so
+                // chunks stay stable across dependency-hash changes; the
+                // path's own references drive both normalization and the
+                // read-side restore.
+                let refs = RefTable::new(&info.references);
+                let chunked = match chunk_path(&path, &refs).await {
                     Ok(chunked) => chunked,
                     Err(err) => {
                         eprintln!("hestia: NOT uploading {path}: chunking failed: {err}");
@@ -372,7 +383,7 @@ impl PipelineContext {
                 // the NAR hash Nix recorded for this path. A mismatch means
                 // hestia would serve corrupt data; never upload it.
                 let (nar_hash, nar_size) =
-                    match nar_hash_from_chunks(&chunked.tree, &chunk_map).await {
+                    match nar_hash_from_chunks(&chunked.tree, &chunk_map, &refs).await {
                         Ok(result) => result,
                         Err(err) => {
                             eprintln!("hestia: NOT uploading {path}: NAR replay failed: {err}");

@@ -53,7 +53,7 @@ use crate::gha::savemutable::{MutableEntry, SaveMutable};
 use crate::gha::twirp::{DownloadUrl, TwirpClient};
 use crate::gha::{Error as GhaError, blob};
 use crate::manifest::{
-    ChunkHash, ChunkLocation, FileSystemObject, Hash32, Manifest, PackHash, PackInfo, PathHash,
+    Blake3Pack, ChunkHash, ChunkLocation, FileSystemObject, Manifest, PackHash, PackInfo, PathHash,
 };
 use crate::pipeline::{MANIFEST_PREFIX, now_unix, upload_pack};
 
@@ -135,7 +135,7 @@ fn parse_manifest_index(prefix: &str, key: &str) -> Option<u64> {
     (suffix == index.to_string()).then_some(index)
 }
 
-/// Parse a `pack-<sha256 hex>` cache key back into the pack hash.
+/// Parse a `pack-<blake3 hex>` cache key back into the pack hash.
 fn parse_pack_key(key: &str) -> Option<PackHash> {
     let hex = key.strip_prefix("pack-")?;
     if hex.len() != 64 {
@@ -151,7 +151,7 @@ fn parse_pack_key(key: &str) -> Option<PackHash> {
     for (i, byte) in bytes.iter_mut().enumerate() {
         *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
     }
-    Some(Hash32(bytes))
+    Some(Blake3Pack(bytes))
 }
 
 /// What the GitHub REST API reports about one `pack-*` cache entry.
@@ -235,7 +235,7 @@ pub struct GcPlan {
     /// Manifest packs that become garbage once the commit lands
     /// (fully dead packs + repack sources).
     pub delete_packs: Vec<PackHash>,
-    /// Cache keys of hestia packs (`pack-<sha256>`) present in GitHub but
+    /// Cache keys of hestia packs (`pack-<blake3>`) present in GitHub but
     /// referenced by no manifest, old enough to be sure no in-flight push
     /// still wants them. Keys that merely share the `pack-` prefix belong
     /// to other workflows and are never touched.
@@ -1315,7 +1315,7 @@ pub async fn run(args: &GcArgs) -> ExitCode {
 mod tests {
     use super::*;
     use crate::manifest::{
-        ChunkList, Directory, FileTree, PathEntry, Regular, Root, StorePath, StorePathHash,
+        ChunkList, Directory, FileTree, Hash32, PathEntry, Regular, Root, StorePath, StorePathHash,
     };
 
     /// Reference clock for all tests (an arbitrary fixed point in time).
@@ -1334,7 +1334,7 @@ mod tests {
     }
 
     fn pack_hash(seed: u8) -> PackHash {
-        Hash32::digest([b'p', seed])
+        PackHash::digest([b'p', seed])
     }
 
     /// Build a single-file tree referencing the given chunks.
@@ -1346,6 +1346,7 @@ mod tests {
                     executable: false,
                     contents: ChunkList {
                         chunks: chunks.iter().map(|seed| chunk_hash(*seed)).collect(),
+                        ..Default::default()
                     },
                 }))),
             )]),
@@ -1468,7 +1469,7 @@ mod tests {
 
     #[test]
     fn pack_key_round_trips() {
-        let hash = Hash32::digest(b"some pack");
+        let hash = PackHash::digest(b"some pack");
         assert_eq!(parse_pack_key(&pack_cache_key(&hash)), Some(hash));
         assert_eq!(parse_pack_key("pack-nothex"), None);
         assert_eq!(parse_pack_key("pack-"), None);
@@ -2136,7 +2137,7 @@ mod tests {
     fn fake_repack_output(plan: &GcPlan) -> RepackOutput {
         let mut output = RepackOutput::default();
         for (job_index, job) in plan.repack_jobs.iter().enumerate() {
-            let new_pack = Hash32::digest([b'N', job_index as u8]);
+            let new_pack = PackHash::digest([b'N', job_index as u8]);
             let mut offset = 0u64;
             for copy in &job.copies {
                 output.locations.insert(

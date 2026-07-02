@@ -155,7 +155,8 @@ async fn garbage_manifest_blob_is_replaced_not_fatal() {
     let twirp = fake.twirp(&http);
 
     // Plant a manifest blob that is not even valid zstd.
-    store_entry(&twirp, &http, "m#1", b"this is not a manifest at all").await;
+    let m1 = format!("{MANIFEST_PREFIX}#1");
+    store_entry(&twirp, &http, &m1, b"this is not a manifest at all").await;
 
     // Loading must degrade to an empty manifest, not fail.
     let ctx = context(&fake, &http, &store);
@@ -204,7 +205,7 @@ async fn truncated_manifest_blob_is_replaced_not_fatal() {
     let save = SaveMutable::new(&twirp, &http, MANIFEST_PREFIX);
     let valid = save.load().await.unwrap().unwrap().data;
     let truncated = &valid[..valid.len() / 2];
-    store_entry(&twirp, &http, "m#2", truncated).await;
+    store_entry(&twirp, &http, &format!("{MANIFEST_PREFIX}#2"), truncated).await;
 
     // The truncated newest version reads as empty (the older intact m#1 is
     // NOT consulted: SaveMutable always serves the newest version)...
@@ -237,7 +238,8 @@ async fn gc_refuses_to_act_on_a_corrupt_manifest() {
     let http = reqwest::Client::new();
     let twirp = fake.twirp(&http);
 
-    store_entry(&twirp, &http, "m#1", b"garbage manifest").await;
+    let m1 = format!("{MANIFEST_PREFIX}#1");
+    store_entry(&twirp, &http, &m1, b"garbage manifest").await;
     // A hestia-shaped pack key, old enough to pass the min_age guard: if GC
     // misjudged the corrupt manifest as empty and ran its orphan sweep, this
     // is exactly what it would delete.
@@ -261,7 +263,10 @@ async fn gc_refuses_to_act_on_a_corrupt_manifest() {
     // Nothing was deleted.
     let entries = fake.rest(&http).list_caches("").await.unwrap();
     let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
-    assert!(keys.contains(&"m#1"), "corrupt manifest left in place");
+    assert!(
+        keys.contains(&m1.as_str()),
+        "corrupt manifest left in place"
+    );
     assert!(keys.contains(&pack_key.as_str()), "packs left in place");
 }
 
@@ -278,7 +283,13 @@ async fn daemon_starts_and_drains_over_a_corrupt_manifest() {
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
         let twirp = fake.twirp(&http);
-        store_entry(&twirp, &http, "m#1", b"garbage manifest").await;
+        store_entry(
+            &twirp,
+            &http,
+            &format!("{MANIFEST_PREFIX}#1"),
+            b"garbage manifest",
+        )
+        .await;
 
         let ctx = context(&fake, &http, &store);
 

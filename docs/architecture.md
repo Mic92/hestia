@@ -60,8 +60,9 @@ and idempotent, so the outcome does not depend on who wins.
 
 A `PathEntry` holds what narinfo needs (store path, NAR hash and size,
 references) plus the path's file tree, where each file's contents is a
-list of chunk hashes. Chunk hashes resolve through the `chunks` map to
-a location: which pack, at what offset, how many bytes.
+list of chunk hashes (plus a table of reference rewrites -- see below).
+Chunk hashes resolve through the `chunks` map to a location: which
+pack, at what offset, how many bytes.
 
 ### Packs
 
@@ -69,8 +70,10 @@ Store paths are not cached one entry each. NARs are split into
 content-defined chunks (FastCDC, 16–256 KiB, 64 KiB average), each
 chunk is zstd-compressed individually, and compressed chunks are
 concatenated into pack blobs of about 64 MiB. The pack key is the
-SHA-256 of the blob, so identical packs dedup naturally and a finalized
-pack can be trusted to match its name.
+BLAKE3 of the blob, so identical packs dedup naturally and a finalized
+pack can be trusted to match its name. Chunk and pack hashes use BLAKE3
+(~3x faster than SHA-256 and unconstrained by any Nix format); NAR
+hashes stay SHA-256, since Nix records and verifies those.
 
 This layout buys three things. Chunking dedups across paths and
 versions: a rebuilt package shares most of its chunks with the previous
@@ -79,6 +82,35 @@ keeps every chunk independently extractable: serving one path touches
 only its chunks, fetched with Range reads, not whole packs. And packing
 keeps the entry count low, which matters because both REST list
 operations and the eviction clock work per entry.
+
+### Reference normalization
+
+Store paths embed the 32-character base32 hashes of their references
+(and their own self-reference) in file contents. When a dependency is
+rebuilt its hash changes, so every chunk covering an occurrence churns
+even though nothing else in the file changed.
+
+hestia rewrites those occurrences to zeros before chunking, so the
+stored chunk stays identical across rebuilds. Each occurrence is
+recorded in a per-file position table (`ChunkList::rewrites`: file
+offset + reference index); on NAR reassembly the daemon copies the real
+hash back into each span. The hashes are not stored twice -- they come
+from the path's `references` in the `PathEntry`, and a reference's index
+is its position in the sorted, deduplicated reference set, so write and
+read derive identical indices.
+
+Restoring from the position table is chosen over re-scanning each served
+NAR: a benchmark measured 20-30 GB/s against under 1 GB/s, and it
+restores losslessly with no chance of a sentinel colliding with genuine
+content. The write side scans each file once to find the occurrences
+regardless; recording their offsets during that scan is free.
+
+Restoration keys off whether a file's `rewrites` is non-empty, so
+reference-free files pass through untouched (and keep the single-chunk
+zero-copy fast path). Correctness is checked, not assumed: the write
+pipeline re-derives the NAR hash through the same restore path before
+upload, and the substituter re-verifies the full NAR hash before
+serving. Any disagreement is a 404, and Nix falls through.
 
 ### Roots and GC
 

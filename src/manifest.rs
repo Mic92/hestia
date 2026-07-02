@@ -30,10 +30,24 @@ pub enum Error {
     InvalidEncoding(String),
 }
 
+/// Full SHA-256 digest of `data`. Used for NAR hashes, which Nix records
+/// and hestia must reproduce byte-for-byte.
+fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    *harmonia_utils_hash::Sha256::digest(data).digest_bytes()
+}
+
+/// Full BLAKE3 digest of `data`. Used for hestia's internal content
+/// addresses (chunk and pack hashes): ~3x faster than SHA-256 and not
+/// constrained by any Nix format.
+fn blake3_digest(data: &[u8]) -> [u8; 32] {
+    *blake3::hash(data).as_bytes()
+}
+
 /// Generates a fixed-size hash digest type: CBOR byte-string serialization,
-/// hex display, SHA-256 (truncated to the type's length) construction.
+/// hex display, and construction via `$digest` (truncated to the type's
+/// length).
 macro_rules! hash_newtype {
-    ($(#[$doc:meta])* $name:ident, $len:expr) => {
+    ($(#[$doc:meta])* $name:ident, $len:expr, $digest:path) => {
         $(#[$doc])*
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(pub [u8; $len]);
@@ -42,11 +56,11 @@ macro_rules! hash_newtype {
             /// Hash length in bytes.
             pub const LEN: usize = $len;
 
-            /// SHA-256 of `data`, truncated to [`Self::LEN`] bytes.
+            /// Digest of `data`, truncated to [`Self::LEN`] bytes.
             pub fn digest(data: impl AsRef<[u8]>) -> Self {
-                let digest = harmonia_utils_hash::Sha256::digest(data);
+                let digest = $digest(data.as_ref());
                 let mut bytes = [0u8; $len];
-                bytes.copy_from_slice(&digest.digest_bytes()[..$len]);
+                bytes.copy_from_slice(&digest[..$len]);
                 Self(bytes)
             }
 
@@ -97,23 +111,32 @@ macro_rules! hash_newtype {
 }
 
 hash_newtype!(
-    /// A full 32-byte SHA-256 digest (pack hash or NAR hash).
+    /// A full 32-byte SHA-256 digest. Used for NAR hashes only.
     Hash32,
-    32
+    32,
+    sha256_digest
 );
 
 hash_newtype!(
-    /// A SHA-256 digest truncated to 16 bytes.
+    /// A full 32-byte BLAKE3 digest, used for pack content addresses.
+    Blake3Pack,
+    32,
+    blake3_digest
+);
+
+hash_newtype!(
+    /// A BLAKE3 digest truncated to 16 bytes.
     ///
     /// Used for chunk hashes: 128 bits keeps collisions out of reach
     /// (birthday bound 2^64 chunks) while halving the dominant cost of the
     /// manifest, which stores one hash per chunk.
-    Hash16,
-    16
+    Blake3Chunk,
+    16,
+    blake3_digest
 );
 
-pub type ChunkHash = Hash16;
-pub type PackHash = Hash32;
+pub type ChunkHash = Blake3Chunk;
+pub type PackHash = Blake3Pack;
 pub type NarHash = Hash32;
 
 impl Hash32 {
@@ -183,6 +206,19 @@ impl<'de> Deserialize<'de> for PathHash {
 pub struct ChunkList {
     #[serde(default)]
     pub chunks: Vec<ChunkHash>,
+    /// Reference occurrences rewritten to a sentinel before chunking. Empty
+    /// for reference-free files. Offsets are relative to the file content;
+    /// indices point into the path's sorted reference set (see
+    /// [`crate::refnorm`]).
+    #[serde(default)]
+    pub rewrites: Vec<Rewrite>,
+}
+
+/// One reference occurrence normalized out of a file's content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rewrite {
+    pub offset: u64,
+    pub ref_index: u32,
 }
 
 /// Where one chunk lives inside a pack blob.
@@ -513,6 +549,8 @@ impl<'de> Deserialize<'de> for Blob {
 struct WireChunkList {
     #[serde(default)]
     chunks: Vec<u64>,
+    #[serde(default)]
+    rewrites: Vec<Rewrite>,
 }
 
 /// Columnar wire representation.
@@ -686,6 +724,7 @@ impl Manifest {
                 let entry = entry.clone().map_contents(&mut |list: &ChunkList| {
                     Ok::<_, Error>(WireChunkList {
                         chunks: list.chunks.iter().map(|hash| chunk_index[hash]).collect(),
+                        rewrites: list.rewrites.clone(),
                     })
                 })?;
                 Ok((*hash, entry))
@@ -716,13 +755,13 @@ impl Manifest {
             .chunk_hashes
             .0
             .chunks_exact(ChunkHash::LEN)
-            .map(|bytes| Hash16(bytes.try_into().expect("chunks_exact yields exact lengths")))
+            .map(|bytes| Blake3Chunk(bytes.try_into().expect("chunks_exact yields exact lengths")))
             .collect();
         let pack_table: Vec<PackHash> = wire
             .pack_hashes
             .0
             .chunks_exact(PackHash::LEN)
-            .map(|bytes| Hash32(bytes.try_into().expect("chunks_exact yields exact lengths")))
+            .map(|bytes| Blake3Pack(bytes.try_into().expect("chunks_exact yields exact lengths")))
             .collect();
         let chunk_at = |index: u64| {
             chunk_table
@@ -794,6 +833,7 @@ impl Manifest {
                             .iter()
                             .map(|&index| chunk_at(index))
                             .collect::<Result<Vec<_>, Error>>()?,
+                        rewrites: list.rewrites.clone(),
                     })
                 })?;
                 Ok((hash, entry))
@@ -816,7 +856,10 @@ mod tests {
     pub(crate) fn leaf_tree(chunks: Vec<ChunkHash>) -> FileTree<ChunkList> {
         FileTree(FileSystemObject::Regular(Regular {
             executable: false,
-            contents: ChunkList { chunks },
+            contents: ChunkList {
+                chunks,
+                ..Default::default()
+            },
         }))
     }
 
@@ -857,7 +900,7 @@ mod tests {
         let mut manifest = Manifest::new();
         let chunk_a = ChunkHash::digest(b"chunk a");
         let chunk_b = ChunkHash::digest(b"chunk b");
-        let pack = Hash32::digest(b"pack");
+        let pack = PackHash::digest(b"pack");
 
         manifest.paths.insert(
             path_hash(1),
@@ -879,6 +922,7 @@ mod tests {
                                         executable: true,
                                         contents: ChunkList {
                                             chunks: vec![chunk_a, chunk_b],
+                                            ..Default::default()
                                         },
                                     }))),
                                 )]),
@@ -951,7 +995,7 @@ mod tests {
         // expected bytes"). The columnar hash blobs exceed that on any
         // real manifest, so use enough chunks to cross the threshold.
         let mut manifest = sample_manifest();
-        let pack = Hash32::digest(b"big pack");
+        let pack = PackHash::digest(b"big pack");
         for i in 0u32..1000 {
             manifest.chunks.insert(
                 ChunkHash::digest(i.to_le_bytes()),
@@ -1118,9 +1162,9 @@ mod tests {
     }
 
     #[test]
-    fn truncated_digest_is_a_sha256_prefix() {
-        let full = Hash32::digest(b"same input");
-        let truncated = Hash16::digest(b"same input");
+    fn truncated_chunk_digest_is_a_blake3_prefix() {
+        let full = Blake3Pack::digest(b"same input");
+        let truncated = ChunkHash::digest(b"same input");
         assert_eq!(truncated.0[..], full.0[..16]);
     }
 
@@ -1234,7 +1278,7 @@ mod tests {
 
     #[test]
     fn merge_dedups_packs_and_chunks() {
-        let pack = Hash32::digest(b"pack");
+        let pack = PackHash::digest(b"pack");
         let chunk = ChunkHash::digest(b"chunk");
 
         let mut a = Manifest::new();
@@ -1428,13 +1472,19 @@ mod tests {
             (0u8..6).prop_map(|seed| Hash32::digest([seed]))
         }
 
+        fn arb_pack_hash() -> impl Strategy<Value = PackHash> {
+            (0u8..6).prop_map(|seed| PackHash::digest([seed]))
+        }
+
         fn arb_chunk_hash() -> impl Strategy<Value = ChunkHash> {
             (0u8..6).prop_map(|seed| ChunkHash::digest([seed]))
         }
 
         fn arb_chunk_list() -> impl Strategy<Value = ChunkList> {
-            proptest::collection::vec(arb_chunk_hash(), 0..3)
-                .prop_map(|chunks| ChunkList { chunks })
+            proptest::collection::vec(arb_chunk_hash(), 0..3).prop_map(|chunks| ChunkList {
+                chunks,
+                ..Default::default()
+            })
         }
 
         fn arb_path_entry() -> impl Strategy<Value = PathEntry> {
@@ -1481,7 +1531,7 @@ mod tests {
         }
 
         fn arb_chunk_location() -> impl Strategy<Value = ChunkLocation> {
-            (arb_hash32(), 0u64..1000, 1u32..1000, 1u32..1000, 0u32..5).prop_map(
+            (arb_pack_hash(), 0u64..1000, 1u32..1000, 1u32..1000, 0u32..5).prop_map(
                 |(pack, offset, compressed_size, uncompressed_size, repacks_survived)| {
                     ChunkLocation {
                         pack,
@@ -1523,7 +1573,7 @@ mod tests {
             (
                 proptest::collection::btree_map(arb_path_hash(), arb_path_entry(), 0..4),
                 proptest::collection::btree_map(arb_chunk_hash(), arb_chunk_location(), 0..4),
-                proptest::collection::btree_map(arb_hash32(), arb_pack_info(), 0..3),
+                proptest::collection::btree_map(arb_pack_hash(), arb_pack_info(), 0..3),
                 proptest::collection::btree_map("[a-z]{1,4}", arb_root(), 0..3),
             )
                 .prop_map(|(paths, chunks, packs, roots)| Manifest {

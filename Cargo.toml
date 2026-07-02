@@ -44,6 +44,9 @@ axum = "0.8"
 # Content-defined chunking
 fastcdc = "4"
 
+# Internal content addresses (chunk + pack hashes); faster than SHA-256
+blake3 = "1"
+
 # Stream combinators for NAR event/byte streams
 futures-util = "0.3"
 

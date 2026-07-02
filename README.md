@@ -78,9 +78,11 @@ To Nix, the daemon looks like a regular binary cache: Nix asks it for paths
 before building them and reports every path it does build. At the end of
 the job, new build results and their runtime dependencies (the full closure,
 nixpkgs packages included) are split into content-defined chunks, packed
-into a few large blobs, and uploaded. Chunks that are already in the cache
-are never uploaded again, and every download is hash-verified before Nix
-gets to see it. The worst thing corrupt or evicted cache data can cause is a
+into a few large blobs, and uploaded. Embedded dependency hashes are
+normalized out before chunking so a chunk stays identical when only a
+reference's hash changed, and restored losslessly on the way back out.
+Chunks that are already in the cache are never uploaded again, and every
+download is hash-verified before Nix gets to see it. The worst thing corrupt or evicted cache data can cause is a
 rebuild, never wrong build inputs.
 
 ### Roots
@@ -156,9 +158,9 @@ when the branch is deleted. In practice this means:
 
 ### What hestia itself enforces
 
-Pack blobs are content-addressed (SHA-256-named, hash-verified on every
-read), and NARs are verified against the manifest's NAR hash before being
-served. Anything that doesn't check out is treated as a cache miss and gets
+Pack blobs are content-addressed (BLAKE3-named, hash-verified on every
+read), and NARs are verified against the manifest's SHA-256 NAR hash
+before being served. Anything that doesn't check out is treated as a cache miss and gets
 rebuilt.
 
 ## Limitations

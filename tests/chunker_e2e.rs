@@ -19,6 +19,7 @@ use bytes::Bytes;
 
 use hestia::chunker::{self, PackBuilder, chunk_path, extract_chunk, flatten_tree};
 use hestia::manifest::{ChunkHash, ChunkLocation, FileSystemObject};
+use hestia::refnorm::RefTable;
 use support::store::{find_real_store_path, nix_path_info_hash, nix_store_dump_hash};
 
 // ---------------------------------------------------------------------------
@@ -65,7 +66,7 @@ fn create_fixture(root: &Path) {
 /// from the pack buffer + manifest-style locations and compare against the
 /// filesystem.
 async fn assert_reconstruction_from_pack(path: &Path) {
-    let chunked = chunk_path(path).await.unwrap();
+    let chunked = chunk_path(path, &RefTable::new(&[])).await.unwrap();
 
     // Build a single pack from the chunks. (The production pipeline goes
     // through compress_chunks + add_compressed and splits packs at the
@@ -148,7 +149,7 @@ async fn fixture_tree_reconstructs_byte_identical_from_pack() {
 
     // Dedup check: the two identical large files must share every chunk, so
     // unique chunks must be far fewer than total chunk references.
-    let chunked = chunk_path(&root).await.unwrap();
+    let chunked = chunk_path(&root, &RefTable::new(&[])).await.unwrap();
     let total_refs: usize = flatten_tree(&chunked.tree)
         .iter()
         .filter_map(|(_, node)| match node {
@@ -181,7 +182,7 @@ async fn single_file_path_chunks_and_reconstructs() {
     let file = dir.path().join("single");
     std::fs::write(&file, vec![7u8; 100_000]).unwrap();
 
-    let chunked = chunk_path(&file).await.unwrap();
+    let chunked = chunk_path(&file, &RefTable::new(&[])).await.unwrap();
     let FileSystemObject::Regular(regular) = &chunked.tree.0 else {
         panic!("root node must be a regular file");
     };
@@ -262,10 +263,11 @@ async fn nar_hash_from_chunks_matches_nix_for_real_store_path() {
         return;
     };
 
-    let chunked = chunk_path(&store_path).await.unwrap();
-    let (hash, size) = chunker::nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map())
-        .await
-        .unwrap();
+    let chunked = chunk_path(&store_path, &RefTable::new(&[])).await.unwrap();
+    let (hash, size) =
+        chunker::nar_hash_from_chunks(&chunked.tree, &chunked.chunk_map(), &RefTable::new(&[]))
+            .await
+            .unwrap();
     assert_eq!(size, expected_size, "NAR size mismatch");
     assert_eq!(hash, expected_hash, "NAR hash mismatch");
 }
