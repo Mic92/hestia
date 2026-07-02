@@ -5,14 +5,24 @@
 # paths (and their closures) via the post-build hook, then times the drain.
 #
 # Usage:
-#   bin/bench-drain.sh /nix/store/xxx-foo [/nix/store/yyy-bar ...]
+#   bin/bench-drain.sh [--perf] <store-path> [store-path ...]
+#
+# With --perf the daemon runs under `perf record` (call-graph dwarf) and
+# writes perf.data in the repo root for `perf report`.
 #
 # Binaries are taken from $HESTIA_BIN / $MOCK_BIN if set, else from
-# ./target/release (build them first: cargo build --release).
+# ./target/release (build them first; --perf wants debuginfo:
+# CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release).
 set -euo pipefail
 
+perf=0
+if [ "${1:-}" = "--perf" ]; then
+	perf=1
+	shift
+fi
+
 if [ "$#" -lt 1 ]; then
-	echo "usage: $0 <store-path> [store-path ...]" >&2
+	echo "usage: $0 [--perf] <store-path> [store-path ...]" >&2
 	exit 2
 fi
 
@@ -48,11 +58,18 @@ pids+=("$!")
 eval "$("$mock" --print-env --addr "$addr")"
 export ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN GITHUB_API_URL GITHUB_TOKEN GITHUB_REPOSITORY
 
-# 3. Daemon.
-"$hestia" serve --socket "$socket" --listen "127.0.0.1:8100" >"$work/serve.log" 2>&1 &
-pids+=("$!")
+# 3. Daemon, optionally under perf.
+serve=("$hestia" serve --socket "$socket" --listen "127.0.0.1:8100")
+if [ "$perf" -eq 1 ]; then
+	perf record -g --call-graph dwarf -o "$root/perf.data" -- \
+		"${serve[@]}" >"$work/serve.log" 2>&1 &
+else
+	"${serve[@]}" >"$work/serve.log" 2>&1 &
+fi
+serve_launcher=$!
+pids+=("$serve_launcher")
 
-for _ in $(seq 1 50); do
+for _ in $(seq 1 100); do
 	[ -S "$socket" ] && break
 	sleep 0.1
 done
@@ -73,3 +90,11 @@ end=$(date +%s.%N)
 blob_bytes=$(du -sb "$work/blobs" | cut -f1)
 printf 'drain wall time: %.2fs, uploaded %s bytes\n' \
 	"$(echo "$end - $start" | bc)" "$blob_bytes"
+
+if [ "$perf" -eq 1 ]; then
+	# Graceful shutdown lets perf finalize perf.data.
+	serve_pid=$(pgrep -P "$serve_launcher" -f 'hestia serve' || true)
+	[ -n "$serve_pid" ] && kill -TERM "$serve_pid" 2>/dev/null || true
+	wait "$serve_launcher" 2>/dev/null || true
+	echo "wrote $root/perf.data" >&2
+fi
