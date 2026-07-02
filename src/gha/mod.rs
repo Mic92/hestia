@@ -53,6 +53,13 @@ pub enum Error {
 
     #[error("gave up after {attempts} conflicting attempts to save {key}")]
     Conflict { key: String, attempts: u32 },
+
+    #[error(
+        "cache write denied ({reason}): the runtime token is read-only, so nothing can be \
+         cached. Expected for events whose token has no writable cache scopes (check_run, \
+         fork pull_request). The build is unaffected; its paths are rebuilt next time."
+    )]
+    WriteDenied { reason: String },
 }
 
 impl Error {

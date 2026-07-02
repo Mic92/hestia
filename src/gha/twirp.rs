@@ -62,7 +62,16 @@ pub struct CreateCacheEntryResponse {
     pub ok: bool,
     #[serde(default)]
     pub signed_upload_url: String,
+    /// Why the reservation was refused. A read-only token is denied with
+    /// `ok=false` and this set (not a Twirp error), so it is the only way
+    /// to tell a denial from a genuinely taken key.
+    #[serde(default, alias = "message")]
+    pub msg: String,
 }
+
+/// Prefix the receiver puts on a read-only-token denial. Matches
+/// `CACHE_WRITE_DENIED_PREFIX` in @actions/toolkit.
+pub const CACHE_WRITE_DENIED_PREFIX: &str = "cache write denied:";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FinalizeCacheEntryUploadRequest {
@@ -247,8 +256,13 @@ impl TwirpClient {
                     upload_url: response.signed_upload_url,
                 })
             }
-            // Some backends signal "exists" with ok=false instead of a Twirp
-            // error; treat both the same.
+            // Distinct from a taken key: without this the save loop retries
+            // the denial as a conflict and gives up with a misleading error.
+            Ok(response) if response.msg.starts_with(CACHE_WRITE_DENIED_PREFIX) => {
+                Err(Error::WriteDenied {
+                    reason: response.msg,
+                })
+            }
             Ok(_) => Ok(Reservation::AlreadyExists),
             Err(err) if err.is_already_exists() => Ok(Reservation::AlreadyExists),
             Err(err) => Err(err),
@@ -445,5 +459,18 @@ mod tests {
             msg: error.msg,
         };
         assert!(parsed.is_already_exists());
+    }
+
+    #[test]
+    fn create_cache_entry_response_carries_the_denial_message() {
+        let denied: CreateCacheEntryResponse = serde_json::from_str(
+            r#"{"ok": false, "message": "cache write denied: token has no writable scopes"}"#,
+        )
+        .unwrap();
+        assert!(!denied.ok);
+        assert!(denied.msg.starts_with(CACHE_WRITE_DENIED_PREFIX));
+
+        let taken: CreateCacheEntryResponse = serde_json::from_str(r#"{"ok": false}"#).unwrap();
+        assert!(!taken.msg.starts_with(CACHE_WRITE_DENIED_PREFIX));
     }
 }
