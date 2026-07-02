@@ -7,7 +7,9 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    # Full version tags only; the floating major alias (v1) has no dots and
+    # must not cut a duplicate release for an already-shipped version.
+    tags: ["v*.*.*"]
   # Manual dry runs: build the binaries without creating a release, so the
   # build can be debugged without re-pushing tags.
   workflow_dispatch:
