@@ -14,6 +14,8 @@
 //! error for us: cache keys are content-addressed, so it means the data is
 //! already there (CAS semantics).
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -72,6 +74,10 @@ pub struct CreateCacheEntryResponse {
 /// Prefix the receiver puts on a read-only-token denial. Matches
 /// `CACHE_WRITE_DENIED_PREFIX` in @actions/toolkit.
 pub const CACHE_WRITE_DENIED_PREFIX: &str = "cache write denied:";
+
+/// Finalize retries when the freshly uploaded entry is not yet visible.
+const FINALIZE_MAX_ATTEMPTS: u32 = 5;
+const FINALIZE_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FinalizeCacheEntryUploadRequest {
@@ -277,8 +283,22 @@ impl TwirpClient {
             size_bytes,
             version: self.version.clone(),
         };
-        let response: FinalizeCacheEntryUploadResponse =
-            self.call("FinalizeCacheEntryUpload", &request).await?;
+        // Finalize occasionally answers not_found for an entry this writer
+        // just reserved and uploaded (the blob is not yet visible to the
+        // finalize handler). It is idempotent, so retry before giving up.
+        let mut attempts = 0;
+        let response: FinalizeCacheEntryUploadResponse = loop {
+            attempts += 1;
+            match self
+                .call::<_, FinalizeCacheEntryUploadResponse>("FinalizeCacheEntryUpload", &request)
+                .await
+            {
+                Err(err) if err.is_not_found() && attempts < FINALIZE_MAX_ATTEMPTS => {
+                    tokio::time::sleep(FINALIZE_RETRY_DELAY).await;
+                }
+                other => break other?,
+            }
+        };
         if !response.ok {
             return Err(Error::InvalidResponse(format!(
                 "FinalizeCacheEntryUpload for {key} returned ok=false"
@@ -472,5 +492,15 @@ mod tests {
 
         let taken: CreateCacheEntryResponse = serde_json::from_str(r#"{"ok": false}"#).unwrap();
         assert!(!taken.msg.starts_with(CACHE_WRITE_DENIED_PREFIX));
+    }
+
+    #[test]
+    fn not_found_is_recognized_for_finalize_retry() {
+        let err = Error::Twirp {
+            method: "FinalizeCacheEntryUpload".into(),
+            code: "not_found".into(),
+            msg: "cache entry not found".into(),
+        };
+        assert!(err.is_not_found());
     }
 }

@@ -68,4 +68,9 @@ impl Error {
     pub fn is_already_exists(&self) -> bool {
         matches!(self, Error::Twirp { code, .. } if code == "already_exists")
     }
+
+    /// True if this error is a Twirp `not_found` response.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Error::Twirp { code, .. } if code == "not_found")
+    }
 }
