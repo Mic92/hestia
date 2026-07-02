@@ -46,6 +46,10 @@ pub const PACK_TARGET_SIZE: u64 = 64 * 1024 * 1024;
 /// How many packs upload concurrently during a drain.
 const UPLOAD_CONCURRENCY: usize = 4;
 
+/// Upper bound on paths chunked and NAR-verified concurrently; the actual
+/// width is capped at the CPU count.
+const CHUNK_CONCURRENCY: usize = 32;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("GHA cache error: {0}")]
@@ -222,6 +226,23 @@ struct PreparedPath {
     entry: PathEntry,
 }
 
+/// A path that chunked and passed NAR verification.
+struct ReadyPath {
+    info: PathInfo,
+    chunked: chunker::ChunkedPath,
+    nar_hash: crate::manifest::NarHash,
+    nar_size: u64,
+    elapsed: std::time::Duration,
+}
+
+/// Result of the concurrent chunk-and-verify stage for one path.
+enum Verified {
+    // Boxed: far larger than the failure variants.
+    Ready(Box<ReadyPath>),
+    ChunkFailed,
+    VerifyFailed,
+}
+
 impl PipelineContext {
     fn save_mutable(&self) -> SaveMutable<'_> {
         SaveMutable::new(&self.twirp, &self.http, &self.manifest_prefix)
@@ -337,71 +358,103 @@ impl PipelineContext {
 
         stats.load_ms = load_started.elapsed().as_millis() as u64;
 
-        // Pipelined chunk → compress → pack → upload: the producer chunks
-        // paths sequentially, compresses their new chunks in parallel
-        // across cores, and seals packs at the target size; sealed packs
-        // flow through a bounded channel to the uploader, so network
-        // transfer overlaps with the CPU work for later paths.
+        // Three stages joined below, each feeding the next over a bounded
+        // channel: prepare (chunk + verify concurrently, then dedup),
+        // pack (compress concurrently, then seal packs), upload. The
+        // CPU-heavy chunk/verify and compress steps run across cores; the
+        // dedup and packing glue is serial but cheap.
+        let concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(CHUNK_CONCURRENCY);
+        let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Vec<chunker::Chunk>>(concurrency);
         let (pack_tx, pack_rx) = tokio::sync::mpsc::channel::<chunker::Pack>(2);
 
-        let producer = async {
+        let prepare = async {
             let mut prepared: Vec<PreparedPath> = Vec::new();
-            // Stage timers accumulate as Durations and convert to ms once:
-            // per-path as_millis() truncation would drop up to ~1 ms per
-            // path, systematically underreporting drains of many small
-            // paths.
+            // Summed as a Duration, converted once: per-path as_millis()
+            // truncation would underreport drains of many small paths.
             let mut chunk_time = std::time::Duration::ZERO;
-            let mut pack_time = std::time::Duration::ZERO;
-            // Chunks of earlier prepared paths in this batch (cross-path dedup).
+            let mut failed_chunking = 0usize;
+            let mut failed_verification = 0usize;
+            // Chunks already emitted for this batch (cross-path dedup).
             let mut batch_chunks: BTreeSet<crate::manifest::ChunkHash> = BTreeSet::new();
-            let mut builder = PackBuilder::new();
 
-            'paths: for (path, info) in to_push {
-                let chunk_started = std::time::Instant::now();
-                // Per-path chunking failures (unreadable files, NAR contents
-                // hestia cannot represent) are skipped, not propagated: a
-                // pipeline error would re-buffer the whole batch, and a
-                // deterministic failure would then keep every later drain --
-                // including the final shutdown drain -- from caching
-                // anything at all.
-                // Normalize reference occurrences out before chunking so
-                // chunks stay stable across dependency-hash changes; the
-                // path's own references drive both normalization and the
-                // read-side restore.
-                let refs = RefTable::new(&info.references);
-                let chunked = match chunk_path(&path, &refs).await {
-                    Ok(chunked) => chunked,
-                    Err(err) => {
-                        eprintln!("hestia: NOT uploading {path}: chunking failed: {err}");
-                        stats.failed_chunking += 1;
+            // Per-path work is single-threaded, so running several at once
+            // is what fills the cores. Chunking or verification failures are
+            // skipped, not propagated: a pipeline error would re-buffer the
+            // whole batch, and a deterministic failure would then keep every
+            // later drain (including the shutdown drain) from caching
+            // anything.
+            let mut verified = futures_util::stream::iter(to_push)
+                .map(|(path, info)| {
+                    tokio::spawn(async move {
+                        let started = std::time::Instant::now();
+                        // The path's own references drive both normalization
+                        // (so chunks stay stable across dependency-hash
+                        // changes) and the read-side restore.
+                        let refs = RefTable::new(&info.references);
+                        let chunked = match chunk_path(&path, &refs).await {
+                            Ok(chunked) => chunked,
+                            Err(err) => {
+                                eprintln!("hestia: NOT uploading {path}: chunking failed: {err}");
+                                return Verified::ChunkFailed;
+                            }
+                        };
+                        let chunk_map = chunked.chunk_map();
+                        // Integrity gate: the chunked representation must
+                        // reproduce the NAR hash Nix recorded. A mismatch
+                        // means hestia would serve corrupt data; never upload.
+                        let (nar_hash, nar_size) =
+                            match nar_hash_from_chunks(&chunked.tree, &chunk_map, &refs).await {
+                                Ok(result) => result,
+                                Err(err) => {
+                                    eprintln!(
+                                        "hestia: NOT uploading {path}: NAR replay failed: {err}"
+                                    );
+                                    return Verified::ChunkFailed;
+                                }
+                            };
+                        if nar_hash != info.nar_hash || nar_size != info.nar_size {
+                            eprintln!(
+                                "hestia: NOT uploading {path}: chunked NAR hash {nar_hash} (size \
+                                 {nar_size}) does not match the store's record {} (size {}); \
+                                 this indicates a chunker bug or store corruption",
+                                info.nar_hash, info.nar_size
+                            );
+                            return Verified::VerifyFailed;
+                        }
+                        Verified::Ready(Box::new(ReadyPath {
+                            info,
+                            chunked,
+                            nar_hash,
+                            nar_size,
+                            elapsed: started.elapsed(),
+                        }))
+                    })
+                })
+                .buffer_unordered(concurrency);
+
+            while let Some(joined) = verified.next().await {
+                let ready = match joined.expect("chunk task panicked") {
+                    Verified::Ready(ready) => ready,
+                    Verified::ChunkFailed => {
+                        failed_chunking += 1;
+                        continue;
+                    }
+                    Verified::VerifyFailed => {
+                        failed_verification += 1;
                         continue;
                     }
                 };
-                let chunk_map = chunked.chunk_map();
-
-                // Integrity gate: the chunked representation must reproduce
-                // the NAR hash Nix recorded for this path. A mismatch means
-                // hestia would serve corrupt data; never upload it.
-                let (nar_hash, nar_size) =
-                    match nar_hash_from_chunks(&chunked.tree, &chunk_map, &refs).await {
-                        Ok(result) => result,
-                        Err(err) => {
-                            eprintln!("hestia: NOT uploading {path}: NAR replay failed: {err}");
-                            stats.failed_chunking += 1;
-                            continue;
-                        }
-                    };
-                chunk_time += chunk_started.elapsed();
-                if nar_hash != info.nar_hash || nar_size != info.nar_size {
-                    eprintln!(
-                        "hestia: NOT uploading {path}: chunked NAR hash {nar_hash} (size \
-                         {nar_size}) does not match the store's record {} (size {}); \
-                         this indicates a chunker bug or store corruption",
-                        info.nar_hash, info.nar_size
-                    );
-                    stats.failed_verification += 1;
-                    continue;
-                }
+                let ReadyPath {
+                    info,
+                    chunked,
+                    nar_hash,
+                    nar_size,
+                    elapsed,
+                } = *ready;
+                chunk_time += elapsed;
 
                 let new_chunks: Vec<chunker::Chunk> = chunked
                     .chunks
@@ -410,28 +463,6 @@ impl PipelineContext {
                         !current.chunks.contains_key(&chunk.hash) && batch_chunks.insert(chunk.hash)
                     })
                     .collect();
-
-                let mut pack_started = std::time::Instant::now();
-                let frames = tokio::task::spawn_blocking(move || compress_chunks(new_chunks))
-                    .await
-                    .expect("compression task panicked")?;
-                for frame in frames {
-                    builder.add_compressed(frame.hash, &frame.frame, frame.uncompressed_size);
-                    if builder.compressed_size() >= self.pack_target_size {
-                        let pack = std::mem::take(&mut builder).finish();
-                        // Pause the pack timer across the send: a full
-                        // channel blocks on upload backpressure, which must
-                        // not be booked as packing time.
-                        pack_time += pack_started.elapsed();
-                        if pack_tx.send(pack).await.is_err() {
-                            // Uploader gone: it failed, and try_join below
-                            // reports its error; stop producing.
-                            break 'paths;
-                        }
-                        pack_started = std::time::Instant::now();
-                    }
-                }
-                pack_time += pack_started.elapsed();
 
                 prepared.push(PreparedPath {
                     hash: info.path_hash(),
@@ -451,17 +482,55 @@ impl PipelineContext {
                         last_pushed: now,
                     },
                 });
+
+                if !new_chunks.is_empty() && chunks_tx.send(new_chunks).await.is_err() {
+                    // Packer gone: it failed, and try_join below reports its
+                    // error; stop producing.
+                    break;
+                }
+            }
+            drop(chunks_tx);
+            Ok::<_, Error>((prepared, chunk_time, failed_chunking, failed_verification))
+        };
+
+        let pack = async {
+            let mut pack_time = std::time::Duration::ZERO;
+            let mut builder = PackBuilder::new();
+            // Compress paths' new-chunk sets concurrently; frames arrive out
+            // of order, which is fine -- packs are content-addressed.
+            let chunk_stream = futures_util::stream::unfold(chunks_rx, |mut rx| async move {
+                rx.recv().await.map(|chunks| (chunks, rx))
+            });
+            let compressed = chunk_stream
+                .map(|new_chunks| tokio::task::spawn_blocking(move || compress_chunks(new_chunks)))
+                .buffer_unordered(concurrency);
+            tokio::pin!(compressed);
+
+            'pack: while let Some(joined) = compressed.next().await {
+                let frames = joined.expect("compression task panicked")?;
+                let mut pack_started = std::time::Instant::now();
+                for frame in frames {
+                    builder.add_compressed(frame.hash, &frame.frame, frame.uncompressed_size);
+                    if builder.compressed_size() >= self.pack_target_size {
+                        let sealed = std::mem::take(&mut builder).finish();
+                        // Pause the pack timer across the send: a full
+                        // channel blocks on upload backpressure, which must
+                        // not be booked as packing time.
+                        pack_time += pack_started.elapsed();
+                        if pack_tx.send(sealed).await.is_err() {
+                            break 'pack;
+                        }
+                        pack_started = std::time::Instant::now();
+                    }
+                }
+                pack_time += pack_started.elapsed();
             }
             if !builder.is_empty() {
-                // A send failure means the uploader failed; try_join below
-                // reports its error, the producer's result is discarded.
                 let _ = pack_tx.send(builder.finish()).await;
             }
-            // pack_tx drops here, ending the consumer's stream.
+            // pack_tx drops here, ending the uploader's stream.
             drop(pack_tx);
-            stats.chunk_ms = chunk_time.as_millis() as u64;
-            stats.pack_ms = pack_time.as_millis() as u64;
-            Ok::<_, Error>(prepared)
+            Ok::<_, Error>(pack_time)
         };
 
         let upload_started = std::time::Instant::now();
@@ -485,7 +554,12 @@ impl PipelineContext {
                 .await
         };
 
-        let (prepared, uploads) = tokio::try_join!(producer, consumer)?;
+        let ((prepared, chunk_time, failed_chunking, failed_verification), pack_time, uploads) =
+            tokio::try_join!(prepare, pack, consumer)?;
+        stats.failed_chunking += failed_chunking;
+        stats.failed_verification += failed_verification;
+        stats.chunk_ms = chunk_time.as_millis() as u64;
+        stats.pack_ms = pack_time.as_millis() as u64;
         // Paths the producer rejected (failed verification or chunking)
         // must not enter the committed root: it would pin hashes the
         // manifest cannot serve.

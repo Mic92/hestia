@@ -209,10 +209,19 @@ pub struct CompressedChunk {
     pub uncompressed_size: u32,
 }
 
-/// Compress chunks in parallel across CPU cores, preserving order.
+/// Chunks per worker below which parallel compression is not worth the
+/// thread-spawn cost. The pipeline already compresses many paths at once,
+/// so only a path large enough to fill several workers (e.g. a big binary,
+/// which is where a closure's bytes concentrate) spreads over cores.
+const CHUNKS_PER_COMPRESS_WORKER: usize = 64;
+
+/// Compress a path's chunks, preserving order.
 ///
-/// zstd is the dominant CPU cost of a drain; spreading one path's chunks
-/// over all cores shortens the producer's critical path.
+/// zstd is the dominant CPU cost of a drain. The pipeline compresses many
+/// paths concurrently, so small paths stay single-threaded (spawning a
+/// thread pool for tens of chunks costs more than it saves); a large path
+/// -- often a single big output holding most of a closure's bytes -- spans
+/// cores, since inter-path concurrency alone cannot split it.
 /// Blocking: call via `spawn_blocking` from async code.
 pub fn compress_chunks(chunks: Vec<Chunk>) -> Result<Vec<CompressedChunk>, Error> {
     let compress_one = |chunk: &Chunk| -> Result<CompressedChunk, Error> {
@@ -225,7 +234,7 @@ pub fn compress_chunks(chunks: Vec<Chunk>) -> Result<Vec<CompressedChunk>, Error
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(chunks.len());
+        .min(chunks.len() / CHUNKS_PER_COMPRESS_WORKER);
     if workers <= 1 {
         return chunks.iter().map(compress_one).collect();
     }
