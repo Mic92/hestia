@@ -33,14 +33,15 @@ pub enum Error {
     OffsetOutOfRange { offset: usize, len: usize },
 }
 
-/// Sorted, deduplicated reference hashes for one path, plus a first-byte
-/// bitmap and 4-byte prefix index for fast scanning. The vector position is
-/// the [`Rewrite::ref_index`].
+/// Sorted, deduplicated reference hashes for one path, plus a two-byte
+/// presence bitmap that gates the scan. The vector position is the
+/// [`Rewrite::ref_index`].
 #[derive(Debug, Clone)]
 pub struct RefTable {
     hashes: Vec<[u8; HASH_LEN]>,
-    first: [bool; 256],
-    prefix: std::collections::HashMap<[u8; 4], Vec<usize>>,
+    /// Set at `u16(hash[0], hash[1])` for every hash: an array lookup that
+    /// rejects almost every scan position before the binary search.
+    gate: Box<[bool; 65536]>,
 }
 
 impl RefTable {
@@ -58,21 +59,12 @@ impl RefTable {
         hashes.sort_unstable();
         hashes.dedup();
 
-        let mut first = [false; 256];
-        let mut prefix: std::collections::HashMap<[u8; 4], Vec<usize>> = Default::default();
-        for (index, hash) in hashes.iter().enumerate() {
-            first[hash[0] as usize] = true;
-            prefix
-                .entry(hash[..4].try_into().expect("slice is 4 bytes"))
-                .or_default()
-                .push(index);
+        let mut gate = Box::new([false; 65536]);
+        for hash in &hashes {
+            gate[usize::from(u16::from_be_bytes([hash[0], hash[1]]))] = true;
         }
 
-        Self {
-            hashes,
-            first,
-            prefix,
-        }
+        Self { hashes, gate }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -80,12 +72,9 @@ impl RefTable {
     }
 
     fn match_at(&self, window: &[u8]) -> Option<usize> {
-        let key: [u8; 4] = window[..4].try_into().expect("slice is 4 bytes");
-        self.prefix
-            .get(&key)?
-            .iter()
-            .copied()
-            .find(|&index| self.hashes[index] == window)
+        self.hashes
+            .binary_search_by(|hash| hash[..].cmp(window))
+            .ok()
     }
 
     /// Replace every reference-hash occurrence with the sentinel, returning
@@ -99,22 +88,25 @@ impl RefTable {
         let mut out = Vec::with_capacity(data.len());
         let mut rewrites = Vec::new();
         let mut i = 0;
+        // Start of the unmatched run not yet copied into `out`.
+        let mut last = 0;
         while i + HASH_LEN <= data.len() {
-            if self.first[data[i] as usize]
+            if self.gate[usize::from(u16::from_be_bytes([data[i], data[i + 1]]))]
                 && let Some(index) = self.match_at(&data[i..i + HASH_LEN])
             {
+                out.extend_from_slice(&data[last..i]);
                 rewrites.push(Rewrite {
                     offset: out.len() as u64,
                     ref_index: index as u32,
                 });
                 out.extend_from_slice(&SENTINEL);
                 i += HASH_LEN;
-                continue;
+                last = i;
+            } else {
+                i += 1;
             }
-            out.push(data[i]);
-            i += 1;
         }
-        out.extend_from_slice(&data[i..]);
+        out.extend_from_slice(&data[last..]);
         (Bytes::from(out), rewrites)
     }
 
