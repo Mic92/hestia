@@ -41,8 +41,7 @@ pub enum Error {
 #[derive(Debug, Clone)]
 pub struct RefTable {
     hashes: Vec<[u8; HASH_LEN]>,
-    /// `None` when there are no references: an empty automaton is pointless
-    /// and the scan is skipped entirely.
+    /// `None` with no references; the scan is then skipped entirely.
     scanner: Option<AhoCorasick>,
 }
 
@@ -62,10 +61,9 @@ impl RefTable {
         hashes.dedup();
 
         let scanner = (!hashes.is_empty()).then(|| {
-            // LeftmostLongest matches the old left-to-right, longest-first
-            // scan; all patterns are the same length, so it also yields the
-            // non-overlapping runs restore expects. A SIMD prefilter makes
-            // this multi-GB/s over the sparse hits typical of file content.
+            // All patterns are hash-length, so LeftmostLongest yields the
+            // non-overlapping matches restore expects; its SIMD prefilter
+            // skips the long non-matching runs of file content.
             AhoCorasick::builder()
                 .match_kind(MatchKind::LeftmostLongest)
                 .build(&hashes)
