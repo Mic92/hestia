@@ -1,4 +1,4 @@
-# Release pipeline: tag push -> static binaries -> GitHub release.
+#https://github.com/numtide/freelancer-toolbox/pull/118 Release pipeline: tag push -> static binaries -> GitHub release.
 #
 # The binaries must run on stock runners without nix: Linux binaries are
 # statically linked (musl); darwin binaries link only system libraries
@@ -97,10 +97,6 @@ jobs:
           # by hand before publishing. Binaries are verified via build
           # attestations (gh attestation verify), so no checksums.
           cat > notes.md <<EOF
-          This is alpha software. The cache format and behavior can change
-          between releases; a format change means the cache starts out empty
-          after an upgrade.
-
           ## Usage
 
           \`\`\`yaml
