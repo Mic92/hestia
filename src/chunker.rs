@@ -80,23 +80,70 @@ pub struct Chunk {
     pub data: Bytes,
 }
 
+/// Segment size for parallel chunking: FastCDC runs independently per
+/// segment, forcing a cut at each seam. A fixed constant (not core count),
+/// so chunk boundaries -- and dedup -- stay identical across machines.
+const CHUNK_SEGMENT_SIZE: usize = 16 * 1024 * 1024;
+
 /// Split file contents into content-defined chunks.
 ///
-/// Deterministic: the same input always produces the same chunk boundaries
-/// and hashes (the gear table is fixed by the FastCDC algorithm; only
-/// MIN/AVG/MAX_CHUNK_SIZE and the fastcdc crate version affect boundaries).
+/// Deterministic: same input, same chunks, independent of core count.
+/// Boundaries depend only on MIN/AVG/MAX_CHUNK_SIZE, the fastcdc version,
+/// and the CHUNK_SEGMENT_SIZE seam cuts.
+///
+/// A multi-segment file chunks across cores, so one big output -- where a
+/// closure's bytes concentrate -- is not stuck on one core (inter-path
+/// concurrency cannot split a single file).
 pub fn chunk_data(data: &Bytes) -> Vec<Chunk> {
     if data.is_empty() {
         return Vec::new();
     }
+    let segments = data.len().div_ceil(CHUNK_SEGMENT_SIZE);
+    if segments <= 1 {
+        return chunk_segment(data, 0);
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(segments);
+    if workers <= 1 {
+        return (0..segments)
+            .flat_map(|s| chunk_segment(data, s * CHUNK_SEGMENT_SIZE))
+            .collect();
+    }
+    let per_worker = segments.div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let first = w * per_worker;
+                let last = ((w + 1) * per_worker).min(segments);
+                scope.spawn(move || {
+                    (first..last)
+                        .flat_map(|s| chunk_segment(data, s * CHUNK_SEGMENT_SIZE))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut out = Vec::new();
+        for handle in handles {
+            out.extend(handle.join().expect("chunking worker panicked"));
+        }
+        out
+    })
+}
+
+/// Chunk one segment starting at `offset`, with file-absolute data slices.
+fn chunk_segment(data: &Bytes, offset: usize) -> Vec<Chunk> {
+    let end = (offset + CHUNK_SEGMENT_SIZE).min(data.len());
     fastcdc::v2020::FastCDC::new(
-        data,
+        &data[offset..end],
         MIN_CHUNK_SIZE as usize,
         AVG_CHUNK_SIZE as usize,
         MAX_CHUNK_SIZE as usize,
     )
     .map(|cut| {
-        let slice = data.slice(cut.offset..cut.offset + cut.length);
+        let start = offset + cut.offset;
+        let slice = data.slice(start..start + cut.length);
         Chunk {
             hash: ChunkHash::digest(&slice),
             data: slice,
@@ -786,6 +833,33 @@ mod tests {
             "1 MiB should produce several chunks, got {}",
             first.len()
         );
+    }
+
+    #[test]
+    fn multi_segment_chunking_covers_and_is_deterministic() {
+        // Spans several CHUNK_SEGMENT_SIZE segments, exercising the parallel
+        // path: chunks must stay in order, cover the input, and match a
+        // second run byte-for-byte (core count must not affect boundaries).
+        let data = test_data(CHUNK_SEGMENT_SIZE * 3 + 1234, 99);
+        let chunks = chunk_data(&data);
+        assert_eq!(chunks, chunk_data(&data));
+
+        let reassembled: Vec<u8> = chunks.iter().flat_map(|c| c.data.to_vec()).collect();
+        assert_eq!(reassembled, data.as_ref());
+
+        // Every segment seam forces a cut, so a chunk must end exactly on
+        // each interior segment boundary.
+        let mut offset = 0u64;
+        let ends: std::collections::BTreeSet<u64> = chunks
+            .iter()
+            .map(|c| {
+                offset += c.data.len() as u64;
+                offset
+            })
+            .collect();
+        for seam in 1..data.len().div_ceil(CHUNK_SEGMENT_SIZE) {
+            assert!(ends.contains(&((seam * CHUNK_SEGMENT_SIZE) as u64)));
+        }
     }
 
     #[test]
