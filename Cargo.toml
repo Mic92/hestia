@@ -45,6 +45,7 @@ axum = "0.8"
 fastcdc = "4"
 
 # Internal content addresses (chunk + pack hashes); faster than SHA-256
+aho-corasick = "1"
 blake3 = "1"
 
 # Stream combinators for NAR event/byte streams

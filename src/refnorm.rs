@@ -13,6 +13,7 @@
 //! position in the sorted, deduplicated set, so write and read derive
 //! identical indices from the same list.
 
+use aho_corasick::{AhoCorasick, MatchKind};
 use bytes::Bytes;
 
 use crate::manifest::{Rewrite, StorePath};
@@ -33,15 +34,16 @@ pub enum Error {
     OffsetOutOfRange { offset: usize, len: usize },
 }
 
-/// Sorted, deduplicated reference hashes for one path, plus a two-byte
-/// presence bitmap that gates the scan. The vector position is the
-/// [`Rewrite::ref_index`].
+/// Sorted, deduplicated reference hashes for one path, plus an
+/// Aho-Corasick automaton over them. The vector position is the
+/// [`Rewrite::ref_index`]; the automaton's pattern id equals that position,
+/// since patterns are added in the same sorted order.
 #[derive(Debug, Clone)]
 pub struct RefTable {
     hashes: Vec<[u8; HASH_LEN]>,
-    /// Set at `u16(hash[0], hash[1])` for every hash: an array lookup that
-    /// rejects almost every scan position before the binary search.
-    gate: Box<[bool; 65536]>,
+    /// `None` when there are no references: an empty automaton is pointless
+    /// and the scan is skipped entirely.
+    scanner: Option<AhoCorasick>,
 }
 
 impl RefTable {
@@ -59,22 +61,22 @@ impl RefTable {
         hashes.sort_unstable();
         hashes.dedup();
 
-        let mut gate = Box::new([false; 65536]);
-        for hash in &hashes {
-            gate[usize::from(u16::from_be_bytes([hash[0], hash[1]]))] = true;
-        }
+        let scanner = (!hashes.is_empty()).then(|| {
+            // LeftmostLongest matches the old left-to-right, longest-first
+            // scan; all patterns are the same length, so it also yields the
+            // non-overlapping runs restore expects. A SIMD prefilter makes
+            // this multi-GB/s over the sparse hits typical of file content.
+            AhoCorasick::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .build(&hashes)
+                .expect("aho-corasick build over fixed-length hashes")
+        });
 
-        Self { hashes, gate }
+        Self { hashes, scanner }
     }
 
     pub fn is_empty(&self) -> bool {
         self.hashes.is_empty()
-    }
-
-    fn match_at(&self, window: &[u8]) -> Option<usize> {
-        self.hashes
-            .binary_search_by(|hash| hash[..].cmp(window))
-            .ok()
     }
 
     /// Replace every reference-hash occurrence with the sentinel, returning
@@ -82,29 +84,21 @@ impl RefTable {
     /// index the file content, identical in normalized and original bytes
     /// (the sentinel is hash-length).
     pub fn normalize(&self, data: &[u8]) -> (Bytes, Vec<Rewrite>) {
-        if self.is_empty() || data.len() < HASH_LEN {
+        let Some(scanner) = &self.scanner else {
             return (Bytes::copy_from_slice(data), Vec::new());
-        }
+        };
         let mut out = Vec::with_capacity(data.len());
         let mut rewrites = Vec::new();
-        let mut i = 0;
         // Start of the unmatched run not yet copied into `out`.
         let mut last = 0;
-        while i + HASH_LEN <= data.len() {
-            if self.gate[usize::from(u16::from_be_bytes([data[i], data[i + 1]]))]
-                && let Some(index) = self.match_at(&data[i..i + HASH_LEN])
-            {
-                out.extend_from_slice(&data[last..i]);
-                rewrites.push(Rewrite {
-                    offset: out.len() as u64,
-                    ref_index: index as u32,
-                });
-                out.extend_from_slice(&SENTINEL);
-                i += HASH_LEN;
-                last = i;
-            } else {
-                i += 1;
-            }
+        for m in scanner.find_iter(data) {
+            out.extend_from_slice(&data[last..m.start()]);
+            rewrites.push(Rewrite {
+                offset: out.len() as u64,
+                ref_index: m.pattern().as_u32(),
+            });
+            out.extend_from_slice(&SENTINEL);
+            last = m.end();
         }
         out.extend_from_slice(&data[last..]);
         (Bytes::from(out), rewrites)
