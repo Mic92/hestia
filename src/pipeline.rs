@@ -16,6 +16,7 @@
 //!    SaveMutable handles write conflicts by re-merging.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -210,6 +211,11 @@ pub struct PipelineContext {
     /// Compressed bytes per pack ([`PACK_TARGET_SIZE`] in production; tests
     /// use small values to exercise pack splitting).
     pub pack_target_size: u64,
+    /// Runtime token has no writable cache scope (`check_run`, fork
+    /// `pull_request`); the write pipeline is skipped so a drain is a clean
+    /// no-op instead of failing at the first reservation. Set by a
+    /// background probe at startup ([`crate::serve`]).
+    pub read_only: Arc<AtomicBool>,
     /// Where committed manifests are published for the substituter.
     ///
     /// Read-your-writes: the cache service's lookups are eventually
@@ -280,6 +286,10 @@ impl PipelineContext {
         };
 
         if paths.is_empty() && accessed.is_empty() {
+            return Ok(stats);
+        }
+
+        if self.read_only.load(Ordering::Relaxed) {
             return Ok(stats);
         }
 

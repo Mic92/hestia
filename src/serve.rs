@@ -34,6 +34,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -546,6 +547,9 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         .unwrap_or_else(|| "local".to_string());
     let system = args.system.clone().unwrap_or_else(pipeline::current_system);
 
+    // Set by the write probe spawned once the listeners are bound (below).
+    let read_only = Arc::new(AtomicBool::new(false));
+
     let store_dir = store.store_dir().clone();
     let root_key = pipeline::root_key(&branch, &system);
     let pipeline = PipelineContext {
@@ -560,6 +564,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             .filter(|id| !id.is_empty()),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         pack_target_size: pipeline::PACK_TARGET_SIZE,
+        read_only: read_only.clone(),
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.
         publish: None,
     };
@@ -641,6 +646,31 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             load_published_manifest(&twirp, &http, &manifest_store).await;
         })
     };
+
+    // Detect a read-only token (check_run, fork pull_request) upfront so a
+    // job never chunks a whole closure only to fail at the first
+    // reservation. Spawned like the manifest load so a stalled cache API
+    // cannot delay readiness; it resolves long before the post-step drain.
+    // An unreachable cache is inconclusive: stay writable and let the real
+    // drain surface any genuine failure.
+    {
+        let twirp = twirp.clone();
+        let read_only = read_only.clone();
+        tokio::spawn(async move {
+            match twirp.probe_writable().await {
+                Ok(false) => {
+                    read_only.store(true, Ordering::Relaxed);
+                    eprintln!(
+                        "hestia serve: the runtime token is read-only (expected for check_run \
+                         and fork pull_request events); paths built this job will not be \
+                         cached, but reads from the cache still work"
+                    );
+                }
+                Ok(true) => {}
+                Err(err) => eprintln!("hestia serve: cache write probe inconclusive: {err}"),
+            }
+        });
+    }
 
     eprintln!(
         "hestia serve: hook socket {}, substituter http://{} (root key: {root_key})",
