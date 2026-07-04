@@ -3,6 +3,8 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use bytes::Bytes;
 
@@ -48,6 +50,7 @@ pub fn pipeline_context_with(
         run_id: Some("test-run".to_string()),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         pack_target_size: PACK_TARGET_SIZE,
+        read_only: Arc::new(AtomicBool::new(false)),
         publish: None,
     }
 }

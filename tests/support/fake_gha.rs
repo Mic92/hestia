@@ -87,6 +87,9 @@ struct Inner {
     twirp_calls_until_401: Option<u64>,
     /// `Some(n)`: n more CreateCacheEntry calls succeed, then quota errors.
     creates_until_quota: Option<u64>,
+    /// When set, every CreateCacheEntry is refused with a write-denied
+    /// response (models a read-only runtime token: check_run, fork PR).
+    deny_writes: bool,
     /// Number of upcoming blob GETs whose connection gets dropped mid-body.
     blob_read_failures: u64,
     /// While > 0, download lookups pretend the newest matching entry does
@@ -160,6 +163,13 @@ async fn twirp_create(State(state): State<AppState>, body: Bytes) -> Response {
         return twirp_error(StatusCode::BAD_REQUEST, "malformed", "bad json");
     };
     let mut inner = state.inner.lock().unwrap();
+    if inner.deny_writes {
+        return Json(json!({
+            "ok": false,
+            "message": "cache write denied: token has no writable scopes"
+        }))
+        .into_response();
+    }
     // Quota injection: reservations are what the real service rejects when
     // the repository cache is full.
     if let Some(remaining) = &mut inner.creates_until_quota {
@@ -613,6 +623,7 @@ impl FakeGha {
             blob_requests: Vec::new(),
             twirp_calls_until_401: None,
             creates_until_quota: None,
+            deny_writes: false,
             blob_read_failures: 0,
             stale_lookups_remaining: 0,
             stale_lookups_after: 0,
@@ -676,6 +687,12 @@ impl FakeGha {
     /// which lets GC tests simulate days passing.
     pub fn set_clock(&self, unix_seconds: u64) {
         self.inner.lock().unwrap().clock = unix_seconds;
+    }
+
+    /// Refuse every reservation with a write-denied response, modelling a
+    /// read-only runtime token (check_run, fork pull_request).
+    pub fn deny_writes(&self) {
+        self.inner.lock().unwrap().deny_writes = true;
     }
 
     /// Twirp client pointed at this fake.

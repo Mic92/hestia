@@ -75,6 +75,8 @@ pub struct CreateCacheEntryResponse {
 /// `CACHE_WRITE_DENIED_PREFIX` in @actions/toolkit.
 pub const CACHE_WRITE_DENIED_PREFIX: &str = "cache write denied:";
 
+const WRITE_PROBE_KEY: &str = "hestia-write-probe-v1";
+
 /// Finalize retries when the freshly uploaded entry is not yet visible.
 const FINALIZE_MAX_ATTEMPTS: u32 = 5;
 const FINALIZE_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -271,6 +273,18 @@ impl TwirpClient {
             }
             Ok(_) => Ok(Reservation::AlreadyExists),
             Err(err) if err.is_already_exists() => Ok(Reservation::AlreadyExists),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Whether the runtime token may write to the cache. Scopes are not
+    /// advertised, so the only way to know is to attempt a reservation. The
+    /// key is fixed so a writable token reserves it at most once (later
+    /// probes hit already_exists); it is never finalized and expires.
+    pub async fn probe_writable(&self) -> Result<bool, Error> {
+        match self.create_cache_entry(WRITE_PROBE_KEY).await {
+            Ok(_) => Ok(true),
+            Err(Error::WriteDenied { .. }) => Ok(false),
             Err(err) => Err(err),
         }
     }

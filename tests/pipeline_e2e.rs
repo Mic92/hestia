@@ -8,6 +8,8 @@ mod support;
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use hestia::manifest::PathHash;
 use hestia::pathinfo::StoreDatabase;
@@ -554,4 +556,55 @@ async fn small_pack_target_splits_a_drain_into_multiple_packs() {
         .expect("manifest committed");
     assert_eq!(manifest.packs.len(), stats.packs_uploaded);
     assert_all_chunks_locatable(&manifest);
+}
+
+/// A read-only runtime token skips the write pipeline entirely: nothing is
+/// reserved, nothing is uploaded, and no manifest is committed. The drain
+/// still succeeds so the post-step never marks the job failed.
+#[tokio::test]
+async fn read_only_token_skips_the_write_pipeline() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let fixture = store.add_fixture("read-only", 3);
+
+    let fake = FakeGha::start().await;
+    fake.deny_writes();
+    let http = reqwest::Client::new();
+    let ctx = PipelineContext {
+        read_only: Arc::new(AtomicBool::new(true)),
+        ..context(&fake, &http, store.database())
+    };
+
+    let stats = ctx
+        .run(to_path_set(&[&fixture]), BTreeSet::new(), now_unix())
+        .await
+        .expect("read-only drain must succeed");
+
+    assert_eq!(stats.paths_received, 1);
+    assert_eq!(stats.pushed, 0);
+    assert_eq!(stats.packs_uploaded, 0);
+    assert_eq!(stats.manifest_version, 0);
+    assert_eq!(pack_count(&fake, &http).await, 0);
+    assert!(committed_manifest(&fake, &http).await.is_none());
+}
+
+/// The startup probe reports a read-only token against a backend that
+/// denies writes, and a writable one otherwise.
+#[tokio::test]
+async fn write_probe_detects_a_read_only_token() {
+    let http = reqwest::Client::new();
+
+    let writable = FakeGha::start().await;
+    assert!(
+        writable.twirp(&http).probe_writable().await.unwrap(),
+        "a normal backend must probe as writable"
+    );
+
+    let read_only = FakeGha::start().await;
+    read_only.deny_writes();
+    assert!(
+        !read_only.twirp(&http).probe_writable().await.unwrap(),
+        "a write-denying backend must probe as read-only"
+    );
 }
