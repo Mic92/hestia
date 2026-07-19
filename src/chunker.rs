@@ -29,6 +29,27 @@ pub const MIN_CHUNK_SIZE: u32 = 16 * 1024;
 pub const AVG_CHUNK_SIZE: u32 = 64 * 1024;
 pub const MAX_CHUNK_SIZE: u32 = 256 * 1024;
 
+/// FastCDC min/avg/max boundaries as a value, so experiments (e.g.
+/// `examples/chunk_sweep.rs`) can chunk with non-default parameters.
+/// Production code uses [`ChunkParams::default`], which equals the pinned
+/// constants above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkParams {
+    pub min: u32,
+    pub avg: u32,
+    pub max: u32,
+}
+
+impl Default for ChunkParams {
+    fn default() -> Self {
+        Self {
+            min: MIN_CHUNK_SIZE,
+            avg: AVG_CHUNK_SIZE,
+            max: MAX_CHUNK_SIZE,
+        }
+    }
+}
+
 /// zstd level for individual chunk compression inside packs.
 ///
 /// Level 3 (zstd default): pack uploads happen on CI time, so favor speed;
@@ -95,12 +116,17 @@ const CHUNK_SEGMENT_SIZE: usize = 16 * 1024 * 1024;
 /// closure's bytes concentrate -- is not stuck on one core (inter-path
 /// concurrency cannot split a single file).
 pub fn chunk_data(data: &Bytes) -> Vec<Chunk> {
+    chunk_data_with(data, ChunkParams::default())
+}
+
+/// [`chunk_data`] with explicit FastCDC parameters (experiments only).
+pub fn chunk_data_with(data: &Bytes, params: ChunkParams) -> Vec<Chunk> {
     if data.is_empty() {
         return Vec::new();
     }
     let segments = data.len().div_ceil(CHUNK_SEGMENT_SIZE);
     if segments <= 1 {
-        return chunk_segment(data, 0);
+        return chunk_segment(data, 0, params);
     }
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -108,7 +134,7 @@ pub fn chunk_data(data: &Bytes) -> Vec<Chunk> {
         .min(segments);
     if workers <= 1 {
         return (0..segments)
-            .flat_map(|s| chunk_segment(data, s * CHUNK_SEGMENT_SIZE))
+            .flat_map(|s| chunk_segment(data, s * CHUNK_SEGMENT_SIZE, params))
             .collect();
     }
     let per_worker = segments.div_ceil(workers);
@@ -119,7 +145,7 @@ pub fn chunk_data(data: &Bytes) -> Vec<Chunk> {
                 let last = ((w + 1) * per_worker).min(segments);
                 scope.spawn(move || {
                     (first..last)
-                        .flat_map(|s| chunk_segment(data, s * CHUNK_SEGMENT_SIZE))
+                        .flat_map(|s| chunk_segment(data, s * CHUNK_SEGMENT_SIZE, params))
                         .collect::<Vec<_>>()
                 })
             })
@@ -133,13 +159,13 @@ pub fn chunk_data(data: &Bytes) -> Vec<Chunk> {
 }
 
 /// Chunk one segment starting at `offset`, with file-absolute data slices.
-fn chunk_segment(data: &Bytes, offset: usize) -> Vec<Chunk> {
+fn chunk_segment(data: &Bytes, offset: usize, params: ChunkParams) -> Vec<Chunk> {
     let end = (offset + CHUNK_SEGMENT_SIZE).min(data.len());
     fastcdc::v2020::FastCDC::new(
         &data[offset..end],
-        MIN_CHUNK_SIZE as usize,
-        AVG_CHUNK_SIZE as usize,
-        MAX_CHUNK_SIZE as usize,
+        params.min as usize,
+        params.avg as usize,
+        params.max as usize,
     )
     .map(|cut| {
         let start = offset + cut.offset;
@@ -472,6 +498,15 @@ fn name_to_string(name: &[u8], what: &str) -> Result<String, Error> {
 /// chunks in pack order. Identical chunks appearing in multiple files are
 /// returned once.
 pub async fn chunk_path(path: impl Into<PathBuf>, refs: &RefTable) -> Result<ChunkedPath, Error> {
+    chunk_path_with(path, refs, ChunkParams::default()).await
+}
+
+/// [`chunk_path`] with explicit FastCDC parameters (experiments only).
+pub async fn chunk_path_with(
+    path: impl Into<PathBuf>,
+    refs: &RefTable,
+    params: ChunkParams,
+) -> Result<ChunkedPath, Error> {
     let mut events = harmonia_file_nar::dump(path.into());
     let mut builder = TreeBuilder::new();
     let mut chunks: Vec<Chunk> = Vec::new();
@@ -501,7 +536,7 @@ pub async fn chunk_path(path: impl Into<PathBuf>, refs: &RefTable) -> Result<Chu
             } => {
                 let data = reader.into_bytes();
                 let (normalized, rewrites) = refs.normalize(&data);
-                let file_chunks = chunk_data(&normalized);
+                let file_chunks = chunk_data_with(&normalized, params);
                 let list = ChunkList {
                     chunks: file_chunks.iter().map(|chunk| chunk.hash).collect(),
                     rewrites,
