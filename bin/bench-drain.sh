@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Benchmark a real hestia drain against the local mock cache.
+# Benchmark a real hestia drain and closure export against the local mock
+# cache.
 #
 # Starts mock-cache, points a hestia daemon at it, registers the given store
-# paths (and their closures) via the post-build hook, then times the drain.
+# paths (and their closures) via the post-build hook, times the drain, then
+# times downloading the same closure back out through GET /closure/<hash>
+# (the prefetch endpoint build jobs use).
 #
 # Usage:
 #   bin/bench-drain.sh [--perf] <store-path> [store-path ...]
@@ -90,6 +93,14 @@ end=$(date +%s.%N)
 blob_bytes=$(du -sb "$work/blobs" | cut -f1)
 printf 'drain wall time: %.2fs, uploaded %s bytes\n' \
 	"$(echo "$end - $start" | bc)" "$blob_bytes"
+
+# 5. Closure export (prefetch) of the same roots, one request.
+hashes=$(for path in "$@"; do basename "$path" | cut -c1-32; done | paste -sd,)
+start=$(date +%s.%N)
+export_bytes=$(curl -fsS "http://127.0.0.1:8100/closure/$hashes" | wc -c)
+end=$(date +%s.%N)
+printf 'closure export wall time: %.2fs, %s bytes\n' \
+	"$(echo "$end - $start" | bc)" "$export_bytes"
 
 if [ "$perf" -eq 1 ]; then
 	# Graceful shutdown lets perf finalize perf.data.
