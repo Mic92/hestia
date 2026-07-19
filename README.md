@@ -225,6 +225,53 @@ Running the `hestia` binary yourself instead of using the action? See the
 [CLI reference](docs/cli.md). How it all works under the hood:
 [architecture](docs/architecture.md).
 
+## Eval once, build by drv path
+
+With `nix-eval-jobs` you can evaluate once and fan the results out into a
+matrix of build jobs that build the `.drv` paths directly, skipping a
+second evaluation. Derivations written during evaluation never trigger the
+post-build-hook, so the eval job has to register them explicitly with
+`hestia hook` (the action exports `HESTIA_BIN` and `HESTIA_SOCKET` for
+this):
+
+```yaml
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    outputs:
+      jobs: ${{ steps.eval.outputs.jobs }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@main
+      - uses: Mic92/hestia@v1
+      - id: eval
+        run: |
+          nix run nixpkgs#nix-eval-jobs -- --flake .#hydraJobs > jobs.json
+          jq -r '.drvPath' jobs.json | xargs "$HESTIA_BIN" hook --socket "$HESTIA_SOCKET"
+          echo "jobs=$(jq -sc . jobs.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: eval
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        job: ${{ fromJSON(needs.eval.outputs.jobs) }}
+    steps:
+      - uses: NixOS/nix-installer-action@main
+      - uses: Mic92/hestia@v1
+      - run: nix build "${{ matrix.job.drvPath }}^*"
+```
+
+The drain at the end of the eval job uploads the drvs together with their
+input closure (input drvs and sources), so the build jobs substitute them
+from the cache. Notes:
+
+* Dependency *outputs* are not part of a drv's closure; they come from the
+  normal cache flow (earlier builds or upstream substituters).
+* Input sources (fetched tarballs, patched srcs) are uploaded too and count
+  against the cache quota. `upstream-cache-filter` does not skip them,
+  because sources carry no upstream signature.
+
 ## Security
 
 ### Why `?trusted=true` is safe here
