@@ -496,15 +496,19 @@ impl ChunkFetcher {
         }
         // One line per pack fetch (= per burst of GHA cache traffic): shows
         // whether chunks coalesce into few large Range reads or degrade
-        // into many small ones.
-        eprintln!(
-            "hestia substituter: pack {}: {chunk_count} chunks requested, {} extracted \
-             in {range_count} range reads ({}, {:.1}s)",
-            pack_cache_key(&pack),
-            fetched.len(),
-            crate::drain::human_bytes(range_bytes),
-            started.elapsed().as_secs_f64(),
-        );
+        // into many small ones. A busy job produces hundreds of these, so
+        // they only appear when the workflow is re-run with debug logging
+        // (RUNNER_DEBUG=1).
+        if std::env::var_os("RUNNER_DEBUG").is_some_and(|value| value == "1") {
+            eprintln!(
+                "hestia substituter: pack {}: {chunk_count} chunks requested, {} extracted \
+                 in {range_count} range reads ({}, {:.1}s)",
+                pack_cache_key(&pack),
+                fetched.len(),
+                crate::drain::human_bytes(range_bytes),
+                started.elapsed().as_secs_f64(),
+            );
+        }
         Ok(fetched)
     }
 }
