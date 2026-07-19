@@ -41,8 +41,11 @@ pub enum Error {
 #[derive(Debug, Clone)]
 pub struct RefTable {
     hashes: Vec<[u8; HASH_LEN]>,
-    /// `None` with no references; the scan is then skipped entirely.
-    scanner: Option<AhoCorasick>,
+    /// Aho-Corasick automaton over the hashes, built on first `normalize`:
+    /// only the write side scans, and the read side (`restore`) builds a
+    /// RefTable per served path, so paying the build cost there would be
+    /// pure waste.
+    scanner: std::sync::OnceLock<AhoCorasick>,
 }
 
 impl RefTable {
@@ -60,17 +63,10 @@ impl RefTable {
         hashes.sort_unstable();
         hashes.dedup();
 
-        let scanner = (!hashes.is_empty()).then(|| {
-            // All patterns are hash-length, so LeftmostLongest yields the
-            // non-overlapping matches restore expects; its SIMD prefilter
-            // skips the long non-matching runs of file content.
-            AhoCorasick::builder()
-                .match_kind(MatchKind::LeftmostLongest)
-                .build(&hashes)
-                .expect("aho-corasick build over fixed-length hashes")
-        });
-
-        Self { hashes, scanner }
+        Self {
+            hashes,
+            scanner: std::sync::OnceLock::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -82,9 +78,18 @@ impl RefTable {
     /// index the file content, identical in normalized and original bytes
     /// (the sentinel is hash-length).
     pub fn normalize(&self, data: &[u8]) -> (Bytes, Vec<Rewrite>) {
-        let Some(scanner) = &self.scanner else {
+        if self.hashes.is_empty() {
             return (Bytes::copy_from_slice(data), Vec::new());
-        };
+        }
+        let scanner = self.scanner.get_or_init(|| {
+            // All patterns are hash-length, so LeftmostLongest yields the
+            // non-overlapping matches restore expects; its SIMD prefilter
+            // skips the long non-matching runs of file content.
+            AhoCorasick::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .build(&self.hashes)
+                .expect("aho-corasick build over fixed-length hashes")
+        });
         let mut out = Vec::with_capacity(data.len());
         let mut rewrites = Vec::new();
         // Start of the unmatched run not yet copied into `out`.
