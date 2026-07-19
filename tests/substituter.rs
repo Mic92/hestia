@@ -421,6 +421,73 @@ async fn nar_round_trips_with_matching_hash() {
 }
 
 #[tokio::test]
+async fn closure_export_imports_into_a_fresh_store() {
+    timed(async {
+        // The prefetch endpoint: one request streams the whole closure in
+        // `nix-store --export` format; `nix-store --import` is the format
+        // oracle.
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let (top, dep) = store.add_paths_with_reference("closure-export");
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        push_paths(&fake, &http, &store, &[&top, &dep]).await;
+        let substituter = RunningSubstituter::start(&fake, &http, &store).await;
+
+        let response = substituter
+            .get(&http, &format!("closure/{}", path_hash_str(&top)))
+            .await;
+        assert_eq!(response.status(), 200);
+        let body = response.bytes().await.expect("reading export stream");
+
+        let destination = store.create_destination();
+        let mut import = tokio::process::Command::new("nix-store")
+            .args([
+                "--store",
+                &destination.uri,
+                "--option",
+                "require-sigs",
+                "false",
+                "--import",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning nix-store --import failed");
+        {
+            use tokio::io::AsyncWriteExt as _;
+            let mut stdin = import.stdin.take().unwrap();
+            stdin.write_all(&body).await.unwrap();
+        }
+        let output = import.wait_with_output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "nix-store --import failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // The whole closure landed: top plus its reference.
+        assert_trees_equal(&top, &destination.physical_path(&top));
+        assert_trees_equal(&dep, &destination.physical_path(&dep));
+
+        // Prefetched paths count as accessed (GC liveness).
+        let accessed = substituter.access_log.snapshot();
+        assert!(accessed.contains(&path_hash_of(&top)));
+        assert!(accessed.contains(&path_hash_of(&dep)));
+
+        // Unknown roots are a 404, not a partial stream.
+        let miss = substituter
+            .get(&http, "closure/00000000000000000000000000000000")
+            .await;
+        assert_eq!(miss.status(), 404);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn nix_copy_substitutes_into_fresh_store() {
     timed(async {
         // The key end-to-end test: nix itself copies a closure out of
