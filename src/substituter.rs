@@ -42,9 +42,7 @@ use harmonia_store_nar_info::{build_narinfo, format_narinfo_txt};
 use harmonia_store_path::StoreDir;
 use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
 
-use crate::chunker::{
-    self, coalesce_adjacent, extract_chunk, flatten_tree, nar_from_chunks, pack_cache_key,
-};
+use crate::chunker::{self, extract_chunk, flatten_tree, nar_from_chunks, pack_cache_key};
 use crate::gha::twirp::{DownloadUrl, TwirpClient};
 use crate::gha::{Error as GhaError, blob};
 use crate::manifest::{
@@ -67,6 +65,19 @@ const PACK_URL_TTL: Duration = Duration::from_secs(10 * 60);
 /// Oldest chunks are dropped first.
 const CHUNK_CACHE_BUDGET: usize = 256 * 1024 * 1024;
 
+/// Chunks of one pack whose gap is at most this are fetched in one Range
+/// read: dedup and generational scatter punch small holes into otherwise
+/// contiguous chunk runs, and re-downloading the hole is far cheaper than
+/// another ~66 ms round trip.
+const PACK_FETCH_GAP_BYTES: u64 = 128 * 1024;
+
+/// Every Range read is extended to at least this many bytes (clamped to
+/// the last known chunk of the pack) and all chunks inside the region go into the
+/// chunk cache. Packs are written in drain order, so the neighbours of a
+/// requested chunk are what nix asks for next; read-ahead turns thousands
+/// of per-path round trips into a few large reads.
+const PACK_READ_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Maximum number of pack reads in flight across all NAR requests. A pack
 /// read is the unit of GHA cache API traffic (one Twirp URL lookup plus
 /// Azure Range requests), so this bounds the total API concurrency no
@@ -78,6 +89,16 @@ const MAX_CONCURRENT_PACK_FETCHES: usize = 8;
 /// and returns 404.
 const TRANSIENT_READ_RETRIES: u32 = 2;
 
+/// One pack's chunk locations sorted by offset. Lets the fetcher answer
+/// "which chunks live in this byte range" (read-ahead) with a range scan;
+/// the manifest itself only indexes chunks by hash.
+struct PackChunkIndex {
+    /// End of the last known chunk; reads are never extended past it.
+    end: u64,
+    /// (offset, compressed size, hash), sorted by offset.
+    chunks: Vec<(u64, u32, ChunkHash)>,
+}
+
 /// One manifest version plus the indexes the substituter needs.
 #[derive(Default)]
 struct ManifestView {
@@ -85,6 +106,8 @@ struct ManifestView {
     /// NAR hash → manifest path key, for `/nar/{narhash}.nar` requests that
     /// arrive without the `?hash=` parameter.
     by_nar_hash: BTreeMap<Hash32, PathHash>,
+    /// Per-pack chunk layout, for read-ahead.
+    pack_index: HashMap<PackHash, Arc<PackChunkIndex>>,
     /// SaveMutable index this manifest was loaded from / committed as
     /// (0 = unknown or no manifest yet).
     version: u64,
@@ -97,9 +120,28 @@ impl ManifestView {
             .iter()
             .map(|(path_hash, entry)| (entry.nar_hash, *path_hash))
             .collect();
+        let mut by_pack: HashMap<PackHash, Vec<(u64, u32, ChunkHash)>> = HashMap::new();
+        for (hash, location) in &manifest.chunks {
+            by_pack.entry(location.pack).or_default().push((
+                location.offset,
+                location.compressed_size,
+                *hash,
+            ));
+        }
+        let pack_index = by_pack
+            .into_iter()
+            .map(|(pack, mut chunks)| {
+                chunks.sort_unstable_by_key(|(offset, ..)| *offset);
+                let end = chunks
+                    .last()
+                    .map_or(0, |(offset, size, _)| offset + u64::from(*size));
+                (pack, Arc::new(PackChunkIndex { end, chunks }))
+            })
+            .collect();
         Self {
             manifest,
             by_nar_hash,
+            pack_index,
             version,
         }
     }
@@ -325,7 +367,7 @@ impl ChunkFetcher {
     /// Fetch all chunks of `entry`, using cached chunks where possible.
     async fn fetch_path_chunks(
         &self,
-        manifest: &Manifest,
+        view: &ManifestView,
         path: PathHash,
         entry: &PathEntry,
     ) -> Result<BTreeMap<ChunkHash, Bytes>, FetchError> {
@@ -333,17 +375,18 @@ impl ChunkFetcher {
         // path do the work once.
         let lock = self.path_lock(path);
         let _guard = lock.lock().await;
-        self.fetch_chunks(manifest, entry_chunks(entry)).await
+        self.fetch_chunks(view, entry_chunks(entry)).await
     }
 
     /// Fetch a set of chunks, using cached chunks where possible.
     ///
-    /// Missing chunks are grouped by pack; adjacent chunks within a pack are
-    /// coalesced into single Range requests; packs are fetched in parallel.
-    /// Every chunk is hash-verified during extraction.
+    /// Missing chunks are grouped by pack; nearby chunks within a pack are
+    /// coalesced into single Range requests (with read-ahead, see
+    /// [`PACK_READ_AHEAD_BYTES`]); packs are fetched in parallel. Every
+    /// chunk is hash-verified during extraction.
     async fn fetch_chunks(
         &self,
-        manifest: &Manifest,
+        view: &ManifestView,
         needed: BTreeSet<ChunkHash>,
     ) -> Result<BTreeMap<ChunkHash, Bytes>, FetchError> {
         let mut result: BTreeMap<ChunkHash, Bytes> = BTreeMap::new();
@@ -355,7 +398,8 @@ impl ChunkFetcher {
                     result.insert(chunk, data);
                     continue;
                 }
-                let location = manifest
+                let location = view
+                    .manifest
                     .chunks
                     .get(&chunk)
                     .ok_or(FetchError::UnknownChunk(chunk))?;
@@ -369,13 +413,19 @@ impl ChunkFetcher {
         // Fetch packs in parallel; each fetch holds one global permit
         // while it talks to the GHA cache API. The semaphore is never
         // closed, so acquire only fails after close.
-        let fetches = missing.into_iter().map(|(pack, chunks)| async move {
-            let _permit = self
-                .fetch_semaphore
-                .acquire()
-                .await
-                .expect("fetch semaphore closed");
-            self.fetch_from_pack(pack, chunks).await
+        let fetches = missing.into_iter().map(|(pack, chunks)| {
+            // Present by construction: the index covers every pack the
+            // manifest's chunk table mentions, and the locations above came
+            // from that table.
+            let index = Arc::clone(&view.pack_index[&pack]);
+            async move {
+                let _permit = self
+                    .fetch_semaphore
+                    .acquire()
+                    .await
+                    .expect("fetch semaphore closed");
+                self.fetch_from_pack(pack, chunks, index).await
+            }
         });
         for fetched in futures_util::future::try_join_all(fetches).await? {
             let mut cache = self.chunk_cache.lock().expect("chunk cache poisoned");
@@ -389,43 +439,50 @@ impl ChunkFetcher {
     }
 
     /// Fetch a set of chunks from one pack with as few Range requests as
-    /// possible (adjacent chunks share a request).
+    /// possible (gap coalescing plus read-ahead, see [`plan_pack_reads`]).
+    ///
+    /// Returns the requested chunks plus every other manifest chunk that
+    /// happened to fall inside the fetched regions (read-ahead); the caller
+    /// caches all of them.
     async fn fetch_from_pack(
         &self,
         pack: PackHash,
         mut chunks: Vec<(ChunkHash, ChunkLocation)>,
+        index: Arc<PackChunkIndex>,
     ) -> Result<Vec<(ChunkHash, Bytes)>, FetchError> {
         chunks.sort_by_key(|(_, location)| location.offset);
         let chunk_count = chunks.len();
-
-        // Coalesce adjacent chunks into runs.
-        let runs = coalesce_adjacent(chunks, |(_, location)| {
-            (location.offset, location.compressed_size)
-        });
+        let spans: Vec<(u64, u32)> = chunks
+            .iter()
+            .map(|(_, location)| (location.offset, location.compressed_size))
+            .collect();
+        let ranges = plan_pack_reads(&spans, index.end);
 
         let started = Instant::now();
-        let range_count = runs.len();
+        let range_count = ranges.len();
         let mut range_bytes = 0u64;
         let mut fetched = Vec::new();
-        for run in runs {
-            let start = run[0].1.offset;
-            let last = &run[run.len() - 1].1;
-            let end = last.offset + u64::from(last.compressed_size);
-            range_bytes += end - start;
-            let data = self.read_pack_range(pack, start..end).await?;
+        for range in ranges {
+            let start = range.start;
+            range_bytes += range.end - range.start;
+            // Everything inside the fetched region gets extracted and
+            // cached: the requested chunks by construction, plus their
+            // neighbours pulled in by read-ahead.
+            let in_range: Vec<(u64, u32, ChunkHash)> = chunks_in_range(&index, &range).collect();
+            let data = self.read_pack_range(pack, range).await?;
 
             // Decompression + hash verification are CPU-bound: off the
             // runtime workers, like the write pipeline's compression
             // stages, so concurrent fetches cannot starve the hook socket.
             let extracted = tokio::task::spawn_blocking(move || {
-                let mut extracted = Vec::with_capacity(run.len());
-                for (hash, location) in run {
-                    let from = (location.offset - start) as usize;
-                    let to = from + location.compressed_size as usize;
+                let mut extracted = Vec::with_capacity(in_range.len());
+                for (offset, size, hash) in in_range {
+                    let from = (offset - start) as usize;
+                    let to = from + size as usize;
                     // In bounds by construction: blob::get errors unless
-                    // the ranged response is exactly end - start bytes,
-                    // and coalesce_adjacent only groups chunks that tile
-                    // [start, end) contiguously. extract_chunk verifies
+                    // the ranged response is exactly range.end - range.start
+                    // bytes, and plan_pack_reads/chunks_in_range only select
+                    // chunks fully inside the range. extract_chunk verifies
                     // the SHA-256 of the decompressed data; corrupt or
                     // truncated cache contents cannot pass.
                     let chunk = extract_chunk(&data[from..to], &hash)?;
@@ -441,14 +498,64 @@ impl ChunkFetcher {
         // whether chunks coalesce into few large Range reads or degrade
         // into many small ones.
         eprintln!(
-            "hestia substituter: pack {}: {chunk_count} chunks in {range_count} range reads \
-             ({}, {:.1}s)",
+            "hestia substituter: pack {}: {chunk_count} chunks requested, {} extracted \
+             in {range_count} range reads ({}, {:.1}s)",
             pack_cache_key(&pack),
+            fetched.len(),
             crate::drain::human_bytes(range_bytes),
             started.elapsed().as_secs_f64(),
         );
         Ok(fetched)
     }
+}
+
+/// Plan the Range reads for one pack: coalesce chunk spans whose gap is at
+/// most [`PACK_FETCH_GAP_BYTES`], extend each read to at least
+/// [`PACK_READ_AHEAD_BYTES`] (clamped to `pack_end`), and merge reads that
+/// the extension made overlap. `spans` are `(offset, size)`, sorted by
+/// offset.
+fn plan_pack_reads(spans: &[(u64, u32)], pack_end: u64) -> Vec<std::ops::Range<u64>> {
+    let mut runs: Vec<std::ops::Range<u64>> = Vec::new();
+    for &(offset, size) in spans {
+        // Checked: offsets come from the manifest; a corrupt value near
+        // u64::MAX must not panic.
+        let end = offset.saturating_add(u64::from(size));
+        match runs.last_mut() {
+            Some(run) if offset <= run.end.saturating_add(PACK_FETCH_GAP_BYTES) => {
+                run.end = run.end.max(end);
+            }
+            _ => runs.push(offset..end),
+        }
+    }
+    let mut reads: Vec<std::ops::Range<u64>> = Vec::new();
+    for run in runs {
+        let read_ahead = run
+            .start
+            .saturating_add(PACK_READ_AHEAD_BYTES)
+            .min(pack_end);
+        let end = run.end.max(read_ahead);
+        match reads.last_mut() {
+            Some(read) if run.start <= read.end => read.end = read.end.max(end),
+            _ => reads.push(run.start..end),
+        }
+    }
+    reads
+}
+
+/// All chunks of a pack that lie fully inside `range`, as
+/// `(offset, size, hash)`.
+fn chunks_in_range<'a>(
+    index: &'a PackChunkIndex,
+    range: &'a std::ops::Range<u64>,
+) -> impl Iterator<Item = (u64, u32, ChunkHash)> + 'a {
+    let start = index
+        .chunks
+        .partition_point(|(offset, ..)| *offset < range.start);
+    index.chunks[start..]
+        .iter()
+        .take_while(move |(offset, ..)| *offset < range.end)
+        .filter(move |(offset, size, _)| offset + u64::from(*size) <= range.end)
+        .copied()
 }
 
 /// Reloads the served manifest from the cache backend (the daemon wires
@@ -684,7 +791,7 @@ async fn nar(
     let chunks = loop {
         match state
             .fetcher
-            .fetch_path_chunks(&manifest_view.manifest, path_hash, &entry)
+            .fetch_path_chunks(&manifest_view, path_hash, &entry)
             .await
         {
             Ok(chunks) => break chunks,
@@ -1083,6 +1190,50 @@ mod tests {
                 vec![order[2]],
                 vec![order[3], order[4]],
             ]
+        );
+    }
+
+    #[test]
+    fn plan_pack_reads_coalesces_gaps_and_reads_ahead() {
+        let gap = PACK_FETCH_GAP_BYTES;
+        let ahead = PACK_READ_AHEAD_BYTES;
+        let pack_size = 100 * ahead;
+
+        // Small gap merges, big gap splits.
+        let spans = [(0, 100), (gap + 100, 100), (10 * ahead, 100)];
+        let reads = plan_pack_reads(&spans, pack_size);
+        assert_eq!(reads, vec![0..ahead, 10 * ahead..11 * ahead]);
+
+        // Read-ahead never runs past the pack end...
+        let reads = plan_pack_reads(&[(pack_size - 50, 50)], pack_size);
+        assert_eq!(reads, vec![pack_size - 50..pack_size]);
+
+        // ...and never truncates a run that is already larger.
+        let reads = plan_pack_reads(&[(0, u32::MAX)], 100);
+        assert_eq!(reads, vec![0..u64::from(u32::MAX)]);
+
+        // Runs that only overlap after extension merge into one read.
+        let reads = plan_pack_reads(&[(0, 100), (2 * gap, 100)], pack_size);
+        assert_eq!(reads, vec![0..2 * gap + ahead]);
+    }
+
+    #[test]
+    fn chunks_in_range_selects_only_fully_contained_chunks() {
+        let index = PackChunkIndex {
+            end: 1000,
+            chunks: vec![
+                (0, 100, ChunkHash::digest([0])),
+                (100, 100, ChunkHash::digest([1])),
+                (300, 100, ChunkHash::digest([2])),
+                (350, 100, ChunkHash::digest([3])), // straddles range end
+            ],
+        };
+        let selected: Vec<ChunkHash> = chunks_in_range(&index, &(100..400))
+            .map(|(.., hash)| hash)
+            .collect();
+        assert_eq!(
+            selected,
+            vec![ChunkHash::digest([1]), ChunkHash::digest([2])]
         );
     }
 
