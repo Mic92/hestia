@@ -629,9 +629,11 @@ const ZSTD_LEVEL: i32 = 9;
 /// bomb stored as the next manifest version would abort every serve,
 /// drain, and GC inside the allocator -- before the corrupt-manifest
 /// fallback (`decode_manifest_or_empty`) can trigger. Production manifest
-/// CBOR is single-digit megabytes, so 64 MiB is ample headroom while an
-/// over-long stream surfaces as a normal decode error.
-const MAX_MANIFEST_CBOR_BYTES: u64 = 64 * 1024 * 1024;
+/// CBOR is single-digit megabytes, so 256 MiB is ample headroom while an
+/// over-long stream surfaces as a normal decode error. (A 28 GiB NAR /
+/// 4.4k-path workload measured ~70 MiB of manifest CBOR, so the previous
+/// 64 MiB bound was too tight for large caches.)
+const MAX_MANIFEST_CBOR_BYTES: u64 = 256 * 1024 * 1024;
 
 impl Manifest {
     pub fn new() -> Self {
@@ -1130,7 +1132,7 @@ mod tests {
         // A small zstd stream of zeros decompressing far past any real
         // manifest must be rejected at the size bound, before the full
         // payload is buffered.
-        let bomb_payload = vec![0u8; 128 * 1024 * 1024];
+        let bomb_payload = vec![0u8; 512 * 1024 * 1024];
         let bomb = zstd::encode_all(bomb_payload.as_slice(), 3).unwrap();
         assert!(bomb.len() < 1024 * 1024, "bomb must be small on the wire");
         let result = Manifest::decode(&bomb);
