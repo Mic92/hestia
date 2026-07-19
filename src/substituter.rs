@@ -816,7 +816,7 @@ async fn nar(
         }
     };
 
-    let nar = match assemble_verified_nar(&entry, chunks).await {
+    let nar = match assemble_verified_nar(&entry, Arc::new(chunks)).await {
         Ok(nar) => nar,
         Err(err) => {
             eprintln!("hestia substituter: cannot serve NAR for {path_hash}: {err}");
@@ -851,7 +851,7 @@ fn entry_chunks(entry: &PathEntry) -> BTreeSet<ChunkHash> {
 /// starve the hook socket.
 async fn assemble_verified_nar(
     entry: &PathEntry,
-    chunks: BTreeMap<ChunkHash, Bytes>,
+    chunks: Arc<BTreeMap<ChunkHash, Bytes>>,
 ) -> Result<Vec<u8>, String> {
     let tree = entry.tree.clone();
     let nar_size = entry.nar_size;
@@ -998,21 +998,22 @@ async fn export_window(
         .iter()
         .flat_map(|(_, entry)| entry_chunks(entry))
         .collect();
-    let chunks = state
-        .fetcher
-        .fetch_chunks(&view.manifest, needed)
-        .await
-        .map_err(|err| {
-            eprintln!("hestia substituter: closure export chunk fetch failed: {err}");
-            err.to_string()
-        })?;
+    let chunks = Arc::new(
+        state
+            .fetcher
+            .fetch_chunks(view, needed)
+            .await
+            .map_err(|err| {
+                eprintln!("hestia substituter: closure export chunk fetch failed: {err}");
+                err.to_string()
+            })?,
+    );
 
     let mut out = Vec::new();
     for (path_hash, entry) in entries {
         // Prefetched paths are accesses (GC liveness), same as narinfo hits.
         state.access_log.record(path_hash);
-        // Bytes clones are refcounts; each path only reads its own subset.
-        let nar = assemble_verified_nar(entry, chunks.clone())
+        let nar = assemble_verified_nar(entry, Arc::clone(&chunks))
             .await
             .map_err(|err| {
                 eprintln!("hestia substituter: closure export failed at {path_hash}: {err}");
