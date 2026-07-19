@@ -13,7 +13,13 @@
   staticTarget ? null,
 }:
 let
-  src = craneLib.cleanCargoSource ../.;
+  # Cargo sources plus the nix fixtures the integration tests evaluate.
+  src = lib.cleanSourceWith {
+    src = ../.;
+    filter =
+      path: type: (lib.hasInfix "/tests/fixtures" path) || (craneLib.filterCargoSources path type);
+    name = "source";
+  };
 
   staticArgs = lib.optionalAttrs (staticTarget != null) (
     let
@@ -121,8 +127,11 @@ in
     // {
       inherit cargoArtifacts;
       # The integration tests drive real nix tooling (scratch stores,
-      # signing, nix copy) inside the sandbox.
-      nativeBuildInputs = [ pkgs.nix ];
+      # signing, nix copy, nix-eval-jobs) inside the sandbox.
+      nativeBuildInputs = [
+        pkgs.nix
+        pkgs.nix-eval-jobs
+      ];
       # nix needs a writable HOME.
       preBuild = ''
         export HOME="$(mktemp -d)"

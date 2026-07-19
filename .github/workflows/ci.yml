@@ -136,6 +136,92 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
+  # End-to-end test of the matrix subaction: evaluate the fixture flake
+  # once with nix-eval-jobs, register the drv closures, and hand the
+  # matrix to build jobs that build by drv path without re-evaluating.
+  matrix-eval:
+    runs-on: ubuntu-latest
+    # The build job pushes the package closure to the cache.
+    needs: build
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      matrix: ${{ steps.eval.outputs.matrix }}
+      any-jobs: ${{ steps.eval.outputs.any-jobs }}
+      manifest-version: ${{ steps.eval.outputs.manifest-version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: NixOS/nix-installer-action@main
+      # Dogfood substituter, so the nix build below substitutes instead of
+      # compiling (forks without the variables build from source).
+      - name: Start hestia cache (dogfood)
+        if: vars.HESTIA_DOGFOOD == 'true'
+        uses: ./
+      - name: Build hestia
+        run: nix build .# -o hestia-bin
+      # Instance under test on its own port/socket, started last: the
+      # HESTIA_* variables and the post-build-hook then point at it.
+      - uses: ./
+        with:
+          binary: ./hestia-bin/bin/hestia
+          listen: 127.0.0.1:37517
+          socket: /tmp/hestia-matrix/hook.sock
+      - name: Make the fixture derivations unique to this run
+        run: |
+          set -euo pipefail
+          # Fresh derivations every run, so the matrix is never fully cached
+          # and the build jobs below always exercise the drv-path round trip.
+          cp -r tests/fixtures/matrix-checks "$RUNNER_TEMP/matrix-checks"
+          sed -i "s/echo /echo ${{ github.run_id }}-${{ github.run_attempt }} /" \
+            "$RUNNER_TEMP/matrix-checks/flake.nix"
+      - id: eval
+        uses: ./matrix
+        with:
+          flake: path:${{ runner.temp }}/matrix-checks#checks
+          nix-eval-jobs: nix run nixpkgs#nix-eval-jobs --
+      - name: Assert the fixture jobs are in the matrix
+        run: |
+          set -euo pipefail
+          echo '${{ steps.eval.outputs.matrix }}' | jq .
+          test "${{ steps.eval.outputs.any-jobs }}" = "true"
+          names=$(echo '${{ steps.eval.outputs.matrix }}' | jq -r '.include[].name' | sort | paste -sd' ')
+          test "$names" = "small x86_64-linux.fast"
+
+  matrix-build:
+    needs: matrix-eval
+    if: needs.matrix-eval.outputs.any-jobs == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix-eval.outputs.matrix) }}
+    name: matrix-build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: NixOS/nix-installer-action@main
+      # Dogfood substituter, so the nix build below substitutes instead of
+      # compiling (forks without the variables build from source).
+      - name: Start hestia cache (dogfood)
+        if: vars.HESTIA_DOGFOOD == 'true'
+        uses: ./
+      - name: Build hestia
+        run: nix build .# -o hestia-bin
+      # Instance under test: it must serve the drv closures registered by
+      # the eval job, hence wait-manifest-version.
+      - uses: ./
+        with:
+          binary: ./hestia-bin/bin/hestia
+          listen: 127.0.0.1:37517
+          socket: /tmp/hestia-matrix/hook.sock
+          wait-manifest-version: ${{ needs.matrix-eval.outputs.manifest-version }}
+      # No checkout of the fixture flake and no evaluation: the drv closure
+      # comes out of the cache.
+      - name: Build by drv path
+        run: nix build -L ${{ matrix.installables }}
+
   # End-to-end test of the hestia-cache action on a real runner: install
   # (locally built binary), nix.conf wiring, daemon readiness, post-build-hook
   # capture, manifest commit, and substitution back out of the cache.

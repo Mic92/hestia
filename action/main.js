@@ -359,6 +359,10 @@ function serveFlags() {
   if (getInput('no-closure') === 'true') {
     flags.push('--no-closure');
   }
+  const waitManifestVersion = getInput('wait-manifest-version');
+  if (waitManifestVersion && waitManifestVersion !== '0') {
+    flags.push('--wait-manifest-version', waitManifestVersion);
+  }
   return flags;
 }
 

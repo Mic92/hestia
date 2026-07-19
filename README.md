@@ -15,6 +15,9 @@ How it differs from [magic-nix-cache]:
   `429 Too Many Requests`.
 - A scheduled garbage-collection workflow keeps your repository inside
   GitHub's 10 GB cache quota by deleting paths no branch uses anymore.
+- A [`matrix` subaction](#build-matrix-eval-once-build-in-parallel) spreads
+  your flake's checks over parallel runners: evaluate once, build each
+  check as its own job.
 
 [magic-nix-cache]: https://github.com/DeterminateSystems/magic-nix-cache
 
@@ -30,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
-      - uses: Mic92/hestia@v1
+      - uses: Mic92/hestia@v2
       - run: nix build .#
 ```
 
@@ -45,7 +48,9 @@ You will also want a daily GC workflow on the default branch to stay within
 the cache quota; copy [`.github/workflows/gc.yml`](.github/workflows/gc.yml)
 for that (its REST cache deletes are what need `actions: write`).
 
-See [Configuration](#configuration) for all action inputs.
+See [Configuration](#configuration) for all action inputs. For building
+each flake check as its own job, see the
+[`matrix` subaction](#build-matrix-eval-once-build-in-parallel).
 
 ## Comparison
 
@@ -126,9 +131,89 @@ All inputs are optional; the defaults work for the quick start above.
 The GC workflow takes one input: `dry-run` (plan only, delete nothing); see
 [`.github/workflows/gc.yml`](.github/workflows/gc.yml).
 
+The `matrix` subaction has its own inputs (`flake`, `nix-eval-jobs`,
+`runner-map`, `attr-prefix`, `skip-unmapped-systems`); see
+[`matrix/action.yml`](matrix/action.yml).
+
 Running the `hestia` binary yourself instead of using the action? See the
 [CLI reference](docs/cli.md). How it all works under the hood:
 [architecture](docs/architecture.md).
+
+## Build matrix (eval once, build in parallel)
+
+`Mic92/hestia/matrix` turns a flake's checks into a GitHub Actions build
+matrix: one runner per check, evaluated only once. The eval job runs
+`nix-eval-jobs`, uploads each check's `.drv` closure to the cache, and
+outputs the matrix of checks that are not cached yet. Each build job then
+fetches its derivation from the cache and builds it by store path — no
+per-job evaluation, no flake changes, and no job at all for checks whose
+results are already cached.
+
+```yaml
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      any-jobs: ${{ steps.matrix.outputs.any-jobs }}
+      manifest-version: ${{ steps.matrix.outputs.manifest-version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@main
+      - uses: Mic92/hestia@v2
+      - id: matrix
+        uses: Mic92/hestia/matrix@v2
+        with:
+          flake: ".#checks"                        # default
+          nix-eval-jobs: "nix run nixpkgs#nix-eval-jobs --"
+          # runner-map: |
+          #   x86_64-linux=ubuntu-24.04
+          #   aarch64-darwin=macos-14,self-hosted
+
+  build:
+    needs: eval
+    if: needs.eval.outputs.any-jobs == 'true'
+    name: ${{ matrix.name }} (${{ matrix.system }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.eval.outputs.matrix) }}
+    steps:
+      - uses: NixOS/nix-installer-action@main
+      - uses: Mic92/hestia@v2
+        with:
+          wait-manifest-version: ${{ needs.eval.outputs.manifest-version }}
+      - run: nix build -L ${{ matrix.installables }}
+```
+
+Jobs can steer the matrix from their `meta` attributes (read via
+`nix-eval-jobs --meta`, no flake plumbing needed):
+
+```nix
+checks.x86_64-linux.mycheck = pkgs.hello.overrideAttrs (old: {
+  meta = (old.meta or { }) // {
+    hestia.group = "small-checks";        # share one runner with the group
+    hestia.os = [ "self-hosted" "big" ];  # override the runner labels
+  };
+});
+```
+
+Notes:
+
+* Build jobs substitute the derivation and its inputs (drvs and sources)
+  from the cache. Dependency *outputs* are not part of that closure; they
+  come from the normal cache flow (earlier builds or upstream
+  substituters), so shared uncached dependencies are rebuilt by every
+  matrix job that needs them.
+* Input sources (fetched tarballs, patched srcs) count against the cache
+  quota. `upstream-cache-filter` does not skip them, because sources carry
+  no upstream signature.
+* Each matrix row also carries `attr`, so `nix build .#${{ matrix.attr }}`
+  works as a per-job-eval fallback.
+* GitHub limits a matrix to 256 jobs and a step output to 1 MB.
+
+Template repository with this workflow:
+[Mic92/hestia-drv-test](https://github.com/Mic92/hestia-drv-test).
 
 ## Security
 

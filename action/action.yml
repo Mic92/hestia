@@ -68,6 +68,14 @@ inputs:
       stay on upstream caches).
     required: false
     default: "false"
+  wait-manifest-version:
+    description: >
+      Wait up to 60s at daemon startup until the cache manifest has at least
+      this version. Matrix build jobs pass the eval job's `manifest-version`
+      output so the just-uploaded drv closures are visible despite GHA cache
+      lookup lag.
+    required: false
+    default: "0"
 
 # If both `binary` and `version` are explicitly empty, the action only
 # captures and exports the cache tokens (ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL).

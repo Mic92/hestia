@@ -19,6 +19,9 @@ pub struct Cli {
 pub enum Command {
     /// Run the per-job daemon: hook listener + substituter HTTP server.
     Serve(ServeArgs),
+    /// Evaluate a flake with nix-eval-jobs and emit a GitHub Actions build
+    /// matrix (drv closures registered for upload).
+    Matrix(MatrixArgs),
     /// Send $OUT_PATHS from a Nix post-build-hook to the daemon.
     Hook(HookArgs),
     /// Tell the daemon to upload pending paths and commit the manifest.
@@ -74,6 +77,45 @@ pub struct ServeArgs {
     /// Nix store database to read path metadata from.
     #[arg(long, default_value = crate::pathinfo::DEFAULT_DB_PATH)]
     pub db_path: PathBuf,
+
+    /// Wait up to 60s at startup until the loaded manifest's version is at
+    /// least this (0 = don't wait). Build jobs pass the version committed
+    /// by an eval job so its drv closures are visible despite GHA cache
+    /// lookup lag.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub wait_manifest_version: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct MatrixArgs {
+    /// Flake installable passed to nix-eval-jobs.
+    #[arg(long, default_value = ".#checks")]
+    pub flake: String,
+
+    /// nix-eval-jobs command, split on whitespace; extra arguments may be
+    /// appended (e.g. "nix run nixpkgs#nix-eval-jobs -- --workers 4").
+    #[arg(long, default_value = "nix-eval-jobs", value_name = "CMD")]
+    pub nix_eval_jobs: String,
+
+    /// Runner mapping override: <system>=<label>[,<label>...]. Repeatable.
+    #[arg(long = "runner", value_name = "SYSTEM=LABELS")]
+    pub runners: Vec<String>,
+
+    /// Skip jobs whose system has no runner mapping instead of failing.
+    #[arg(long)]
+    pub skip_unmapped_systems: bool,
+
+    /// Prefix prepended (dot-joined) to every attr in the matrix.
+    #[arg(long, default_value = "")]
+    pub attr_prefix: String,
+
+    /// Unix socket path of the running daemon.
+    #[arg(long, default_value = DEFAULT_SOCKET)]
+    pub socket: PathBuf,
+
+    /// Maximum time to wait for the drv upload to finish, in seconds.
+    #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+    pub drain_timeout: u64,
 }
 
 #[derive(Args, Debug)]

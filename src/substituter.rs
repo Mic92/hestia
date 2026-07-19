@@ -150,6 +150,11 @@ impl ManifestStore {
         Arc::clone(&self.inner.read().expect("manifest lock poisoned"))
     }
 
+    /// SaveMutable version of the served manifest (0 = none loaded yet).
+    pub fn version(&self) -> u64 {
+        self.view().version
+    }
+
     /// Number of paths currently servable.
     pub fn path_count(&self) -> usize {
         self.view().manifest.paths.len()
@@ -445,6 +450,11 @@ pub type ManifestReload =
 /// idle clock once at request start.
 pub type ActivityHook = Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>;
 
+/// Signals that the startup manifest load (including a
+/// `--wait-manifest-version` wait) has finished. Narinfo requests block on
+/// it so an early `nix build` cannot race the load and see spurious misses.
+pub type ManifestReady = tokio::sync::watch::Receiver<bool>;
+
 /// The substituter's shared state and configuration.
 pub struct Substituter {
     store_dir: StoreDir,
@@ -453,6 +463,7 @@ pub struct Substituter {
     fetcher: ChunkFetcher,
     activity_hook: Option<ActivityHook>,
     manifest_reload: Option<ManifestReload>,
+    manifest_ready: Option<ManifestReady>,
 }
 
 impl Substituter {
@@ -470,6 +481,7 @@ impl Substituter {
             fetcher: ChunkFetcher::new(twirp, http),
             activity_hook: None,
             manifest_reload: None,
+            manifest_ready: None,
         }
     }
 
@@ -483,6 +495,22 @@ impl Substituter {
     pub fn with_manifest_reload(mut self, reload: ManifestReload) -> Self {
         self.manifest_reload = Some(reload);
         self
+    }
+
+    /// Install a startup-load gate (see [`ManifestReady`]).
+    pub fn with_manifest_ready(mut self, ready: ManifestReady) -> Self {
+        self.manifest_ready = Some(ready);
+        self
+    }
+
+    /// Block until the startup manifest load finished (no-op without a
+    /// gate, or once it fired).
+    async fn manifest_ready(&self) {
+        if let Some(ready) = &self.manifest_ready {
+            // Only fails if the sender is dropped without sending; serve
+            // treats that as "nothing to wait for".
+            let _ = ready.clone().wait_for(|ready| *ready).await;
+        }
     }
 
     /// Build the axum router serving the binary cache protocol.
@@ -551,6 +579,7 @@ fn narinfo_for_entry(store_dir: &StoreDir, entry: &PathEntry, hash: &str) -> Vec
 
 async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>) -> Response {
     let _activity = state.touch();
+    state.manifest_ready().await;
     let Some(hash_str) = file.strip_suffix(".narinfo") else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -753,6 +782,38 @@ mod tests {
             Some(&test_path_hash(1))
         );
         assert_eq!(view.by_nar_hash.get(&Hash32::digest([99])), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn narinfo_waits_for_the_startup_manifest_load() {
+        let mut manifest = Manifest::new();
+        manifest.paths.insert(test_path_hash(1), test_entry(1));
+        let store = ManifestStore::new();
+        store.set(manifest);
+
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let state = Arc::new(
+            Substituter::new(
+                StoreDir::default(),
+                store,
+                AccessLog::new(),
+                TwirpClient::new(reqwest::Client::new(), "http://unused", "token"),
+                reqwest::Client::new(),
+            )
+            .with_manifest_ready(ready_rx),
+        );
+
+        let request = tokio::spawn(narinfo(
+            State(state),
+            Path(format!("{}.narinfo", test_path_hash(1))),
+        ));
+        // The gate is closed: the request must still be pending.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!request.is_finished(), "narinfo answered before the load");
+
+        ready_tx.send(true).unwrap();
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

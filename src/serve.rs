@@ -435,6 +435,42 @@ async fn load_published_manifest(
     }
 }
 
+/// How long `--wait-manifest-version` retries the startup manifest load
+/// before giving up, and how long it pauses between attempts.
+const MANIFEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const MANIFEST_WAIT_POLL: Duration = Duration::from_secs(2);
+
+/// Retry `reload` until the served manifest's version reaches
+/// `min_version` or the timeout expires (GHA cache lookups are eventually
+/// consistent: a manifest committed by the eval job moments ago may not be
+/// visible yet when a build job's daemon starts). On timeout the daemon
+/// serves whatever it found; missing paths then surface as cache misses.
+async fn wait_for_manifest_version<Fut: Future<Output = ()>>(
+    manifest_store: &ManifestStore,
+    min_version: u64,
+    reload: impl Fn() -> Fut,
+) {
+    // tokio's clock, not std::time::Instant: respects paused time in tests.
+    let deadline = tokio::time::Instant::now() + MANIFEST_WAIT_TIMEOUT;
+    loop {
+        reload().await;
+        if manifest_store.version() >= min_version {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!(
+                "hestia serve: manifest version {} not visible after {}s (have {}); \
+                 serving what was found",
+                min_version,
+                MANIFEST_WAIT_TIMEOUT.as_secs(),
+                manifest_store.version(),
+            );
+            return;
+        }
+        tokio::time::sleep(MANIFEST_WAIT_POLL).await;
+    }
+}
+
 /// Accept errors that do not mean the listener is dead: a queued client
 /// that disconnected before being accepted, or momentary fd/buffer
 /// exhaustion. Treating these as fatal would kill caching for the rest of
@@ -603,6 +639,11 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         }
     };
 
+    // Narinfo requests block until the startup manifest load (and the
+    // optional --wait-manifest-version wait) finished; otherwise an early
+    // nix build races the load and sees spurious misses.
+    let (manifest_ready_tx, manifest_ready_rx) = tokio::sync::watch::channel(false);
+
     // The substituter HTTP server shares the manifest and access log with
     // the daemon and runs until the daemon exits.
     let substituter = Substituter::new(
@@ -613,6 +654,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         http.clone(),
     )
     .with_activity_hook(daemon.activity_hook())
+    .with_manifest_ready(manifest_ready_rx)
     .with_manifest_reload({
         let twirp = twirp.clone();
         let http = http.clone();
@@ -642,8 +684,16 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         let twirp = twirp.clone();
         let http = http.clone();
         let manifest_store = manifest_store.clone();
+        let min_version = args.wait_manifest_version;
         tokio::spawn(async move {
-            load_published_manifest(&twirp, &http, &manifest_store).await;
+            let reload = || {
+                let twirp = twirp.clone();
+                let http = http.clone();
+                let manifest_store = manifest_store.clone();
+                async move { load_published_manifest(&twirp, &http, &manifest_store).await }
+            };
+            wait_for_manifest_version(&manifest_store, min_version, reload).await;
+            let _ = manifest_ready_tx.send(true);
         })
     };
 
@@ -728,6 +778,49 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::Manifest;
+
+    #[tokio::test(start_paused = true)]
+    async fn manifest_wait_retries_until_the_version_appears() {
+        let store = ManifestStore::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reload_store = store.clone();
+        let reload_attempts = attempts.clone();
+        wait_for_manifest_version(&store, 3, || {
+            let store = reload_store.clone();
+            let attempts = reload_attempts.clone();
+            async move {
+                // The version becomes visible on the third attempt.
+                if attempts.fetch_add(1, Ordering::SeqCst) + 1 >= 3 {
+                    store.set_version_if_newer(Manifest::new(), 3);
+                }
+            }
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(store.version(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manifest_wait_gives_up_after_the_timeout() {
+        let store = ManifestStore::new();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reload_attempts = attempts.clone();
+        wait_for_manifest_version(&store, 5, || {
+            let attempts = reload_attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert_eq!(store.version(), 0, "nothing was published");
+        let expected = 1 + MANIFEST_WAIT_TIMEOUT.as_secs() / MANIFEST_WAIT_POLL.as_secs();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            expected,
+            "initial load + one per poll"
+        );
+    }
 
     #[test]
     fn transient_accept_errors_are_classified() {

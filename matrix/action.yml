@@ -1,0 +1,81 @@
+name: hestia-matrix
+description: >
+  Evaluate a flake once with nix-eval-jobs and emit a GitHub Actions build
+  matrix; derivation closures are uploaded to the hestia cache so build jobs
+  can run `nix build <drvPath>^*` without re-evaluating. Requires the main
+  Mic92/hestia action earlier in the same job.
+
+inputs:
+  flake:
+    description: Flake installable passed to nix-eval-jobs.
+    required: false
+    default: ".#checks"
+  nix-eval-jobs:
+    description: >
+      nix-eval-jobs command, split on whitespace; extra arguments may be
+      appended. Override to pin a specific build, e.g.
+      "nix run nixpkgs#nix-eval-jobs -- --workers 4".
+    required: false
+    default: "nix-eval-jobs"
+  runner-map:
+    description: >
+      Runner label overrides, one `system=label[,label...]` per line.
+      Unlisted systems keep the defaults (ubuntu-24.04, ubuntu-24.04-arm,
+      macos-13, macos-14).
+    required: false
+    default: ""
+  attr-prefix:
+    description: Prefix prepended (dot-joined) to every attr in the matrix.
+    required: false
+    default: ""
+  skip-unmapped-systems:
+    description: Skip jobs whose system has no runner mapping instead of failing.
+    required: false
+    default: "false"
+
+outputs:
+  matrix:
+    description: >
+      JSON build matrix of not-yet-cached jobs: `{ "include": [ { name,
+      system, os, attr, drvPath, installables }, ... ] }`.
+    value: ${{ steps.matrix.outputs.matrix }}
+  any-jobs:
+    description: '"true" when the matrix has at least one job.'
+    value: ${{ steps.matrix.outputs.any-jobs }}
+  manifest-version:
+    description: >
+      Cache manifest version that contains the registered drv closures.
+      Pass to the main hestia action's `wait-manifest-version` input in
+      build jobs.
+    value: ${{ steps.matrix.outputs.manifest-version }}
+
+runs:
+  using: composite
+  steps:
+    - id: matrix
+      shell: bash
+      env:
+        FLAKE: ${{ inputs.flake }}
+        NIX_EVAL_JOBS: ${{ inputs.nix-eval-jobs }}
+        RUNNER_MAP: ${{ inputs.runner-map }}
+        ATTR_PREFIX: ${{ inputs.attr-prefix }}
+        SKIP_UNMAPPED: ${{ inputs.skip-unmapped-systems }}
+      run: |
+        set -euo pipefail
+        if [ -z "${HESTIA_BIN:-}" ] || [ -z "${HESTIA_SOCKET:-}" ]; then
+          echo "::error::Mic92/hestia must run before Mic92/hestia/matrix in this job"
+          exit 1
+        fi
+        args=(matrix --flake "$FLAKE" --socket "$HESTIA_SOCKET" --nix-eval-jobs "$NIX_EVAL_JOBS")
+        while IFS= read -r mapping; do
+          if [ -n "$mapping" ]; then
+            args+=(--runner "$mapping")
+          fi
+        done <<< "$RUNNER_MAP"
+        if [ -n "$ATTR_PREFIX" ]; then
+          args+=(--attr-prefix "$ATTR_PREFIX")
+        fi
+        if [ "$SKIP_UNMAPPED" = "true" ]; then
+          args+=(--skip-unmapped-systems)
+        fi
+        "$HESTIA_BIN" "${args[@]}"
