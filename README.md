@@ -48,96 +48,7 @@ You will also want a daily GC workflow on the default branch to stay within
 the cache quota; copy [`.github/workflows/gc.yml`](.github/workflows/gc.yml)
 for that (its REST cache deletes are what need `actions: write`).
 
-See [Configuration](#configuration) for all action inputs. For building
-each flake check as its own job, see the
-[`matrix` subaction](#build-matrix-eval-once-build-in-parallel).
-
-## Comparison
-
-|  | **hestia** | **magic-nix-cache** | **cachix** | **attic** |
-|---|---|---|---|---|
-| Status | stable | maintained | commercial service | self-hosted |
-| Storage | GHA cache (free, 10 GB/repo) | GHA cache (free, 10 GB/repo) | cachix.org | your S3/disk |
-| Accounts / secrets needed | none | none | auth token | server + token |
-| Infrastructure to run | none | none | none | server, database, storage |
-| Uploads only what changed (dedup) | yes | no (whole store paths) | no | yes |
-| Rate-limit errors on big builds | no | yes (`429`) | no | no |
-| Garbage collection | automatic (scheduled workflow) | none (LRU eviction only) | retention rules | policies |
-| Cache shared beyond CI | no (CI-only by design) | no | yes (any machine) | yes |
-| Signing | not needed (`?trusted=true`, localhost) | not needed | yes | yes |
-| Telemetry | none | reports usage to Determinate Systems (opt-out) | — | none |
-
-If developer machines should hit the cache too, you want cachix or attic
-instead; hestia only works inside CI.
-
-## How it works
-
-A small daemon (`hestia serve`) runs alongside your CI job:
-
-```
-nix build ──built paths──▶ hestia ──upload──▶ GitHub Actions cache
-nix build ◀─cached paths── hestia ◀─download─ GitHub Actions cache
-```
-
-To Nix, the daemon looks like a regular binary cache: Nix asks it for paths
-before building them and reports every path it does build. At the end of
-the job, new build results and their runtime dependencies (the full closure,
-nixpkgs packages included) are split into content-defined chunks, packed
-into a few large blobs, and uploaded. Embedded dependency hashes are
-normalized out before chunking so a chunk stays identical when only a
-reference's hash changed, and restored losslessly on the way back out.
-Chunks that are already in the cache are never uploaded again, and every
-download is hash-verified before Nix gets to see it. The worst thing corrupt or evicted cache data can cause is a
-rebuild, never wrong build inputs.
-
-### Roots
-
-Every job records the paths it pushed and the paths it downloaded under a
-*root* named `<branch>-<system>`, e.g. `main-x86_64-linux`. The branch part
-comes from `$GITHUB_REF_NAME` (override with `--branch`), the system part is
-detected (override with `--system`). Anything reachable from a root survives
-garbage collection; everything else is deleted once it falls out of the push
-grace period.
-
-Matrix jobs of one workflow run share their root: their closures are
-unioned, however far apart the jobs finish. A new run replaces the root, so
-old closures become collectable.
-
-Pull requests get their own roots (`123/merge-x86_64-linux`), so a PR cannot
-evict paths the default branch still needs. Roots that stop being updated
-(merged PRs, deleted branches) expire after `--root-ttl` (14 days by
-default) and their paths become collectable.
-
-Roots are how hestia decides what is still alive. They are unrelated to
-GitHub's own cache access scoping (who may read or write entries, see
-[Security](#security)), which applies on top.
-
-## Configuration
-
-All inputs are optional; the defaults work for the quick start above.
-
-| Input | Default | Description |
-|---|---|---|
-| `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
-| `version` | latest release | Release tag to download (e.g. `v1.0.0`). The download is verified against GitHub's build attestations. |
-| `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
-| `listen` | `127.0.0.1:37515` | Substituter listen address. |
-| `socket` | `/tmp/hestia/hook.sock` | Post-build-hook unix socket path. |
-| `drain-timeout` | `300` | Seconds the post-job step waits for the final upload. |
-| `upstream-cache-filter` | `false` | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
-| `upstream-cache-key-names` | `cache.nixos.org-1` | Space-separated key names treated as upstream caches by the filter. |
-| `no-closure` | `false` | Cache built paths only, without their runtime closure. |
-
-The GC workflow takes one input: `dry-run` (plan only, delete nothing); see
-[`.github/workflows/gc.yml`](.github/workflows/gc.yml).
-
-The `matrix` subaction has its own inputs (`flake`, `nix-eval-jobs`,
-`runner-map`, `attr-prefix`, `skip-unmapped-systems`); see
-[`matrix/action.yml`](matrix/action.yml).
-
-Running the `hestia` binary yourself instead of using the action? See the
-[CLI reference](docs/cli.md). How it all works under the hood:
-[architecture](docs/architecture.md).
+See [Configuration](#configuration) for all action inputs.
 
 ## Build matrix (eval once, build in parallel)
 
@@ -226,6 +137,93 @@ Notes:
 
 Template repository with this workflow:
 [Mic92/hestia-drv-test](https://github.com/Mic92/hestia-drv-test).
+
+## Comparison
+
+|  | **hestia** | **magic-nix-cache** | **cachix** | **attic** |
+|---|---|---|---|---|
+| Status | stable | maintained | commercial service | self-hosted |
+| Storage | GHA cache (free, 10 GB/repo) | GHA cache (free, 10 GB/repo) | cachix.org | your S3/disk |
+| Accounts / secrets needed | none | none | auth token | server + token |
+| Infrastructure to run | none | none | none | server, database, storage |
+| Uploads only what changed (dedup) | yes | no (whole store paths) | no | yes |
+| Rate-limit errors on big builds | no | yes (`429`) | no | no |
+| Garbage collection | automatic (scheduled workflow) | none (LRU eviction only) | retention rules | policies |
+| Cache shared beyond CI | no (CI-only by design) | no | yes (any machine) | yes |
+| Signing | not needed (`?trusted=true`, localhost) | not needed | yes | yes |
+| Telemetry | none | reports usage to Determinate Systems (opt-out) | — | none |
+
+If developer machines should hit the cache too, you want cachix or attic
+instead; hestia only works inside CI.
+
+## How it works
+
+A small daemon (`hestia serve`) runs alongside your CI job:
+
+```
+nix build ──built paths──▶ hestia ──upload──▶ GitHub Actions cache
+nix build ◀─cached paths── hestia ◀─download─ GitHub Actions cache
+```
+
+To Nix, the daemon looks like a regular binary cache: Nix asks it for paths
+before building them and reports every path it does build. At the end of
+the job, new build results and their runtime dependencies (the full closure,
+nixpkgs packages included) are split into content-defined chunks, packed
+into a few large blobs, and uploaded. Embedded dependency hashes are
+normalized out before chunking so a chunk stays identical when only a
+reference's hash changed, and restored losslessly on the way back out.
+Chunks that are already in the cache are never uploaded again, and every
+download is hash-verified before Nix gets to see it. The worst thing corrupt or evicted cache data can cause is a
+rebuild, never wrong build inputs.
+
+### Roots
+
+Every job records the paths it pushed and the paths it downloaded under a
+*root* named `<branch>-<system>`, e.g. `main-x86_64-linux`. The branch part
+comes from `$GITHUB_REF_NAME` (override with `--branch`), the system part is
+detected (override with `--system`). Anything reachable from a root survives
+garbage collection; everything else is deleted once it falls out of the push
+grace period.
+
+Matrix jobs of one workflow run share their root: their closures are
+unioned, however far apart the jobs finish. A new run replaces the root, so
+old closures become collectable.
+
+Pull requests get their own roots (`123/merge-x86_64-linux`), so a PR cannot
+evict paths the default branch still needs. Roots that stop being updated
+(merged PRs, deleted branches) expire after `--root-ttl` (14 days by
+default) and their paths become collectable.
+
+Roots are how hestia decides what is still alive. They are unrelated to
+GitHub's own cache access scoping (who may read or write entries, see
+[Security](#security)), which applies on top.
+
+## Configuration
+
+All inputs are optional; the defaults work for the quick start above.
+
+| Input | Default | Description |
+|---|---|---|
+| `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
+| `version` | latest release | Release tag to download (e.g. `v1.0.0`). The download is verified against GitHub's build attestations. |
+| `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
+| `listen` | `127.0.0.1:37515` | Substituter listen address. |
+| `socket` | `/tmp/hestia/hook.sock` | Post-build-hook unix socket path. |
+| `drain-timeout` | `300` | Seconds the post-job step waits for the final upload. |
+| `upstream-cache-filter` | `false` | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
+| `upstream-cache-key-names` | `cache.nixos.org-1` | Space-separated key names treated as upstream caches by the filter. |
+| `no-closure` | `false` | Cache built paths only, without their runtime closure. |
+
+The GC workflow takes one input: `dry-run` (plan only, delete nothing); see
+[`.github/workflows/gc.yml`](.github/workflows/gc.yml).
+
+The `matrix` subaction has its own inputs (`flake`, `nix-eval-jobs`,
+`runner-map`, `attr-prefix`, `skip-unmapped-systems`); see
+[`matrix/action.yml`](matrix/action.yml).
+
+Running the `hestia` binary yourself instead of using the action? See the
+[CLI reference](docs/cli.md). How it all works under the hood:
+[architecture](docs/architecture.md).
 
 ## Security
 
