@@ -1,0 +1,48 @@
+[package]
+name = "hestia-core"
+version = "2.0.0"
+edition = "2024"
+license = "MIT"
+description = "Shared storage core for hestia and pheme: chunking, packs, manifest, path info"
+repository = "https://github.com/Mic92/hestia"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time", "sync"] }
+
+# Serialization (manifest = CBOR + zstd)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+zstd = "0.13"
+
+# Content-defined chunking
+fastcdc = "4"
+
+# Internal content addresses (chunk + pack hashes); faster than SHA-256
+aho-corasick = "1"
+blake3 = "1"
+
+# Stream combinators for NAR event/byte streams
+futures-util = "0.3"
+
+# Errors
+thiserror = "2"
+
+# Blob payloads (cheap clones for upload retries)
+bytes = "1"
+
+# Harmonia crates (not on crates.io; pinned to a specific rev)
+harmonia-file-core = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-utils-io = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

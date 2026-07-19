@@ -1001,26 +1001,47 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hestia"
 version = "2.0.0"
 dependencies = [
- "aho-corasick",
  "axum",
  "blake3",
  "bytes",
- "ciborium",
  "clap",
+ "futures-util",
+ "harmonia-store-nar-info",
+ "harmonia-store-path",
+ "harmonia-store-path-info",
+ "harmonia-utils-io",
+ "harmonia-utils-signature",
+ "hestia-core",
+ "libc",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "zstd",
+]
+
+[[package]]
+name = "hestia-core"
+version = "2.0.0"
+dependencies = [
+ "aho-corasick",
+ "blake3",
+ "bytes",
+ "ciborium",
  "fastcdc",
  "futures-util",
  "harmonia-file-core",
  "harmonia-file-nar",
  "harmonia-store-db",
- "harmonia-store-nar-info",
  "harmonia-store-path",
  "harmonia-store-path-info",
  "harmonia-utils-hash",
  "harmonia-utils-io",
  "harmonia-utils-signature",
- "libc",
  "proptest",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",
