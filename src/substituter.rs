@@ -1,6 +1,6 @@
 //! The substituter: Nix binary cache protocol served from the manifest.
 //!
-//! Three routes (axum), mounted into `hestia serve`:
+//! Routes (axum), mounted into `hestia serve`:
 //!
 //! * `GET /nix-cache-info` — store dir, mass-query flag, priority.
 //! * `GET /{hash}.narinfo` — manifest lookup; a hit is recorded in the

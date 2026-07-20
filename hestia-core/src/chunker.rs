@@ -108,13 +108,9 @@ const CHUNK_SEGMENT_SIZE: usize = 16 * 1024 * 1024;
 
 /// Split file contents into content-defined chunks.
 ///
-/// Deterministic: same input, same chunks, independent of core count.
-/// Boundaries depend only on MIN/AVG/MAX_CHUNK_SIZE, the fastcdc version,
-/// and the CHUNK_SEGMENT_SIZE seam cuts.
-///
-/// A multi-segment file chunks across cores, so one big output -- where a
-/// closure's bytes concentrate -- is not stuck on one core (inter-path
-/// concurrency cannot split a single file).
+/// Deterministic: boundaries depend only on the FastCDC parameters and the
+/// CHUNK_SEGMENT_SIZE seam cuts, never on core count. Multi-segment files
+/// chunk across cores so one big output is not stuck on a single core.
 pub fn chunk_data(data: &Bytes) -> Vec<Chunk> {
     chunk_data_with(data, ChunkParams::default())
 }
@@ -224,12 +220,8 @@ impl PackBuilder {
     }
 
     /// Append an already-compressed chunk frame without recompressing it.
-    ///
-    /// Used by the write pipeline (frames freshly produced by
-    /// [`compress_chunks`]; integrity covered by the NAR-hash gate over the
-    /// uncompressed data) and by GC repack (frames Range-read from source
-    /// packs and copied byte-identically after verification via
-    /// [`extract_chunk`]). Returns whether the chunk was actually added
+    /// Used by the write pipeline and GC repack. The caller is responsible
+    /// for verifying the frame. Returns whether the chunk was added
     /// (duplicates are skipped).
     pub fn add_compressed(
         &mut self,
@@ -290,12 +282,10 @@ const CHUNKS_PER_COMPRESS_WORKER: usize = 64;
 
 /// Compress a path's chunks, preserving order.
 ///
-/// zstd is the dominant CPU cost of a drain. The pipeline compresses many
-/// paths concurrently, so small paths stay single-threaded (spawning a
-/// thread pool for tens of chunks costs more than it saves); a large path
-/// -- often a single big output holding most of a closure's bytes -- spans
-/// cores, since inter-path concurrency alone cannot split it.
-/// Blocking: call via `spawn_blocking` from async code.
+/// Small paths stay single-threaded because the pipeline already compresses
+/// many paths concurrently. Large paths span cores since inter-path
+/// concurrency alone cannot split them. Blocking: call via `spawn_blocking`
+/// from async code.
 pub fn compress_chunks(chunks: Vec<Chunk>) -> Result<Vec<CompressedChunk>, Error> {
     let compress_one = |chunk: &Chunk| -> Result<CompressedChunk, Error> {
         Ok(CompressedChunk {
@@ -618,12 +608,6 @@ pub fn flatten_tree(tree: &FileTree<ChunkList>) -> Vec<(String, &TreeNode)> {
     out
 }
 
-// NAR replay (tree + chunk data -> NAR bytes -> hash) is the read-side
-// serialization path: the substituter rebuilds NARs from the manifest tree +
-// fetched chunks exactly like this. Using it on the write side to compute
-// nar_hash means a path's stored representation is proven to reproduce the
-// original NAR before anything is uploaded.
-
 /// Tokio `AsyncWrite` sink that hashes and counts bytes instead of storing
 /// them.
 struct HashSink {
@@ -743,13 +727,10 @@ fn concat_chunks(
     Ok(data)
 }
 
-/// NAR hash and size of a path, computed from its *stored representation*
-/// (file tree + chunk data) by replaying synthesized events through
-/// harmonia's [`NarWriter`].
-///
-/// The write pipeline compares this against the nar_hash recorded in the Nix
-/// database: equality proves the chunked representation reproduces the
-/// original NAR byte-identically, so it is safe to upload and serve.
+/// NAR hash and size computed from the stored representation (file tree +
+/// chunk data). The write pipeline compares this against the nar_hash in
+/// the Nix database: equality proves the chunked representation reproduces
+/// the original NAR before anything is uploaded.
 pub async fn nar_hash_from_chunks(
     tree: &FileTree<ChunkList>,
     chunks: &BTreeMap<ChunkHash, Bytes>,
@@ -760,14 +741,9 @@ pub async fn nar_hash_from_chunks(
     sink.finish()
 }
 
-/// Serialize a complete NAR from a path's *stored representation* (file
-/// tree + chunk data).
-///
-/// This is the read-side code path: the substituter rebuilds NARs from
-/// manifest trees plus fetched chunks with exactly this function. It shares
-/// the event synthesis with [`nar_hash_from_chunks`], which the write
-/// pipeline uses as its integrity gate — so the bytes served here are by
-/// construction the bytes whose hash was verified before upload.
+/// Serialize a complete NAR from the stored representation (file tree +
+/// chunk data). Shares event synthesis with [`nar_hash_from_chunks`], so
+/// the bytes served here are the bytes whose hash was verified on upload.
 pub async fn nar_from_chunks(
     tree: &FileTree<ChunkList>,
     chunks: &BTreeMap<ChunkHash, Bytes>,
@@ -799,18 +775,12 @@ async fn write_nar<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Decompress and verify one chunk extracted from pack bytes.
+/// Decompress and verify one chunk extracted from pack bytes
+/// (`[offset, offset + compressed_size)`, one Range request).
 ///
-/// `compressed` is the byte slice at `[offset, offset + compressed_size)` of
-/// the pack blob — exactly what a Range request against the pack returns.
-/// The hash check is mandatory: the GHA cache is not trusted storage and a
-/// corrupt chunk must never be served onward.
-///
-/// Decompression is bounded at [`MAX_CHUNK_SIZE`]: no legitimate chunk can
-/// be larger (chunking splits at that bound), so anything bigger is corrupt
-/// or malicious pack data and gets rejected *before* its decompressed
-/// payload is buffered (zstd ratios above 1000:1 would otherwise let a tiny
-/// frame allocate gigabytes).
+/// The GHA cache is not trusted storage. The hash check is mandatory, and
+/// decompression is bounded at [`MAX_CHUNK_SIZE`] so a small malicious
+/// frame cannot allocate gigabytes.
 pub fn extract_chunk(compressed: &[u8], expected: &ChunkHash) -> Result<Vec<u8>, Error> {
     use std::io::Read as _;
     let mut data = Vec::new();
@@ -1041,13 +1011,9 @@ mod tests {
 
     #[test]
     fn extract_chunk_rejects_frames_larger_than_max_chunk_size() {
-        // Pack bytes come from the GHA cache, which is not trusted storage.
-        // No legitimate chunk exceeds MAX_CHUNK_SIZE (chunk_data splits with
-        // that bound), but zstd compresses runs of zeros at ratios well above
-        // 1000:1, so a small corrupt or malicious frame can decompress to a
-        // huge payload. extract_chunk must reject such frames at the size
-        // limit instead of buffering the full decompressed payload in memory
-        // (memory amplification in the substituter and GC repack).
+        // A small corrupt or malicious frame can decompress to a huge
+        // payload. extract_chunk must reject it at the size limit instead
+        // of buffering the full payload in memory.
         let bomb_payload = vec![0u8; 64 * 1024 * 1024];
         let frame = zstd::encode_all(bomb_payload.as_slice(), 3).unwrap();
         assert!(

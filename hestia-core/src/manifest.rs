@@ -345,27 +345,18 @@ impl PathEntry {
         }
         // Deterministic winner: newer push wins, nar_hash as tie-break, the
         // CBOR encoding of the remaining content as the final tie-break.
-        //
-        // The final tie-break must be a *total* order over the entry
-        // content: two entries can tie on (last_pushed, nar_hash) while
-        // differing in metadata (the same output path can be produced by
-        // different derivations, so deriver/ca/references may differ, and
-        // concurrent jobs push within the same second routinely). Without a
-        // total order the merge would not be commutative, and the surviving
-        // entry would depend on which concurrent writer wins the
-        // SaveMutable race. The expensive encoding is computed only on a
-        // (last_pushed, nar_hash) tie.
+        // The final tie-break must be a total order. Entries can tie on
+        // (last_pushed, nar_hash) while differing in metadata, and without
+        // a total order the merge would not be commutative. The expensive
+        // encoding is computed only on a (last_pushed, nar_hash) tie.
         fn content_key(entry: &PathEntry) -> Vec<u8> {
-            // The clocks are folded with max() below; exclude them from the
-            // content tie-break so that folding never changes an entry's
-            // ordering (this keeps the merge associative as well).
+            // Exclude the max()-folded clocks so folding never changes an
+            // entry's ordering (keeps the merge associative).
             let mut content = entry.clone();
             content.last_reachable = 0;
             content.last_pushed = 0;
             let mut encoded = Vec::new();
-            // Serializing to a Vec cannot fail for manifest types (it is
-            // the same code path Manifest::encode uses); a failure would
-            // only weaken the tie-break, never panic.
+            // A serialization failure only weakens the tie-break, never panics.
             let _ = ciborium::into_writer(&content, &mut encoded);
             encoded
         }
@@ -625,14 +616,10 @@ const ZSTD_LEVEL: i32 = 9;
 
 /// Decompression bound for stored manifest blobs.
 ///
-/// The GHA cache is not trusted storage: without a bound, a small zstd
-/// bomb stored as the next manifest version would abort every serve,
-/// drain, and GC inside the allocator -- before the corrupt-manifest
-/// fallback (`decode_manifest_or_empty`) can trigger. Production manifest
-/// CBOR is single-digit megabytes, so 256 MiB is ample headroom while an
-/// over-long stream surfaces as a normal decode error. (A 28 GiB NAR /
-/// 4.4k-path workload measured ~70 MiB of manifest CBOR, so the previous
-/// 64 MiB bound was too tight for large caches.)
+/// The GHA cache is not trusted storage. Without a bound, a small zstd bomb
+/// would abort every serve, drain, and GC in the allocator. A 28 GiB NAR /
+/// 4.4k-path workload measured ~70 MiB of manifest CBOR, so 256 MiB leaves
+/// headroom while an over-long stream surfaces as a normal decode error.
 const MAX_MANIFEST_CBOR_BYTES: u64 = 256 * 1024 * 1024;
 
 impl Manifest {
@@ -1250,16 +1237,11 @@ mod tests {
 
     #[test]
     fn merge_is_commutative_when_push_clock_and_nar_hash_tie() {
-        // Two concurrent CI jobs can push the same store path within the
-        // same second (last_pushed has 1-second granularity) with identical
-        // content (same nar_hash) but different metadata: the same output
-        // path can be produced by different derivations, so deriver (and in
-        // principle ca/references) can differ between the two pushes.
-        //
-        // SaveMutable conflict resolution re-merges in whatever order the
-        // race produces; if the merge result depends on argument order, the
-        // surviving manifest depends on who wins that race -- exactly the
-        // non-determinism the merge rules promise to rule out.
+        // Concurrent CI jobs can push the same store path within the same
+        // second with identical content but different metadata (e.g.
+        // deriver). The merge result must not depend on argument order, or
+        // the surviving manifest would depend on who wins the SaveMutable
+        // race.
         let mut a = sample_path_entry(1);
         let mut b = sample_path_entry(1);
         a.deriver = Some(format!("{}-alpha.drv", path_hash(10)).parse().unwrap());
