@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::Poll;
 
@@ -19,7 +19,7 @@ use harmonia_file_nar::{NarByteStream, NarEvent, NarWriter};
 
 use crate::manifest::{
     ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Hash32, PackHash,
-    Regular, Symlink,
+    Regular, Rewrite, Symlink,
 };
 use crate::refnorm::RefTable;
 
@@ -467,6 +467,27 @@ impl TreeBuilder {
     }
 }
 
+/// Files at or above this size are normalized on a copy-on-write mapping of
+/// the on-disk file: only pages containing a reference occurrence get
+/// copied, so a large binary no longer doubles its resident size during
+/// chunking. Below the threshold a plain copy is cheaper than open+mmap.
+const COW_NORMALIZE_THRESHOLD: u64 = 64 * 1024 * 1024;
+
+/// Normalize a file's references on a copy-on-write mapping of its on-disk
+/// contents. `None` when mapping fails or the size no longer matches the
+/// NAR walk's stat (caller falls back to the buffered path).
+fn cow_normalize(path: &Path, size: u64, refs: &RefTable) -> Option<(Bytes, Vec<Rewrite>)> {
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() != size {
+        return None;
+    }
+    // SAFETY: store paths are immutable once registered, so the mapped file
+    // is not truncated or rewritten underneath the mapping.
+    let mut map = unsafe { memmap2::MmapOptions::new().map_copy(&file).ok()? };
+    let rewrites = refs.normalize_in_place(&mut map);
+    Some((Bytes::from_owner(map), rewrites))
+}
+
 /// NAR permits arbitrary bytes in entry names and symlink targets, but the
 /// manifest stores them as UTF-8 (a representation limit); `what` names the
 /// field so the diagnostic points at the right one.
@@ -497,17 +518,28 @@ pub async fn chunk_path_with(
     refs: &RefTable,
     params: ChunkParams,
 ) -> Result<ChunkedPath, Error> {
-    let mut events = harmonia_file_nar::dump(path.into());
+    let root: PathBuf = path.into();
+    let mut events = harmonia_file_nar::dump(root.clone());
     let mut builder = TreeBuilder::new();
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut seen: BTreeSet<ChunkHash> = BTreeSet::new();
+    // On-disk directory currently being walked (for cow_normalize).
+    let mut current_dir = root.clone();
 
     while let Some(event) = events.next().await {
         match event? {
             NarEvent::StartDirectory { name } => {
-                builder.start_directory(name_to_string(&name, "entry name")?);
+                let name = name_to_string(&name, "entry name")?;
+                if !name.is_empty() {
+                    current_dir.push(&name);
+                }
+                builder.start_directory(name);
             }
             NarEvent::EndDirectory => {
+                // The root directory has no name and was never pushed.
+                if current_dir != root {
+                    current_dir.pop();
+                }
                 builder.end_directory()?;
             }
             NarEvent::Symlink { name, target } => {
@@ -521,11 +553,22 @@ pub async fn chunk_path_with(
             NarEvent::File {
                 name,
                 executable,
-                size: _,
+                size,
                 reader,
             } => {
-                let data = reader.into_bytes();
-                let (normalized, rewrites) = refs.normalize(&data);
+                let entry_name = name_to_string(&name, "entry name")?;
+                // Large files with references normalize on a copy-on-write
+                // mapping; everything else uses the event reader's bytes,
+                // which normalize clones without copying when reference-free.
+                let cow = if !refs.is_empty() && size >= COW_NORMALIZE_THRESHOLD {
+                    cow_normalize(&current_dir.join(&entry_name), size, refs)
+                } else {
+                    None
+                };
+                let (normalized, rewrites) = match cow {
+                    Some(normalized) => normalized,
+                    None => refs.normalize(&reader.into_bytes()),
+                };
                 let file_chunks = chunk_data_with(&normalized, params);
                 let list = ChunkList {
                     chunks: file_chunks.iter().map(|chunk| chunk.hash).collect(),
@@ -537,7 +580,7 @@ pub async fn chunk_path_with(
                     }
                 }
                 builder.place(
-                    name_to_string(&name, "entry name")?,
+                    entry_name,
                     FileTree(FileSystemObject::Regular(Regular {
                         executable,
                         contents: list,
