@@ -25,6 +25,14 @@ pub const HASH_LEN: usize = 32;
 /// position table restores the real bytes), zeros compress best.
 const SENTINEL: [u8; HASH_LEN] = [0u8; HASH_LEN];
 
+/// Write the sentinel over each scanned occurrence.
+fn overwrite_with_sentinel(data: &mut [u8], rewrites: &[Rewrite]) {
+    for rewrite in rewrites {
+        let offset = rewrite.offset as usize;
+        data[offset..offset + HASH_LEN].copy_from_slice(&SENTINEL);
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("rewrite references index {index} but the path has {len} references")]
@@ -73,13 +81,12 @@ impl RefTable {
         self.hashes.is_empty()
     }
 
-    /// Replace every reference-hash occurrence with the sentinel, returning
-    /// the normalized bytes and the position table to restore them. Offsets
-    /// index the file content, identical in normalized and original bytes
-    /// (the sentinel is hash-length).
-    pub fn normalize(&self, data: &[u8]) -> (Bytes, Vec<Rewrite>) {
+    /// Find every reference-hash occurrence. Offsets index the file
+    /// content; the sentinel is hash-length, so offsets are identical in
+    /// original and normalized bytes.
+    fn scan(&self, data: &[u8]) -> Vec<Rewrite> {
         if self.hashes.is_empty() {
-            return (Bytes::copy_from_slice(data), Vec::new());
+            return Vec::new();
         }
         let scanner = self.scanner.get_or_init(|| {
             // All patterns are hash-length, so LeftmostLongest yields the
@@ -90,21 +97,37 @@ impl RefTable {
                 .build(&self.hashes)
                 .expect("aho-corasick build over fixed-length hashes")
         });
-        let mut out = Vec::with_capacity(data.len());
-        let mut rewrites = Vec::new();
-        // Start of the unmatched run not yet copied into `out`.
-        let mut last = 0;
-        for m in scanner.find_iter(data) {
-            out.extend_from_slice(&data[last..m.start()]);
-            rewrites.push(Rewrite {
-                offset: out.len() as u64,
+        scanner
+            .find_iter(data)
+            .map(|m| Rewrite {
+                offset: m.start() as u64,
                 ref_index: m.pattern().as_u32(),
-            });
-            out.extend_from_slice(&SENTINEL);
-            last = m.end();
+            })
+            .collect()
+    }
+
+    /// Replace every reference-hash occurrence with the sentinel, returning
+    /// the normalized bytes and the position table to restore them.
+    ///
+    /// Reference-free files (empty table or no occurrences) are returned as
+    /// a cheap clone of `data`, so mmap-backed file bytes stay zero-copy.
+    pub fn normalize(&self, data: &Bytes) -> (Bytes, Vec<Rewrite>) {
+        let rewrites = self.scan(data);
+        if rewrites.is_empty() {
+            return (data.clone(), rewrites);
         }
-        out.extend_from_slice(&data[last..]);
+        let mut out = data.to_vec();
+        overwrite_with_sentinel(&mut out, &rewrites);
         (Bytes::from(out), rewrites)
+    }
+
+    /// [`Self::normalize`] operating on a mutable buffer the caller owns
+    /// (e.g. a copy-on-write mapping): occurrences are overwritten in
+    /// place, so only the touched pages cost memory.
+    pub fn normalize_in_place(&self, data: &mut [u8]) -> Vec<Rewrite> {
+        let rewrites = self.scan(data);
+        overwrite_with_sentinel(data, &rewrites);
+        rewrites
     }
 
     /// Undo [`Self::normalize`]: copy each recorded reference hash back into
@@ -161,6 +184,7 @@ mod tests {
         content.extend_from_slice(b"/lib and self ");
         content.extend_from_slice(SELF.as_bytes());
         content.extend_from_slice(b" suffix padding past the hash-length bound");
+        let content = Bytes::from(content);
 
         let (normalized, rewrites) = table.normalize(&content);
         assert_eq!(rewrites.len(), 2);
@@ -170,6 +194,12 @@ mod tests {
         let mut restored = normalized.to_vec();
         table.restore(&mut restored, &rewrites).unwrap();
         assert_eq!(restored, content);
+
+        // In-place normalization must produce identical output.
+        let mut in_place = content.to_vec();
+        let in_place_rewrites = table.normalize_in_place(&mut in_place);
+        assert_eq!(in_place, normalized);
+        assert_eq!(in_place_rewrites, rewrites);
     }
 
     #[test]
@@ -186,8 +216,8 @@ mod tests {
         b.extend_from_slice(GLIBC_B.as_bytes());
         b.extend_from_slice(b" trailer bytes beyond the hash window");
 
-        let (na, ra) = build_a.normalize(&a);
-        let (nb, rb) = build_b.normalize(&b);
+        let (na, ra) = build_a.normalize(&Bytes::from(a));
+        let (nb, rb) = build_b.normalize(&Bytes::from(b));
         assert_eq!(na, nb);
         assert_eq!(ra, rb);
     }
@@ -195,10 +225,25 @@ mod tests {
     #[test]
     fn empty_table_is_a_noop() {
         let table = RefTable::new(&[]);
-        let data = b"no references here, just content bytes to scan".to_vec();
+        let data = Bytes::from_static(b"no references here, just content bytes to scan");
         let (normalized, rewrites) = table.normalize(&data);
-        assert_eq!(normalized.as_ref(), data.as_slice());
+        assert_eq!(normalized, data);
         assert!(rewrites.is_empty());
+    }
+
+    #[test]
+    fn reference_free_content_is_not_copied() {
+        // Files without any occurrence must share the input buffer (cheap
+        // Bytes clone), so mmap-backed large files stay zero-copy.
+        let table = RefTable::new(&[store_path(GLIBC_A, "glibc")]);
+        let data = Bytes::from(vec![b'x'; 256 * 1024]);
+        let (normalized, rewrites) = table.normalize(&data);
+        assert!(rewrites.is_empty());
+        assert_eq!(
+            normalized.as_ptr(),
+            data.as_ptr(),
+            "expected a zero-copy clone"
+        );
     }
 
     #[test]

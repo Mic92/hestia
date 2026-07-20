@@ -30,7 +30,10 @@ futures-util = "0.3"
 thiserror = "2"
 
 # Blob payloads (cheap clones for upload retries)
-bytes = "1"
+bytes = "1.9"
+
+# Copy-on-write mappings for normalizing large files without a full copy
+memmap2 = "0.9"
 
 # Harmonia crates (not on crates.io; pinned to a specific rev)
 harmonia-file-core = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
