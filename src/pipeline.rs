@@ -51,6 +51,19 @@ const UPLOAD_CONCURRENCY: usize = 4;
 /// width is capped at the CPU count.
 const CHUNK_CONCURRENCY: usize = 32;
 
+/// Upper bound on the summed NAR size of paths chunked and verified
+/// concurrently. The path-count cap alone does not bound memory: a few
+/// multi-hundred-MiB paths in flight at once would stack their buffers.
+/// Large paths serialize against this budget instead; small paths are
+/// unaffected.
+const CHUNK_INFLIGHT_NAR_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Semaphore permits for one path's chunk-and-verify stage: its NAR size,
+/// clamped so a path larger than the whole budget still runs (alone).
+fn chunk_permits(nar_size: u64) -> u32 {
+    nar_size.clamp(1, CHUNK_INFLIGHT_NAR_BYTES) as u32
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("GHA cache error: {0}")]
@@ -396,9 +409,17 @@ impl PipelineContext {
             // whole batch, and a deterministic failure would then keep every
             // later drain (including the shutdown drain) from caching
             // anything.
+            let inflight = Arc::new(tokio::sync::Semaphore::new(
+                CHUNK_INFLIGHT_NAR_BYTES as usize,
+            ));
             let mut verified = futures_util::stream::iter(to_push)
                 .map(|(path, info)| {
+                    let inflight = inflight.clone();
                     tokio::spawn(async move {
+                        let _permit = inflight
+                            .acquire_many(chunk_permits(info.nar_size))
+                            .await
+                            .expect("in-flight NAR byte semaphore is never closed");
                         let started = std::time::Instant::now();
                         // The path's own references drive both normalization
                         // (so chunks stay stable across dependency-hash
@@ -704,6 +725,15 @@ mod tests {
         assert!(!arch.is_empty() && !os.is_empty(), "system: {system}");
         assert!(!["x86", "arm", "macos"].contains(&arch), "arch: {arch}");
         assert_ne!(os, "macos", "os must use the Nix spelling");
+    }
+
+    #[test]
+    fn chunk_permits_clamp_to_the_budget() {
+        assert_eq!(chunk_permits(0), 1);
+        assert_eq!(chunk_permits(4096), 4096);
+        // A path bigger than the whole budget must still get permits it can
+        // actually acquire (it runs alone).
+        assert_eq!(u64::from(chunk_permits(u64::MAX)), CHUNK_INFLIGHT_NAR_BYTES);
     }
 
     #[test]
