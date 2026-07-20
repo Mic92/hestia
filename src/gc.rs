@@ -28,17 +28,13 @@
 //! `docs/gc.als`):
 //!
 //! * **Version protection**: packs referenced by *any surviving manifest
-//!   version* are never deleted. A drain's commit merges its drain-start
-//!   snapshot back in, which can resurrect references GC just dropped —
-//!   but the snapshot is one of the surviving versions, so everything it
-//!   can resurrect stays protected until cleanup ages the version out.
-//!   Garbage therefore survives one extra run.
-//! * **Recency**: packs whose newest REST entry was created *or accessed*
-//!   within min_age are never deleted — a drain may have just uploaded
-//!   the pack, or CAS-deduped onto it (which touches it; see
-//!   [`crate::pipeline::upload_pack`]). Recency is re-checked with a fresh
-//!   listing right before the REST deletes, so a re-upload landing after
-//!   the commit wins over the stale delete set.
+//!   version* are never deleted. A drain commit can only resurrect
+//!   references from one of those versions, so garbage survives one extra
+//!   run instead of being deleted out from under a concurrent drain.
+//! * **Recency**: packs created *or accessed* within min_age are never
+//!   deleted, because a drain may have just uploaded or CAS-touched them
+//!   without having committed yet. Recency is re-checked with a fresh
+//!   listing right before the REST deletes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
@@ -493,15 +489,11 @@ pub fn plan(
         });
     }
 
-    // CAS no-op trap: a job whose copies reproduce a single fully-live source
-    // pack byte-identically (frames are copied verbatim, in offset order)
-    // would produce the same content-addressed key → already_exists → the
-    // upload is skipped and the LRU clock is NOT reset. Since repack sources
-    // are also excluded from touching, such a pack would idle into GitHub's
-    // 7-day eviction while still referenced. Drop the job and let the pack
-    // be touched instead. This covers both the trivial single-source case
-    // and the tier-split case where consolidation isolates one pack's chunks
-    // into their own job.
+    // CAS no-op trap: a job that would reproduce a single fully-live source
+    // pack byte-identically hits already_exists on upload, which skips the
+    // LRU reset while the source is also excluded from touching. The pack
+    // would idle into GitHub's 7-day eviction while still referenced. Drop
+    // the job and let the pack be touched instead.
     plan.repack_jobs.retain(|job| {
         let sources: BTreeSet<PackHash> = job.copies.iter().map(|copy| copy.from.pack).collect();
         if sources.len() == 1 {
@@ -828,12 +820,11 @@ impl GcContext {
             .collect())
     }
 
-    /// Union of the pack tables of every surviving manifest version —
-    /// exactly the references a concurrent drain commit can resurrect (its
-    /// snapshot is one of these versions), so nothing in this set may be
-    /// deleted. A version that vanished since the listing protects
-    /// nothing; one that fails to decode aborts the run (deleting with
-    /// unknown references is unsafe).
+    /// Union of the pack tables of every surviving manifest version. This
+    /// is exactly what a concurrent drain commit can resurrect, so nothing
+    /// in this set may be deleted. A vanished version protects nothing. A
+    /// version that fails to decode aborts the run, since deleting with
+    /// unknown references is unsafe.
     pub async fn protected_packs(&self) -> Result<BTreeSet<PackHash>, Error> {
         let prefix = format!("{}#", self.manifest_prefix);
         let entries = self.rest.list_caches(&prefix).await?;
