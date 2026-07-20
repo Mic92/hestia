@@ -25,9 +25,9 @@ use crate::refnorm::RefTable;
 
 /// FastCDC parameters. Pinned: changing them changes every chunk boundary
 /// and therefore invalidates all existing chunks in the cache.
-pub const MIN_CHUNK_SIZE: u32 = 16 * 1024;
-pub const AVG_CHUNK_SIZE: u32 = 64 * 1024;
-pub const MAX_CHUNK_SIZE: u32 = 256 * 1024;
+pub const MIN_CHUNK_SIZE: u32 = 64 * 1024;
+pub const AVG_CHUNK_SIZE: u32 = 256 * 1024;
+pub const MAX_CHUNK_SIZE: u32 = 1024 * 1024;
 
 /// FastCDC min/avg/max boundaries as a value, so experiments (e.g.
 /// `examples/chunk_sweep.rs`) can chunk with non-default parameters.
@@ -872,13 +872,13 @@ mod tests {
 
     #[test]
     fn chunking_is_deterministic() {
-        let data = test_data(1024 * 1024, 42);
+        let data = test_data(4 * 1024 * 1024, 42);
         let first = chunk_data(&data);
         let second = chunk_data(&data);
         assert_eq!(first, second);
         assert!(
             first.len() > 4,
-            "1 MiB should produce several chunks, got {}",
+            "4 MiB should produce several chunks, got {}",
             first.len()
         );
     }

@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(
             summarize(&stats),
             "pushed 4 paths, 3 already cached, 2 upstream-signed, 1 invalid \
-             (446.1 KiB in 2.0s, 2.2 MiB/s); manifest m2#7"
+             (446.1 KiB in 2.0s, 2.2 MiB/s); manifest m3#7"
         );
         assert_eq!(
             stage_breakdown(&stats),
@@ -222,7 +222,7 @@ mod tests {
             elapsed_ms: 600,
             ..DrainStats::default()
         };
-        assert_eq!(summarize(&stats), "pushed 2 paths; manifest m2#3");
+        assert_eq!(summarize(&stats), "pushed 2 paths; manifest m3#3");
         assert_eq!(
             stage_breakdown(&stats),
             "load 0.1s, chunk 0.4s, commit 0.1s, total 0.6s"
@@ -271,7 +271,7 @@ mod tests {
         };
         assert_eq!(
             summarize(&stats),
-            "pushed 1 path (1.0 MiB in 1.0s, 2.0 MiB/s); manifest m2#1"
+            "pushed 1 path (1.0 MiB in 1.0s, 2.0 MiB/s); manifest m3#1"
         );
         assert_eq!(
             stage_breakdown(&stats),

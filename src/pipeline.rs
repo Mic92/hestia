@@ -33,13 +33,13 @@ use crate::substituter::ManifestStore;
 use crate::upstream::UpstreamFilter;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 
-/// SaveMutable family prefix for the manifest ("m2" → keys `m2#1`, `m2#2`,
-/// …). Bumped from "m" when reference normalization changed the chunk
-/// format: the pre-existing `m#N` sequence chunked NARs verbatim, so those
-/// chunks would never dedup against normalized ones. A fresh namespace
-/// ignores the old manifest outright rather than carrying dead entries
-/// forward; its orphaned packs age out through GC and eviction.
-pub const MANIFEST_PREFIX: &str = "m2";
+/// SaveMutable family prefix for the manifest ("m3" → keys `m3#1`, `m3#2`,
+/// …). Bumped on every chunk-format change, because old chunks never dedup
+/// against new ones: "m" → "m2" for reference normalization, "m2" → "m3"
+/// for the 64/256/1024 KiB FastCDC parameters. A fresh namespace ignores
+/// the old manifest rather than carrying dead entries forward; its
+/// orphaned packs age out through GC and eviction.
+pub const MANIFEST_PREFIX: &str = "m3";
 
 /// Compressed bytes per pack before a new pack is started.
 pub const PACK_TARGET_SIZE: u64 = 64 * 1024 * 1024;
