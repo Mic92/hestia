@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
-      - uses: Mic92/hestia@v2
+      - uses: Mic92/hestia@v3
       - run: nix build .#
 ```
 
@@ -71,9 +71,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
-      - uses: Mic92/hestia@v2
+      - uses: Mic92/hestia@v3
       - id: matrix
-        uses: Mic92/hestia/matrix@v2
+        uses: Mic92/hestia/matrix@v3
         with:
           flake: ".#checks"                        # default
           nix-eval-jobs: "nix run nixpkgs#nix-eval-jobs --"
@@ -91,7 +91,7 @@ jobs:
       matrix: ${{ fromJSON(needs.eval.outputs.matrix) }}
     steps:
       - uses: NixOS/nix-installer-action@main
-      - uses: Mic92/hestia@v2
+      - uses: Mic92/hestia@v3
         with:
           wait-manifest-version: ${{ needs.eval.outputs.manifest-version }}
       - name: Prefetch drv closure
