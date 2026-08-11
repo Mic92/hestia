@@ -2,9 +2,9 @@
 //!
 //! Opt-in (`hestia serve --upstream-cache-filter`): when enabled, anything
 //! carrying a signature from a trusted upstream cache (cache.nixos.org by
-//! default) is already served by that cache and would only waste GHA cache
-//! quota, so the write pipeline skips it. By default the filter is off and
-//! everything is cached, upstream-served paths included.
+//! default) is already served by that cache, so the write pipeline normally
+//! skips it to save GHA cache quota. By default the filter is off and everything
+//! is cached, upstream-served paths included.
 //!
 //! The check is on the signature's *key name* only — no cryptographic
 //! verification. That is deliberate: a forged signature name in the local
@@ -42,8 +42,7 @@ impl UpstreamFilter {
         self.trusted_keys.iter().any(|key| key == key_name)
     }
 
-    /// True if any of `signatures` was made by a trusted upstream key,
-    /// i.e. the signed path should be skipped by the write pipeline.
+    /// True if any of `signatures` was made by a trusted upstream key.
     pub fn is_upstream_signed<'a>(
         &self,
         signatures: impl IntoIterator<Item = &'a Signature>,

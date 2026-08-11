@@ -5,8 +5,9 @@
 //! 1. Query path info from the store database for every buffered path,
 //!    expanded to its runtime closure unless disabled.
 //! 2. Filter: invalid paths, upstream-signed paths (when the upstream
-//!    cache filter is enabled), paths already in the manifest (those get
-//!    their `last_pushed` clock bumped instead).
+//!    cache filter is enabled, except for derivation closures used by the
+//!    closure API), paths already in the manifest (those get their
+//!    `last_pushed` clock bumped instead).
 //! 3. Chunk each new path (FastCDC over NAR events) and verify the chunked
 //!    representation reproduces the NAR hash recorded by Nix.
 //! 4. Pack new chunks, upload the pack (Twirp reserve → Azure PUT →
@@ -327,12 +328,29 @@ impl PipelineContext {
         // Blocking sqlite I/O happens off the async runtime.
         let store = self.store.clone();
         let expand_closure = self.expand_closure;
-        let lookups = tokio::task::spawn_blocking(move || {
-            if expand_closure {
-                store.query_closure(paths)
+        let (lookups, upstream_filter_bypass) = tokio::task::spawn_blocking(move || {
+            // Matrix prefetch requires registered `.drv` closures to be
+            // self-contained, so their members bypass the upstream filter.
+            let bypass_roots: BTreeSet<String> = if expand_closure {
+                paths
+                    .iter()
+                    .filter(|path| path.ends_with(".drv"))
+                    .cloned()
+                    .collect()
             } else {
-                store.query_batch(paths)
-            }
+                BTreeSet::new()
+            };
+            let lookups = if expand_closure {
+                store.query_closure(paths)?
+            } else {
+                store.query_batch(paths)?
+            };
+            let bypass: BTreeSet<String> = store
+                .query_closure(bypass_roots)?
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect();
+            Ok::<_, PathInfoError>((lookups, bypass))
         })
         .await
         .expect("store database query task panicked")?;
@@ -358,7 +376,9 @@ impl PipelineContext {
                 }
             };
 
-            if self.upstream.is_upstream_signed(&info.signatures) {
+            if !upstream_filter_bypass.contains(&path)
+                && self.upstream.is_upstream_signed(&info.signatures)
+            {
                 stats.skipped_upstream += 1;
                 continue;
             }

@@ -128,9 +128,10 @@ Notes:
   come from the normal cache flow (earlier builds or upstream
   substituters), so shared uncached dependencies are rebuilt by every
   matrix job that needs them.
-* Input sources (fetched tarballs, patched srcs) count against the cache
-  quota. `upstream-cache-filter` does not skip them, because sources carry
-  no upstream signature.
+* With closure expansion enabled, registered derivation closures bypass
+  `upstream-cache-filter` so `/closure` exports remain importable into a
+  fresh store. Their inputs, including upstream-signed sources, therefore
+  count against the cache quota.
 * Each matrix row also carries `attr`, so `nix build .#${{ matrix.attr }}`
   works as a per-job-eval fallback.
 * GitHub limits a matrix to 256 jobs and a step output to 1 MB.
@@ -264,13 +265,7 @@ jobs:
 
 The drain at the end of the eval job uploads the drvs together with their
 input closure (input drvs and sources), so the build jobs substitute them
-from the cache. Notes:
-
-* Dependency *outputs* are not part of a drv's closure; they come from the
-  normal cache flow (earlier builds or upstream substituters).
-* Input sources (fetched tarballs, patched srcs) are uploaded too and count
-  against the cache quota. `upstream-cache-filter` does not skip them,
-  because sources carry no upstream signature.
+from the cache.
 
 ## Security
 
