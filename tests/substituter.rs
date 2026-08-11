@@ -421,7 +421,7 @@ async fn nar_round_trips_with_matching_hash() {
 }
 
 #[tokio::test]
-async fn closure_export_imports_into_a_fresh_store() {
+async fn drv_closure_bypasses_upstream_filter_and_imports_into_a_fresh_store() {
     timed(async {
         // The prefetch endpoint: one request streams the whole closure in
         // `nix-store --export` format; `nix-store --import` is the format
@@ -429,15 +429,43 @@ async fn closure_export_imports_into_a_fresh_store() {
         let Some(store) = ScratchStore::create() else {
             return;
         };
-        let (top, dep) = store.add_paths_with_reference("closure-export");
+        let drv = store.instantiate_drv("closure-upstream-filter");
+        let references = match store
+            .database()
+            .query(&drv.to_string_lossy())
+            .expect("store database query failed")
+        {
+            hestia::pathinfo::Lookup::Found(info) => info.references,
+            other => panic!("drv must be valid in the store database, got {other:?}"),
+        };
+        let signed_reference = store.store_dir_path().join(
+            references
+                .first()
+                .expect("drv must have an input reference")
+                .to_string(),
+        );
+        store.sign_path(&signed_reference, "cache.nixos.org-1");
+        let unrelated_upstream = store.add_fixture("unrelated-upstream", 13);
+        store.sign_path(&unrelated_upstream, "cache.nixos.org-1");
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
-        push_paths(&fake, &http, &store, &[&top, &dep]).await;
+        let ctx = pipeline_context(&fake, &http, store.database());
+        let stats = ctx
+            .run(
+                to_path_set(&[&drv, &unrelated_upstream]),
+                BTreeSet::new(),
+                now_unix(),
+            )
+            .await
+            .expect("pipeline run failed");
+        assert_eq!(stats.paths_received, 2);
+        assert_eq!(stats.skipped_upstream, 1);
+
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
         let response = substituter
-            .get(&http, &format!("closure/{}", path_hash_str(&top)))
+            .get(&http, &format!("closure/{}", path_hash_str(&drv)))
             .await;
         assert_eq!(response.status(), 200);
         let body = response.bytes().await.expect("reading export stream");
@@ -469,14 +497,17 @@ async fn closure_export_imports_into_a_fresh_store() {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        // The whole closure landed: top plus its reference.
-        assert_trees_equal(&top, &destination.physical_path(&top));
-        assert_trees_equal(&dep, &destination.physical_path(&dep));
+        // The whole drv closure landed, including the upstream-signed input.
+        assert_trees_equal(&drv, &destination.physical_path(&drv));
+        assert_trees_equal(
+            &signed_reference,
+            &destination.physical_path(&signed_reference),
+        );
 
         // Prefetched paths count as accessed (GC liveness).
         let accessed = substituter.access_log.snapshot();
-        assert!(accessed.contains(&path_hash_of(&top)));
-        assert!(accessed.contains(&path_hash_of(&dep)));
+        assert!(accessed.contains(&path_hash_of(&drv)));
+        assert!(accessed.contains(&path_hash_of(&signed_reference)));
 
         // Unknown roots are a 404, not a partial stream.
         let miss = substituter
