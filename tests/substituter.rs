@@ -612,6 +612,51 @@ async fn evicted_pack_turns_nar_requests_into_404() {
 }
 
 #[tokio::test]
+async fn evicted_pack_negative_caches_narinfo() {
+    timed(async {
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let fixture = store.add_fixture("neg-cache", 87);
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let substituter = RunningSubstituter::start(&fake, &http, &store).await;
+
+        let pack_hash = *manifest.packs.keys().next().expect("one pack uploaded");
+        fake.evict(&http, &pack_cache_key(&pack_hash)).await;
+
+        // The eviction is not known yet.
+        let response = substituter.narinfo(&http, &fixture).await;
+        assert_eq!(response.status(), 200);
+        let narinfo = parse_narinfo(&response.text().await.unwrap());
+
+        // The NAR request discovers the evicted pack ...
+        let response = substituter.get(&http, &narinfo["URL"]).await;
+        assert_eq!(response.status(), 404);
+
+        // ... and from now on the narinfo misses too.
+        let response = substituter.narinfo(&http, &fixture).await;
+        assert_eq!(
+            response.status(),
+            404,
+            "narinfo must miss once the pack is known to be evicted"
+        );
+
+        // A manifest replacement resets the negative cache.
+        substituter.manifest.set(manifest.clone());
+        let response = substituter.narinfo(&http, &fixture).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "a fresh manifest must clear the negative cache"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn narinfo_hits_join_the_root_at_next_drain() {
     timed(async {
         let Some(store) = ScratchStore::create() else {
