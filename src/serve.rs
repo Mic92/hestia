@@ -41,12 +41,17 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+/// Upper bound on `pack-*` entries the startup pack verification pages
+/// through (10 REST calls at 100 per page). The 10 GB repo quota over the
+/// 64 MiB pack target keeps real repositories well below this.
+const MAX_PACK_VERIFY_ENTRIES: u64 = 1000;
+
 use crate::cli::ServeArgs;
 use crate::gha::twirp::TwirpClient;
 use crate::pathinfo::StoreDatabase;
 use crate::pipeline::{self, AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
 use crate::protocol::{DrainStats, Request, Response, encode_line};
-use crate::substituter::{ManifestStore, Substituter};
+use crate::substituter::{ManifestStore, Substituter, verify_packs};
 use crate::upstream::UpstreamFilter;
 
 /// How often the idle-exit timer checks for inactivity.
@@ -694,6 +699,12 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             };
             wait_for_manifest_version(&manifest_store, min_version, reload).await;
             let _ = manifest_ready_tx.send(true);
+            // Only with a GITHUB_TOKEN (optional: build jobs need no
+            // permissions); without one the NAR handler's lazy negative
+            // cache still catches evictions, one failed request later.
+            if let Ok(rest) = crate::gha::rest::RestClient::from_env(http.clone()) {
+                verify_packs(&rest, &manifest_store, MAX_PACK_VERIFY_ENTRIES).await;
+            }
         })
     };
 

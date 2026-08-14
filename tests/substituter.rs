@@ -15,7 +15,7 @@ use std::time::Duration;
 use hestia::chunker::pack_cache_key;
 use hestia::manifest::{Hash32, Manifest, PathHash};
 use hestia::pipeline::{AccessLog, now_unix};
-use hestia::substituter::{ManifestStore, Substituter};
+use hestia::substituter::{ManifestStore, Substituter, verify_packs};
 
 use support::common::{TEST_ROOT_KEY, pipeline_context, store_entry, to_path_set};
 use support::fake_gha::FakeGha;
@@ -651,6 +651,47 @@ async fn evicted_pack_negative_caches_narinfo() {
             response.status(),
             200,
             "a fresh manifest must clear the negative cache"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn eager_pack_verification_marks_evicted_packs_upfront() {
+    timed(async {
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let fixture = store.add_fixture("eager-verify", 91);
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let substituter = RunningSubstituter::start(&fake, &http, &store).await;
+
+        // One pack listed, zero threshold: verification must bail out
+        // without marking anything.
+        verify_packs(&fake.rest(&http), &substituter.manifest, 0).await;
+        assert_eq!(
+            substituter.narinfo(&http, &fixture).await.status(),
+            200,
+            "a bailed-out verification must not mark packs missing"
+        );
+
+        let pack_hash = *manifest.packs.keys().next().expect("one pack uploaded");
+        fake.evict(&http, &pack_cache_key(&pack_hash)).await;
+
+        // The listing reveals the eviction before Nix ever asks.
+        verify_packs(&fake.rest(&http), &substituter.manifest, 1000).await;
+        assert_eq!(
+            substituter.narinfo(&http, &fixture).await.status(),
+            404,
+            "eager verification must turn the narinfo into a miss"
+        );
+        assert_eq!(
+            pack_download_count(&fake),
+            0,
+            "no pack download may have been attempted"
         );
     })
     .await;

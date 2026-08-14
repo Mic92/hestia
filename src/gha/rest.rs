@@ -393,6 +393,19 @@ impl RestClient {
     /// which makes page-numbered pagination skip and duplicate entries.
     /// `created_at` never changes, so the page boundaries stay stable.
     pub async fn list_caches(&self, key_prefix: &str) -> Result<Vec<CacheEntry>, Error> {
+        let listing = self.list_caches_bounded(key_prefix, u64::MAX).await?;
+        Ok(listing.expect("an unbounded listing never bails out"))
+    }
+
+    /// Like [`Self::list_caches`], but returns `Ok(None)` when the
+    /// server-reported `total_count` exceeds `max_total`. The counter is
+    /// only a bail-out heuristic; termination still uses the short-page
+    /// rule below.
+    pub async fn list_caches_bounded(
+        &self,
+        key_prefix: &str,
+        max_total: u64,
+    ) -> Result<Option<Vec<CacheEntry>>, Error> {
         let url = self.caches_url();
         let mut entries = Vec::new();
         let mut page: u32 = 1;
@@ -407,6 +420,9 @@ impl RestClient {
                 request = request.query(&[("key", key_prefix)]);
             }
             let list: CacheList = self.send(&url, request, false).await?;
+            if list.total_count > max_total {
+                return Ok(None);
+            }
             // Termination must not depend on `total_count` ever becoming
             // consistent with the returned pages: the counter can be stale
             // or shrunk by concurrent deletions while later pages still
@@ -416,7 +432,7 @@ impl RestClient {
             let received = list.actions_caches.len();
             entries.extend(list.actions_caches);
             if received < PER_PAGE as usize {
-                return Ok(entries);
+                return Ok(Some(entries));
             }
             page += 1;
         }

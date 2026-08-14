@@ -43,6 +43,7 @@ use harmonia_store_path::StoreDir;
 use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
 
 use crate::chunker::{self, extract_chunk, flatten_tree, nar_from_chunks, pack_cache_key};
+use crate::gha::rest::RestClient;
 use crate::gha::twirp::{DownloadUrl, TwirpClient};
 use crate::gha::{Error as GhaError, blob};
 use crate::manifest::{
@@ -590,6 +591,48 @@ fn chunks_in_range<'a>(
         .take_while(move |(offset, ..)| *offset < range.end)
         .filter(move |(offset, size, _)| offset + u64::from(*size) <= range.end)
         .copied()
+}
+
+/// Mark manifest packs missing from one REST listing of `pack-*` entries
+/// as evicted. Bails out above `max_entries`: a partial listing can prove
+/// presence but never absence. Errors are logged, not fatal: the NAR
+/// handler's lazy negative cache remains the backstop.
+pub async fn verify_packs(rest: &RestClient, store: &ManifestStore, max_entries: u64) {
+    // One view for the whole comparison: marks must land on the same
+    // manifest generation the listing was compared against.
+    let view = store.view();
+    if view.pack_index.is_empty() {
+        return;
+    }
+    let listed = match rest.list_caches_bounded("pack-", max_entries).await {
+        Ok(Some(entries)) => entries,
+        Ok(None) => {
+            eprintln!(
+                "hestia substituter: more than {max_entries} pack entries in the cache; \
+                 skipping upfront pack verification"
+            );
+            return;
+        }
+        Err(err) => {
+            eprintln!("hestia substituter: upfront pack verification failed: {err}");
+            return;
+        }
+    };
+    let present: BTreeSet<&str> = listed.iter().map(|entry| entry.key.as_str()).collect();
+    let mut evicted = 0usize;
+    for pack in view.pack_index.keys() {
+        if !present.contains(pack_cache_key(pack).as_str()) {
+            view.mark_pack_missing(*pack);
+            evicted += 1;
+        }
+    }
+    if evicted > 0 {
+        eprintln!(
+            "hestia substituter: {evicted} of {} packs the manifest references were \
+             evicted from the cache; their paths will be rebuilt or fetched upstream",
+            view.pack_index.len()
+        );
+    }
 }
 
 /// Reloads the served manifest from the cache backend (the daemon wires
