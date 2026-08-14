@@ -42,7 +42,9 @@ from the cache instead of rebuilding.
 
 Build jobs need no extra permissions: cache uploads authenticate with the
 runner-injected `ACTIONS_RUNTIME_TOKEN`, which the `permissions:` block
-does not scope.
+does not scope. Granting `actions: read` additionally lets the daemon
+check upfront which cached packs GitHub has evicted, so affected paths
+are rebuilt without a failed download attempt first.
 
 You will also want a daily GC workflow on the default branch to stay within
 the cache quota; copy [`.github/workflows/gc.yml`](.github/workflows/gc.yml)

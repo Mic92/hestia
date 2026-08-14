@@ -27,7 +27,8 @@ inputs:
   github-token:
     description: >
       Token for the attestation API lookup that verifies downloaded release
-      binaries.
+      binaries, and for the daemon's upfront check which cached packs were
+      evicted (needs `actions: read`; skipped without it).
     required: false
     default: ${{ github.token }}
   listen:
