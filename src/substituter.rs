@@ -111,9 +111,38 @@ struct ManifestView {
     /// SaveMutable index this manifest was loaded from / committed as
     /// (0 = unknown or no manifest yet).
     version: u64,
+    /// Packs observed to be evicted from the cache. Affected paths 404
+    /// already at narinfo time. Lives inside the view so every manifest
+    /// replacement starts from an empty set.
+    missing_packs: Mutex<BTreeSet<PackHash>>,
 }
 
 impl ManifestView {
+    fn mark_pack_missing(&self, pack: PackHash) {
+        self.missing_packs
+            .lock()
+            .expect("missing pack set poisoned")
+            .insert(pack);
+    }
+
+    /// Whether no chunk of `entry` lives in a known-missing pack. The
+    /// chunk walk only runs after an eviction was actually observed.
+    fn entry_available(&self, entry: &PathEntry) -> bool {
+        let missing = self
+            .missing_packs
+            .lock()
+            .expect("missing pack set poisoned");
+        if missing.is_empty() {
+            return true;
+        }
+        entry_chunks(entry).iter().all(|chunk| {
+            self.manifest
+                .chunks
+                .get(chunk)
+                .is_none_or(|location| !missing.contains(&location.pack))
+        })
+    }
+
     fn new(manifest: Manifest, version: u64) -> Self {
         let by_nar_hash = manifest
             .paths
@@ -143,6 +172,7 @@ impl ManifestView {
             by_nar_hash,
             pack_index,
             version,
+            missing_packs: Mutex::new(BTreeSet::new()),
         }
     }
 }
@@ -722,6 +752,13 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    // A needed pack is evicted: miss, so Nix falls through instead of
+    // attempting a doomed copy. No access recorded: an unservable path
+    // must not join the GC root.
+    if !view.entry_available(entry) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     // A narinfo hit is the liveness signal: the accessed path joins this
     // run's GC root at the next drain.
     state.access_log.record(path_hash);
@@ -814,6 +851,10 @@ async fn nar(
                 }
             }
             Err(err) => {
+                // Later narinfos for paths in this pack miss upfront.
+                if let FetchError::PackUnavailable(pack) = err {
+                    manifest_view.mark_pack_missing(pack);
+                }
                 eprintln!("hestia substituter: cannot serve NAR for {path_hash}: {err}");
                 return StatusCode::NOT_FOUND.into_response();
             }
