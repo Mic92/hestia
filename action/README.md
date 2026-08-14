@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: write        # needed to write to the GHA cache
+      actions: read         # optional: detect evicted cache entries upfront
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
@@ -99,6 +99,10 @@ The job needs:
 
 ```yaml
 permissions:
-  actions: write    # GHA cache writes (uploads) and deletes (GC)
   contents: read
+  actions: read     # optional: detect evicted cache entries upfront
 ```
+
+Cache uploads need no scope: they authenticate with the runner-injected
+`ACTIONS_RUNTIME_TOKEN`. Only the GC workflow's cache deletes need
+`actions: write`.

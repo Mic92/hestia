@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read # optional: detect evicted cache entries upfront
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
@@ -40,11 +41,11 @@ jobs:
 Everything built in your workflow gets cached; later runs (and PRs) pull
 from the cache instead of rebuilding.
 
-Build jobs need no extra permissions: cache uploads authenticate with the
-runner-injected `ACTIONS_RUNTIME_TOKEN`, which the `permissions:` block
-does not scope. Granting `actions: read` additionally lets the daemon
-check upfront which cached packs GitHub has evicted, so affected paths
-are rebuilt without a failed download attempt first.
+Build jobs need no extra permissions for the cache itself: uploads
+authenticate with the runner-injected `ACTIONS_RUNTIME_TOKEN`, which the
+`permissions:` block does not scope. The optional `actions: read` lets
+the daemon check upfront which cached packs GitHub has evicted, so
+affected paths are rebuilt without a failed download attempt first.
 
 You will also want a daily GC workflow on the default branch to stay within
 the cache quota; copy [`.github/workflows/gc.yml`](.github/workflows/gc.yml)
