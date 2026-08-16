@@ -28,6 +28,7 @@ tokio = { version = "1", features = [
   "time",
   "sync",
   "io-util",
+  "process",
 ] }
 
 # Accept-loop errno classification (unix sockets are unix-only anyway)

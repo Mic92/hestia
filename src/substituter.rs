@@ -17,6 +17,8 @@
 //!   (comma-separated), restricted to manifest members, streamed in
 //!   `nix-store --export` format for a one-request prefetch via
 //!   `nix-store --import`.
+//! * `GET /closure/{hashes}/external-references` — references required by
+//!   that export but omitted from the manifest, one store path per line.
 //!
 //! A semaphore caps concurrent pack reads so parallel narinfo queries
 //! from Nix (`WantMassQuery: 1`) do not flood the GHA cache API.
@@ -722,6 +724,10 @@ impl Substituter {
             .route("/{file}", get(narinfo))
             .route("/nar/{file}", get(nar))
             .route("/closure/{hashes}", get(closure))
+            .route(
+                "/closure/{hashes}/external-references",
+                get(closure_external_references),
+            )
             .with_state(state)
     }
 
@@ -1072,6 +1078,17 @@ fn closure_order(manifest: &Manifest, roots: &[PathHash]) -> Vec<PathHash> {
     order
 }
 
+fn closure_roots(manifest: &Manifest, hashes: &str) -> Option<Vec<PathHash>> {
+    let roots: Vec<PathHash> = hashes
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    (!roots.is_empty() && roots.iter().all(|root| manifest.paths.contains_key(root)))
+        .then_some(roots)
+}
+
 /// Fetch and frame one window of a closure export.
 async fn export_window(
     state: &Substituter,
@@ -1116,23 +1133,12 @@ async fn closure(State(state): State<Arc<Substituter>>, Path(hashes): Path<Strin
     let _activity = state.touch();
     state.manifest_ready().await;
 
-    let mut roots = Vec::new();
-    for part in hashes.split(',').filter(|part| !part.is_empty()) {
-        match part.parse::<PathHash>() {
-            Ok(hash) => roots.push(hash),
-            Err(_) => return StatusCode::NOT_FOUND.into_response(),
-        }
-    }
     let view = state.manifest.view();
     // Every requested root must be servable; a partial closure would make
     // the import succeed and the subsequent build fail confusingly.
-    if roots.is_empty()
-        || !roots
-            .iter()
-            .all(|root| view.manifest.paths.contains_key(root))
-    {
+    let Some(roots) = closure_roots(&view.manifest, &hashes) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
     let order = closure_order(&view.manifest, &roots);
 
     // Stream the closure in windows: each window's chunks are fetched as
@@ -1169,6 +1175,31 @@ async fn closure(State(state): State<Arc<Substituter>>, Path(hashes): Path<Strin
         axum::body::Body::from_stream(stream),
     )
         .into_response()
+}
+
+async fn closure_external_references(
+    State(state): State<Arc<Substituter>>,
+    Path(hashes): Path<String>,
+) -> Result<String, StatusCode> {
+    let _activity = state.touch();
+    state.manifest_ready().await;
+
+    let view = state.manifest.view();
+    let roots = closure_roots(&view.manifest, &hashes).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(closure_order(&view.manifest, &roots)
+        .into_iter()
+        .flat_map(|hash| view.manifest.paths[&hash].references.iter())
+        .filter(|reference| {
+            !view
+                .manifest
+                .paths
+                .contains_key(&PathHash::from_store_path(reference))
+        })
+        .map(|reference| format!("{}/{reference}", state.store_dir))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 #[cfg(test)]
