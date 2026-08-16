@@ -356,6 +356,9 @@ function serveFlags() {
   for (const name of getInput('upstream-cache-key-names').split(/\s+/).filter(Boolean)) {
     flags.push('--upstream-cache-key-name', name);
   }
+  if (getInput('filter-drv-closures') === 'true') {
+    flags.push('--filter-drv-closures');
+  }
   if (getInput('no-closure') === 'true') {
     flags.push('--no-closure');
   }

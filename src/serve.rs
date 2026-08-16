@@ -599,6 +599,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         store,
         upstream,
         expand_closure: !args.no_closure,
+        filter_drv_closures: args.filter_drv_closures,
         root_key: root_key.clone(),
         run_id: std::env::var("GITHUB_RUN_ID")
             .ok()
