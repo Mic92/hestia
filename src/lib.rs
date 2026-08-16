@@ -12,6 +12,7 @@ pub mod gha;
 pub mod hook;
 pub mod matrix;
 pub mod pipeline;
+pub mod prefetch;
 pub mod serve;
 pub mod substituter;
 pub mod upstream;
