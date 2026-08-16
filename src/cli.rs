@@ -22,6 +22,8 @@ pub enum Command {
     /// Evaluate a flake with nix-eval-jobs and emit a GitHub Actions build
     /// matrix (drv closures registered for upload).
     Matrix(MatrixArgs),
+    /// Fetch a cached closure and prepare its external references.
+    Prefetch(PrefetchArgs),
     /// Send $OUT_PATHS from a Nix post-build-hook to the daemon.
     Hook(HookArgs),
     /// Tell the daemon to upload pending paths and commit the manifest.
@@ -70,6 +72,11 @@ pub struct ServeArgs {
     )]
     pub upstream_cache_key_names: Vec<String>,
 
+    /// Apply --upstream-cache-filter to registered derivation closures.
+    /// Use `hestia prefetch` to retain bulk closure fetching.
+    #[arg(long, requires = "upstream_cache_filter")]
+    pub filter_drv_closures: bool,
+
     /// Push built paths only; do not expand them to their runtime closure.
     #[arg(long)]
     pub no_closure: bool,
@@ -116,6 +123,18 @@ pub struct MatrixArgs {
     /// Maximum time to wait for the drv upload to finish, in seconds.
     #[arg(long, value_name = "SECONDS", default_value_t = 300)]
     pub drain_timeout: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct PrefetchArgs {
+    /// Address of the running Hestia server
+    /// [default: $HESTIA_LISTEN, or 127.0.0.1:37515].
+    #[arg(long)]
+    pub listen: Option<String>,
+
+    /// Store paths to prefetch; `<drvPath>^*` installables are accepted.
+    #[arg(required = true, value_name = "STORE_PATH")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -184,6 +203,7 @@ mod tests {
         assert_eq!(args.branch, None);
         assert_eq!(args.system, None);
         assert!(!args.upstream_cache_filter);
+        assert!(!args.filter_drv_closures);
         assert!(!args.no_closure);
         assert_eq!(args.upstream_cache_key_names, vec!["cache.nixos.org-1"]);
         assert_eq!(
@@ -209,6 +229,7 @@ mod tests {
             "cache.nixos.org-1",
             "--upstream-cache-key-name",
             "company-cache-1",
+            "--filter-drv-closures",
             "--no-closure",
             "--db-path",
             "/custom/db.sqlite",
@@ -222,6 +243,7 @@ mod tests {
         assert_eq!(args.branch.as_deref(), Some("main"));
         assert_eq!(args.system.as_deref(), Some("riscv64-linux"));
         assert!(args.upstream_cache_filter);
+        assert!(args.filter_drv_closures);
         assert!(args.no_closure);
         assert_eq!(
             args.upstream_cache_key_names,
@@ -246,6 +268,11 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn filtering_drv_closures_requires_the_filter_flag() {
+        assert!(Cli::try_parse_from(["hestia", "serve", "--filter-drv-closures"]).is_err());
     }
 
     #[test]

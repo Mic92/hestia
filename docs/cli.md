@@ -15,8 +15,21 @@ setups, or hacking on hestia).
 | `--system <SYSTEM>` | detected | Nix system part of the root key (e.g. `x86_64-linux`). |
 | `--upstream-cache-filter` | off | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
 | `--upstream-cache-key-name <KEY_NAME>` | `cache.nixos.org-1` | Key names treated as upstream caches by the filter. Repeatable. |
+| `--filter-drv-closures` | off | Apply the upstream filter to registered derivation closures. Requires `--upstream-cache-filter`; use `hestia prefetch` to retain bulk closure fetching. |
 | `--no-closure` | off | Cache built paths only, without their runtime closure. |
 | `--db-path <PATH>` | `/nix/var/nix/db/db.sqlite` | Nix store database to read path metadata from. |
+
+## `hestia prefetch` — bulk drv closure fetch
+
+Prepares references omitted by `--filter-drv-closures` through the runner's
+configured Nix substituters, then imports the Hestia-backed closure in one
+request. It accepts the `<drvPath>^*` values emitted by `hestia matrix` and
+requires Nix 2.15 or newer.
+
+| Flag / argument | Default | Description |
+|---|---|---|
+| `--listen <ADDR>` | `$HESTIA_LISTEN`, else `127.0.0.1:37515` | Running Hestia server address. |
+| `<STORE_PATH>...` | — | Store paths or `<drvPath>^*` installables to prefetch. |
 
 ## `hestia hook` — post-build-hook client
 
@@ -55,4 +68,5 @@ Always exits 0 (a failing post-build-hook would fail the build).
 | `GITHUB_API_URL` | gc | REST API base URL (override for GHES). |
 | `GITHUB_REF_NAME` | serve | Default for `--branch`. |
 | `GITHUB_RUN_ID` | serve | Roots written by the same workflow run merge by union (matrix legs); different runs replace each other's root. |
+| `HESTIA_LISTEN` | prefetch | Address exported by the action for the running Hestia server. |
 | `OUT_PATHS` | hook | Set by Nix when invoking the post-build-hook. |

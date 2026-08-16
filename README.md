@@ -98,10 +98,7 @@ jobs:
         with:
           wait-manifest-version: ${{ needs.eval.outputs.manifest-version }}
       - name: Prefetch drv closure
-        run: |
-          hashes=$(printf '%s\n' ${{ matrix.installables }} |
-            awk -F/ '{printf "%s%s", (NR > 1 ? "," : ""), substr($NF, 1, 32)}')
-          curl -fsS "http://$HESTIA_LISTEN/closure/$hashes" | nix-store --import
+        run: "$HESTIA_BIN" prefetch ${{ matrix.installables }}
       - run: nix build -L ${{ matrix.installables }}
 ```
 
@@ -117,12 +114,13 @@ checks.x86_64-linux.mycheck = pkgs.hello.overrideAttrs (old: {
 });
 ```
 
-The prefetch step pulls the whole drv closure with one request
-(`GET /closure/<hash>[,<hash>]` streams it in `nix-store --export`
-format, references first; unknown roots return 404) instead of letting
-`nix build` substitute thousands of paths one narinfo+NAR round trip at
-a time. Importing unsigned paths requires the calling user to be a Nix
-trusted user, which the default GitHub runner setup already is.
+The prefetch step prepares any references omitted by the upstream filter,
+then pulls the Hestia-backed part of the drv closure with one request
+(`GET /closure/<hash>[,<hash>]` streams it in `nix-store --export` format,
+references first; unknown roots return 404). This keeps the Hestia-backed paths
+from being substituted one narinfo+NAR round trip at a time.
+Importing unsigned paths requires the calling user to be a Nix trusted user,
+which the default GitHub runner setup already is.
 
 Notes:
 
@@ -135,6 +133,10 @@ Notes:
   `upstream-cache-filter` so `/closure` exports remain importable into a
   fresh store. Their inputs, including upstream-signed sources, therefore
   count against the cache quota.
+* To filter these closures, enable `upstream-cache-filter` in both jobs and
+  `filter-drv-closures` in the eval job, then use `hestia prefetch` in build
+  jobs. Direct `/closure` imports cannot prepare omitted references, and
+  existing entries remain until no cached drv references them.
 * Each matrix row also carries `attr`, so `nix build .#${{ matrix.attr }}`
   works as a per-job-eval fallback.
 * GitHub limits a matrix to 256 jobs and a step output to 1 MB.
@@ -216,6 +218,7 @@ All inputs are optional; the defaults work for the quick start above.
 | `drain-timeout` | `300` | Seconds the post-job step waits for the final upload. |
 | `upstream-cache-filter` | `false` | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
 | `upstream-cache-key-names` | `cache.nixos.org-1` | Space-separated key names treated as upstream caches by the filter. |
+| `filter-drv-closures` | `false` | Apply the upstream filter to registered derivation closures; requires `upstream-cache-filter`. Use `hestia prefetch` for bulk closure fetching. |
 | `no-closure` | `false` | Cache built paths only, without their runtime closure. |
 
 The GC workflow takes one input: `dry-run` (plan only, delete nothing); see
