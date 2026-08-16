@@ -98,10 +98,7 @@ jobs:
         with:
           wait-manifest-version: ${{ needs.eval.outputs.manifest-version }}
       - name: Prefetch drv closure
-        run: |
-          hashes=$(printf '%s\n' ${{ matrix.installables }} |
-            awk -F/ '{printf "%s%s", (NR > 1 ? "," : ""), substr($NF, 1, 32)}')
-          curl -fsS "http://$HESTIA_LISTEN/closure/$hashes" | nix-store --import
+        run: "$HESTIA_BIN" prefetch ${{ matrix.installables }}
       - run: nix build -L ${{ matrix.installables }}
 ```
 
@@ -117,12 +114,13 @@ checks.x86_64-linux.mycheck = pkgs.hello.overrideAttrs (old: {
 });
 ```
 
-The prefetch step pulls the whole drv closure with one request
-(`GET /closure/<hash>[,<hash>]` streams it in `nix-store --export`
-format, references first; unknown roots return 404) instead of letting
-`nix build` substitute thousands of paths one narinfo+NAR round trip at
-a time. Importing unsigned paths requires the calling user to be a Nix
-trusted user, which the default GitHub runner setup already is.
+The prefetch step prepares any references omitted by the upstream filter,
+then pulls the Hestia-backed part of the drv closure with one request
+(`GET /closure/<hash>[,<hash>]` streams it in `nix-store --export` format,
+references first; unknown roots return 404). This keeps the Hestia-backed paths
+from being substituted one narinfo+NAR round trip at a time.
+Importing unsigned paths requires the calling user to be a Nix trusted user,
+which the default GitHub runner setup already is.
 
 Notes:
 
