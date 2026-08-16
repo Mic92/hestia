@@ -72,6 +72,11 @@ pub struct ServeArgs {
     )]
     pub upstream_cache_key_names: Vec<String>,
 
+    /// Apply --upstream-cache-filter to registered derivation closures.
+    /// Use `hestia prefetch` to retain bulk closure fetching.
+    #[arg(long, requires = "upstream_cache_filter")]
+    pub filter_drv_closures: bool,
+
     /// Push built paths only; do not expand them to their runtime closure.
     #[arg(long)]
     pub no_closure: bool,
@@ -198,6 +203,7 @@ mod tests {
         assert_eq!(args.branch, None);
         assert_eq!(args.system, None);
         assert!(!args.upstream_cache_filter);
+        assert!(!args.filter_drv_closures);
         assert!(!args.no_closure);
         assert_eq!(args.upstream_cache_key_names, vec!["cache.nixos.org-1"]);
         assert_eq!(
@@ -223,6 +229,7 @@ mod tests {
             "cache.nixos.org-1",
             "--upstream-cache-key-name",
             "company-cache-1",
+            "--filter-drv-closures",
             "--no-closure",
             "--db-path",
             "/custom/db.sqlite",
@@ -236,6 +243,7 @@ mod tests {
         assert_eq!(args.branch.as_deref(), Some("main"));
         assert_eq!(args.system.as_deref(), Some("riscv64-linux"));
         assert!(args.upstream_cache_filter);
+        assert!(args.filter_drv_closures);
         assert!(args.no_closure);
         assert_eq!(
             args.upstream_cache_key_names,
@@ -260,6 +268,11 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn filtering_drv_closures_requires_the_filter_flag() {
+        assert!(Cli::try_parse_from(["hestia", "serve", "--filter-drv-closures"]).is_err());
     }
 
     #[test]

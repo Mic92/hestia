@@ -46,6 +46,7 @@ pub fn pipeline_context_with(
         store,
         upstream: UpstreamFilter::default(),
         expand_closure: true,
+        filter_drv_closures: false,
         root_key: TEST_ROOT_KEY.to_string(),
         run_id: Some("test-run".to_string()),
         manifest_prefix: MANIFEST_PREFIX.to_string(),

@@ -15,12 +15,13 @@ setups, or hacking on hestia).
 | `--system <SYSTEM>` | detected | Nix system part of the root key (e.g. `x86_64-linux`). |
 | `--upstream-cache-filter` | off | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
 | `--upstream-cache-key-name <KEY_NAME>` | `cache.nixos.org-1` | Key names treated as upstream caches by the filter. Repeatable. |
+| `--filter-drv-closures` | off | Apply the upstream filter to registered derivation closures. Requires `--upstream-cache-filter`; use `hestia prefetch` to retain bulk closure fetching. |
 | `--no-closure` | off | Cache built paths only, without their runtime closure. |
 | `--db-path <PATH>` | `/nix/var/nix/db/db.sqlite` | Nix store database to read path metadata from. |
 
 ## `hestia prefetch` — bulk drv closure fetch
 
-Prepares references omitted from the Hestia manifest through the runner's
+Prepares references omitted by `--filter-drv-closures` through the runner's
 configured Nix substituters, then imports the Hestia-backed closure in one
 request. It accepts the `<drvPath>^*` values emitted by `hestia matrix` and
 requires Nix 2.15 or newer.

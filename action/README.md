@@ -83,6 +83,7 @@ integration tests use it.
 | `drain-timeout` | `300` | Seconds the post-job step waits for the final upload. |
 | `upstream-cache-filter` | `false` | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
 | `upstream-cache-key-names` | `cache.nixos.org-1` | Space-separated key names treated as upstream caches by the filter. |
+| `filter-drv-closures` | `false` | Apply the upstream filter to registered derivation closures; requires `upstream-cache-filter`. Use `hestia prefetch` for bulk closure fetching. |
 | `no-closure` | `false` | Cache built paths only, without their runtime closure. |
 
 ## Garbage collection

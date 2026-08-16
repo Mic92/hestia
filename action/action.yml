@@ -62,6 +62,13 @@ inputs:
       `upstream-cache-filter`.
     required: false
     default: ""
+  filter-drv-closures:
+    description: >
+      Apply upstream-cache-filter to registered derivation closures. Requires
+      `upstream-cache-filter`; use `hestia prefetch` to retain bulk closure
+      fetching.
+    required: false
+    default: "false"
   no-closure:
     description: >
       Cache built paths only, without their runtime closure (dependencies
