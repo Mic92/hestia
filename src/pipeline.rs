@@ -5,9 +5,9 @@
 //! 1. Query path info from the store database for every buffered path,
 //!    expanded to its runtime closure unless disabled.
 //! 2. Filter: invalid paths, upstream-signed paths (when the upstream
-//!    cache filter is enabled, except for derivation closures used by the
-//!    closure API), paths already in the manifest (those get their
-//!    `last_pushed` clock bumped instead).
+//!    cache filter is enabled; derivation closures bypass it unless
+//!    explicitly configured otherwise), paths already in the manifest
+//!    (those get their `last_pushed` clock bumped instead).
 //! 3. Chunk each new path (FastCDC over NAR events) and verify the chunked
 //!    representation reproduces the NAR hash recorded by Nix.
 //! 4. Pack new chunks, upload the pack (Twirp reserve → Azure PUT →
@@ -215,6 +215,9 @@ pub struct PipelineContext {
     /// Substituted dependencies never trigger the post-build-hook, so
     /// without expansion they are never cached.
     pub expand_closure: bool,
+    /// Apply the upstream filter to derivation closure members instead of
+    /// keeping those closures self-contained.
+    pub filter_drv_closures: bool,
     /// Manifest root key, e.g. `main-x86_64-linux`.
     pub root_key: String,
     /// Workflow run id (`$GITHUB_RUN_ID`); see [`Root::merge`].
@@ -328,10 +331,9 @@ impl PipelineContext {
         // Blocking sqlite I/O happens off the async runtime.
         let store = self.store.clone();
         let expand_closure = self.expand_closure;
+        let filter_drv_closures = self.filter_drv_closures;
         let (lookups, upstream_filter_bypass) = tokio::task::spawn_blocking(move || {
-            // Matrix prefetch requires registered `.drv` closures to be
-            // self-contained, so their members bypass the upstream filter.
-            let bypass_roots: BTreeSet<String> = if expand_closure {
+            let bypass_roots: BTreeSet<String> = if expand_closure && !filter_drv_closures {
                 paths
                     .iter()
                     .filter(|path| path.ends_with(".drv"))

@@ -440,8 +440,9 @@ async fn drv_closure_bypasses_upstream_filter_and_imports_into_a_fresh_store() {
         };
         let signed_reference = store.store_dir_path().join(
             references
-                .first()
-                .expect("drv must have an input reference")
+                .iter()
+                .find(|reference| reference.to_string().ends_with(".drv"))
+                .expect("drv must have an input derivation")
                 .to_string(),
         );
         store.sign_path(&signed_reference, "cache.nixos.org-1");
@@ -514,6 +515,69 @@ async fn drv_closure_bypasses_upstream_filter_and_imports_into_a_fresh_store() {
             .get(&http, "closure/00000000000000000000000000000000")
             .await;
         assert_eq!(miss.status(), 404);
+
+        let filtered_fake = FakeGha::start().await;
+        let filtered_ctx = hestia::pipeline::PipelineContext {
+            filter_drv_closures: true,
+            ..pipeline_context(&filtered_fake, &http, store.database())
+        };
+        let stats = filtered_ctx
+            .run(
+                to_path_set(&[&drv, &unrelated_upstream]),
+                BTreeSet::new(),
+                now_unix(),
+            )
+            .await
+            .expect("pipeline run failed");
+        assert_eq!(stats.skipped_upstream, 2);
+
+        let filtered_substituter = RunningSubstituter::start(&filtered_fake, &http, &store).await;
+        let external_references = filtered_substituter
+            .get(
+                &http,
+                &format!("closure/{}/external-references", path_hash_str(&drv)),
+            )
+            .await;
+        assert_eq!(external_references.status(), 200);
+        assert_eq!(
+            external_references.text().await.unwrap(),
+            signed_reference.display().to_string()
+        );
+
+        let filtered_destination = store.create_destination();
+        let installable = format!(
+            "/nix/store/{}^*",
+            drv.file_name().unwrap().to_string_lossy()
+        );
+        let nix_config = format!(
+            "experimental-features = nix-command\nsubstitute = true\nsubstituters = {}\nrequire-sigs = false\n",
+            substituter.store_url
+        );
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_hestia"))
+            .arg("prefetch")
+            .arg("--listen")
+            .arg(
+                filtered_substituter
+                    .base_url
+                    .strip_prefix("http://")
+                    .unwrap(),
+            )
+            .arg(installable)
+            .env("NIX_REMOTE", &filtered_destination.uri)
+            .env("NIX_CONFIG", nix_config)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "hestia prefetch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_trees_equal(&drv, &filtered_destination.physical_path(&drv));
+        assert_trees_equal(
+            &signed_reference,
+            &filtered_destination.physical_path(&signed_reference),
+        );
     })
     .await;
 }
