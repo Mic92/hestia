@@ -16,6 +16,7 @@ setups, or hacking on hestia).
 | `--upstream-cache-filter` | off | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
 | `--upstream-cache-key-name <KEY_NAME>` | `cache.nixos.org-1` | Key names treated as upstream caches by the filter. Repeatable. |
 | `--filter-drv-closures` | off | Apply the upstream filter to registered derivation closures. Requires `--upstream-cache-filter`; use `hestia prefetch` to retain bulk closure fetching. |
+| `--read-only` | off | Serve the cache for substitution but never write to it (no uploads, no manifest commits). |
 | `--no-closure` | off | Cache built paths only, without their runtime closure. |
 | `--db-path <PATH>` | `/nix/var/nix/db/db.sqlite` | Nix store database to read path metadata from. |
 

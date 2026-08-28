@@ -588,8 +588,9 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         .unwrap_or_else(|| "local".to_string());
     let system = args.system.clone().unwrap_or_else(pipeline::current_system);
 
-    // Set by the write probe spawned once the listeners are bound (below).
-    let read_only = Arc::new(AtomicBool::new(false));
+    // Explicit via --read-only, else set by the write probe spawned once
+    // the listeners are bound (below).
+    let read_only = Arc::new(AtomicBool::new(args.read_only));
 
     let store_dir = store.store_dir().clone();
     let root_key = pipeline::root_key(&branch, &system);
@@ -715,7 +716,9 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     // cannot delay readiness; it resolves long before the post-step drain.
     // An unreachable cache is inconclusive: stay writable and let the real
     // drain surface any genuine failure.
-    {
+    if args.read_only {
+        eprintln!("hestia serve: read-only mode; nothing will be written to the cache");
+    } else {
         let twirp = twirp.clone();
         let read_only = read_only.clone();
         tokio::spawn(async move {
