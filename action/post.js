@@ -28,11 +28,17 @@ function main() {
 
   const socket = getState('socket');
   const timeout = getState('drainTimeout') || '300';
+  const readOnly = getState('readOnly') === 'true';
 
-  console.log('hestia-cache: draining (uploading built paths, committing the manifest)');
-  const drain = spawnSync(binary, ['drain', '--socket', socket, '--timeout', timeout], {
-    stdio: 'inherit',
-  });
+  let drain = { status: 0 };
+  if (readOnly) {
+    console.log('hestia-cache: read-only mode; skipping drain');
+  } else {
+    console.log('hestia-cache: draining (uploading built paths, committing the manifest)');
+    drain = spawnSync(binary, ['drain', '--socket', socket, '--timeout', timeout], {
+      stdio: 'inherit',
+    });
+  }
   if (drain.error) {
     // spawnSync does not throw on launch failures (e.g. ENOENT when the
     // temp dir was cleaned mid-job); without this the only output is the

@@ -70,6 +70,13 @@ inputs:
       fetching.
     required: false
     default: "false"
+  read-only:
+    description: >
+      Substitute from the cache but never write to it: no post-build-hook,
+      no drain, and the daemon refuses uploads. For jobs that should only
+      consume what a central job cached.
+    required: false
+    default: "false"
   no-closure:
     description: >
       Cache built paths only, without their runtime closure (dependencies

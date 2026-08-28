@@ -79,6 +79,41 @@ impl RunningDaemon {
     }
 }
 
+/// Read-only mode (`serve --read-only` or a read-only token): hooked and
+/// accessed paths never reach the cache, neither via an explicit drain nor
+/// via the final drain at shutdown.
+#[tokio::test]
+async fn read_only_daemon_never_writes() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let fixture = store.add_fixture("read-only", 47);
+
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let daemon = RunningDaemon::start(
+        store_socket_path(&store),
+        None,
+        PipelineContext {
+            read_only: std::sync::Arc::new(true.into()),
+            ..pipeline_context(&fake, &http, store.database())
+        },
+    )
+    .await;
+
+    daemon.add(&[&fixture]).await;
+    daemon.access_log.record(path_hash_of(&fixture));
+    let response = daemon.request(&Request::Drain).await;
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(response.stats.expect("stats").pushed, 0);
+
+    daemon.add(&[&fixture]).await;
+    let stats = daemon.stop().await.expect("final drain");
+    assert_eq!(stats.manifest_version, 0);
+    assert!(committed_manifest(&fake, &http).await.is_none());
+    assert!(fake.blob_requests().is_empty());
+}
+
 #[tokio::test]
 async fn hook_drain_status_lifecycle() {
     let Some(store) = ScratchStore::create() else {
