@@ -228,10 +228,11 @@ pub struct PipelineContext {
     /// Compressed bytes per pack ([`PACK_TARGET_SIZE`] in production; tests
     /// use small values to exercise pack splitting).
     pub pack_target_size: u64,
-    /// Runtime token has no writable cache scope (`check_run`, fork
-    /// `pull_request`); the write pipeline is skipped so a drain is a clean
-    /// no-op instead of failing at the first reservation. Set by a
-    /// background probe at startup ([`crate::serve`]).
+    /// The write pipeline is skipped so a drain is a clean no-op. Set by
+    /// `serve --read-only`, or by a background probe at startup
+    /// ([`crate::serve`]) when the runtime token has no writable cache
+    /// scope (`check_run`, fork `pull_request`) and the first reservation
+    /// would fail anyway.
     pub read_only: Arc<AtomicBool>,
     /// Where committed manifests are published for the substituter.
     ///

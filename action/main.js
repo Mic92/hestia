@@ -46,6 +46,10 @@ function getInput(name) {
   return (process.env[`INPUT_${name.toUpperCase()}`] || '').trim();
 }
 
+function readOnly() {
+  return getInput('read-only') === 'true';
+}
+
 /**
  * Save a value for this invocation's post step (the runner exposes it there
  * as STATE_<name>). Unlike exported environment variables, state is not
@@ -280,7 +284,9 @@ function writeHookShim(installDir, hestiaBin, socket) {
 function configureNix(installDir, listen, hookShim) {
   // nix has a single post-build-hook slot and our conf wins (applied last,
   // see below): warn instead of silently disabling a pre-existing hook.
-  const show = spawnSync('nix', ['config', 'show', 'post-build-hook'], { encoding: 'utf8' });
+  const show = hookShim
+    ? spawnSync('nix', ['config', 'show', 'post-build-hook'], { encoding: 'utf8' })
+    : { status: 1 };
   const previousHook = show.status === 0 ? show.stdout.trim() : '';
   if (previousHook) {
     console.log(
@@ -294,7 +300,7 @@ function configureNix(installDir, listen, hookShim) {
     conf,
     '# written by the hestia-cache action\n' +
       `extra-substituters = http://${listen}?trusted=true&priority=30\n` +
-      `post-build-hook = ${hookShim}\n` +
+      (hookShim ? `post-build-hook = ${hookShim}\n` : '') +
       'fallback = true\n' +
       // Without this, nix's on-disk narinfo cache remembers a 404 for an
       // hour: on persistent self-hosted runners the next job would skip
@@ -361,6 +367,9 @@ function serveFlags() {
   }
   if (getInput('no-closure') === 'true') {
     flags.push('--no-closure');
+  }
+  if (readOnly()) {
+    flags.push('--read-only');
   }
   const waitManifestVersion = getInput('wait-manifest-version');
   if (waitManifestVersion && waitManifestVersion !== '0') {
@@ -455,7 +464,10 @@ async function main() {
   const socket = getInput('socket') || path.join(installDir, 'hook.sock');
 
   const hestiaBin = await installBinary(installDir);
-  const hookShim = writeHookShim(installDir, hestiaBin, socket);
+  // Read-only: no post-build-hook, so nothing is registered (and chunked)
+  // in the first place. --read-only additionally makes the daemon refuse
+  // writes from other clients (hestia matrix, manual hooks, final drain).
+  const hookShim = readOnly() ? null : writeHookShim(installDir, hestiaBin, socket);
   configureNix(installDir, listen, hookShim);
   const daemonPid = startDaemon(hestiaBin, listen, socket, logFile);
   await waitForReadiness(listen, logFile, daemonPid);
@@ -474,6 +486,7 @@ async function main() {
   saveState('socket', socket);
   saveState('serveLog', logFile);
   saveState('drainTimeout', getInput('drain-timeout') || '300');
+  saveState('readOnly', readOnly() ? 'true' : '');
   saveState('daemonPid', String(daemonPid));
 }
 

@@ -81,6 +81,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_closure: bool,
 
+    /// Serve the cache for substitution but never write to it (no
+    /// uploads, no manifest commits).
+    #[arg(long)]
+    pub read_only: bool,
+
     /// Nix store database to read path metadata from.
     #[arg(long, default_value = crate::pathinfo::DEFAULT_DB_PATH)]
     pub db_path: PathBuf,
@@ -205,6 +210,7 @@ mod tests {
         assert!(!args.upstream_cache_filter);
         assert!(!args.filter_drv_closures);
         assert!(!args.no_closure);
+        assert!(!args.read_only);
         assert_eq!(args.upstream_cache_key_names, vec!["cache.nixos.org-1"]);
         assert_eq!(
             args.db_path,
@@ -231,6 +237,7 @@ mod tests {
             "company-cache-1",
             "--filter-drv-closures",
             "--no-closure",
+            "--read-only",
             "--db-path",
             "/custom/db.sqlite",
         ]);
@@ -245,6 +252,7 @@ mod tests {
         assert!(args.upstream_cache_filter);
         assert!(args.filter_drv_closures);
         assert!(args.no_closure);
+        assert!(args.read_only);
         assert_eq!(
             args.upstream_cache_key_names,
             vec![
