@@ -167,14 +167,37 @@ jobs:
           binary: ./hestia-bin/bin/hestia
           listen: 127.0.0.1:37517
           socket: /tmp/hestia-matrix/hook.sock
+          upstream-cache-filter: true
+          filter-drv-closures: true
       - name: Make the fixture derivations unique to this run
         run: |
           set -euo pipefail
           # Fresh derivations every run, so the matrix is never fully cached
           # and the build jobs below always exercise the drv-path round trip.
-          cp -r tests/fixtures/matrix-checks "$RUNNER_TEMP/matrix-checks"
-          sed -i "s/echo /echo ${{ github.run_id }}-${{ github.run_attempt }} /" \
+          mkdir -p "$RUNNER_TEMP/matrix-checks"
+          cat > "$RUNNER_TEMP/matrix-checks/flake.nix" <<'NIXEOF'
+          {
+            inputs.nixpkgs = {
+              url = "github:NixOS/nixpkgs/9fbb54b33e91ee4ca368e35a78e0613c720600b3";
+              flake = false;
+            };
+            outputs = { nixpkgs, ... }: {
+              checks.x86_64-linux.upstream-src = derivation {
+                name = "upstream-src";
+                system = "x86_64-linux";
+                builder = "/bin/sh";
+                args = [ "-c" "echo RUNID ${nixpkgs} > $out" ];
+              };
+            };
+          }
+          NIXEOF
+          sed -i "s/RUNID/${{ github.run_id }}-${{ github.run_attempt }}/" \
             "$RUNNER_TEMP/matrix-checks/flake.nix"
+          # Substitute the nixpkgs source from cache.nixos.org so it carries
+          # an upstream signature and gets filtered out of the drv closure.
+          nix-store --realise /nix/store/ww3132d3ajq53n9xx2s8mic73jk91j4r-source
+          nix path-info --sigs /nix/store/ww3132d3ajq53n9xx2s8mic73jk91j4r-source | tee /dev/stderr | grep -q cache.nixos.org-1
+          nix flake lock "path:$RUNNER_TEMP/matrix-checks"
       - id: eval
         uses: ./matrix
         with:
@@ -186,7 +209,7 @@ jobs:
           echo '${{ steps.eval.outputs.matrix }}' | jq .
           test "${{ steps.eval.outputs.any-jobs }}" = "true"
           names=$(echo '${{ steps.eval.outputs.matrix }}' | jq -r '.include[].name' | sort | paste -sd' ')
-          test "$names" = "small x86_64-linux.fast"
+          test "$names" = "x86_64-linux.upstream-src"
 
   matrix-build:
     needs: matrix-eval
@@ -217,6 +240,29 @@ jobs:
           listen: 127.0.0.1:37517
           socket: /tmp/hestia-matrix/hook.sock
           wait-manifest-version: ${{ needs.matrix-eval.outputs.manifest-version }}
+          upstream-cache-filter: true
+          filter-drv-closures: true
+      - name: Prefetch drv closure
+        run: |
+          set -euxo pipefail
+          src=/nix/store/ww3132d3ajq53n9xx2s8mic73jk91j4r-source
+          if nix path-info "$src"; then echo "source already valid"; exit 1; fi
+          hashes=$(printf '%s\n' ${{ matrix.installables }} |
+            awk -F/ '{printf "%s%s", (NR > 1 ? "," : ""), substr($NF, 1, 32)}')
+          ext=$(curl -fsS "http://$HESTIA_LISTEN/closure/$hashes/external-references")
+          echo "external references: $ext"
+          test "$ext" = "$src"
+          # The filtered source must not be served by hestia itself.
+          test "$(curl -s -o /dev/null -w '%{http_code}' "http://$HESTIA_LISTEN/$(basename "$src" | cut -c1-32).narinfo")" = 404
+          # Plain import must fail without the external reference ...
+          if curl -fsS "http://$HESTIA_LISTEN/closure/$hashes" | nix-store --import; then
+            echo "import unexpectedly succeeded without external references"; exit 1
+          fi
+          # ... while prefetch substitutes it first.
+          "$HESTIA_BIN" prefetch ${{ matrix.installables }}
+          nix path-info --sigs "$src"
+          drv=$(printf '%s\n' ${{ matrix.installables }} | head -1 | sed 's/\^\*$//')
+          nix path-info "$drv"
       # No checkout of the fixture flake and no evaluation: the drv closure
       # comes out of the cache.
       - name: Build by drv path
