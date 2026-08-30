@@ -52,6 +52,7 @@ use crate::gha::savemutable::SaveMutable;
 use crate::pathinfo::StoreDatabase;
 use crate::pipeline::{self, AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
 use crate::protocol::{DrainStats, Request, Response, encode_line};
+use crate::store::Snapshot;
 use crate::substituter::{ManifestStore, Substituter, verify_packs};
 use crate::upstream::UpstreamFilter;
 
@@ -419,13 +420,13 @@ impl Daemon {
     }
 }
 
-/// Load the newest committed manifest and publish it into the served
-/// store if it is newer than the current view. A drain may have published
-/// a newer manifest while the load was in flight (or the load may return a
-/// stale version: lookups are eventually consistent); that version must
-/// win. Recording the version makes drains start their reservations above
-/// it even when cache lookups lag.
-async fn load_published_manifest(backend: &Backend, manifest_store: &ManifestStore) {
+/// Load the heads of `roots` and the newest legacy manifest into the
+/// served store. A drain may have published a newer manifest while the
+/// load was in flight (or the load may return a stale version: lookups
+/// are eventually consistent). That version must win. Recording the
+/// version makes drains start their reservations above it even when
+/// cache lookups lag.
+async fn load_published(backend: &Backend, manifest_store: &ManifestStore, roots: &[String]) {
     let save = SaveMutable::new(backend.twirp(), backend.http(), MANIFEST_PREFIX);
     match save.load().await {
         Ok(Some(entry)) => manifest_store
@@ -434,6 +435,14 @@ async fn load_published_manifest(backend: &Backend, manifest_store: &ManifestSto
         Err(err) => {
             eprintln!("hestia serve: cannot load the manifest, substituting nothing: {err}");
         }
+    }
+    let previous = manifest_store.snapshot();
+    match Snapshot::load(backend.clone(), roots, previous.as_deref()).await {
+        Ok(snapshot) => manifest_store.set_snapshot(Arc::new(snapshot)),
+        Err(err) => eprintln!(
+            "hestia serve: cannot list heads, serving only the legacy manifest \
+             (grant `actions: read`): {err}"
+        ),
     }
 }
 
@@ -591,6 +600,13 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 
     let store_dir = store.store_dir().clone();
     let root_key = pipeline::root_key(&branch, &system);
+    let mut serve_roots = vec![root_key.clone()];
+    serve_roots.extend(
+        args.serve_branches
+            .iter()
+            .map(|b| pipeline::root_key(b, &system)),
+    );
+    serve_roots.dedup();
     let pipeline = PipelineContext {
         backend: backend.clone(),
         store,
@@ -660,12 +676,12 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     .with_manifest_reload({
         let backend = backend.clone();
         let manifest_store = manifest_store.clone();
+        let serve_roots = serve_roots.clone();
         Arc::new(move || {
             let backend = backend.clone();
             let manifest_store = manifest_store.clone();
-            Box::pin(async move {
-                load_published_manifest(&backend, &manifest_store).await;
-            })
+            let serve_roots = serve_roots.clone();
+            Box::pin(async move { load_published(&backend, &manifest_store, &serve_roots).await })
         })
     });
     let substituter_task = tokio::spawn(async move {
@@ -688,7 +704,8 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             let reload = || {
                 let backend = backend.clone();
                 let manifest_store = manifest_store.clone();
-                async move { load_published_manifest(&backend, &manifest_store).await }
+                let serve_roots = serve_roots.clone();
+                async move { load_published(&backend, &manifest_store, &serve_roots).await }
             };
             wait_for_manifest_version(&manifest_store, min_version, reload).await;
             let _ = manifest_ready_tx.send(true);

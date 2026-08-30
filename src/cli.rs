@@ -55,6 +55,10 @@ pub struct ServeArgs {
     #[arg(long)]
     pub system: Option<String>,
 
+    /// Also serve paths pushed under these branches' roots (same system).
+    #[arg(long = "serve-branch", value_name = "BRANCH", default_value = "main")]
+    pub serve_branches: Vec<String>,
+
     /// Skip paths signed by an upstream cache (see
     /// --upstream-cache-key-name) instead of caching them.
     #[arg(long)]
