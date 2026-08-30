@@ -455,11 +455,7 @@ impl ChunkFetcher {
             .iter()
             .map(|(_, location)| (location.offset, location.compressed_size))
             .collect();
-        let pack_end = index
-            .entries
-            .last()
-            .map_or(0, |e| e.offset + u64::from(e.compressed_size));
-        let ranges = plan_pack_reads(&spans, pack_end);
+        let ranges = plan_pack_reads(&spans, index.size());
 
         let started = Instant::now();
         let range_count = ranges.len();

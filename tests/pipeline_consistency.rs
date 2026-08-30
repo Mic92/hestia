@@ -181,7 +181,7 @@ async fn commit_includes_everything_the_dedup_decisions_were_based_on() {
         let lagging = context(
             Backend::new(
                 TwirpClient::new(http.clone(), &proxy.base_url, "fake-runtime-token"),
-                None,
+                Some(fake.rest(&http)),
                 http.clone(),
             ),
             store.database(),

@@ -613,6 +613,10 @@ impl SegmentWriter {
         })
     }
 
+    pub fn pack_hashes(&self) -> impl Iterator<Item = PackHash> + '_ {
+        self.packs.iter().map(|p| p.hash)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -786,6 +790,13 @@ pub struct PackIndex {
 
 impl PackIndex {
     const ROW: usize = 16 + 8 + 4 + 4;
+
+    /// Packs are their frames back to back.
+    pub fn size(&self) -> u64 {
+        self.entries
+            .last()
+            .map_or(0, |e| e.offset + u64::from(e.compressed_size))
+    }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + self.entries.len() * Self::ROW);

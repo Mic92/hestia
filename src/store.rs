@@ -59,6 +59,7 @@ pub struct Resolved {
 /// a new one that shares loaded segments and pack indexes.
 pub struct Snapshot {
     backend: Backend,
+    roots: Vec<String>,
     pub view: View,
     /// In lookup priority: served roots in order, newest segment first.
     segments: Vec<Arc<Segment>>,
@@ -160,10 +161,36 @@ impl Snapshot {
             .unwrap_or_default();
         Ok(Snapshot {
             backend,
+            roots: roots.to_vec(),
             view,
             segments,
             pack_indexes: Mutex::new(pack_indexes),
         })
+    }
+
+    /// Reload, then make sure `sealed` (just published under the first
+    /// root) is served even if the listing does not show its head yet.
+    pub async fn refresh_with(&self, sealed: &Sealed) -> Result<Snapshot, Error> {
+        let mut next = Snapshot::load(self.backend.clone(), &self.roots, Some(self)).await?;
+        let digest = sealed.digest();
+        if !next.segments.iter().any(|s| s.digest == digest) {
+            let segment = Segment {
+                digest,
+                meta: Meta::open(&sealed.meta)?,
+                tree: OnceCell::new_with(Some(Tree::open(&sealed.tree)?)),
+            };
+            next.segments.insert(0, Arc::new(segment));
+        }
+        Ok(next)
+    }
+
+    /// Chunks locatable without a fetch: every pack index loaded so far.
+    pub fn known_chunks(&self) -> KnownChunks {
+        let mut known = KnownChunks::default();
+        for (pack, index) in self.pack_indexes.lock().unwrap().iter() {
+            known.add(*pack, index);
+        }
+        known
     }
 
     pub fn path_count(&self) -> usize {
@@ -294,20 +321,33 @@ fn to_file_tree(
     })
 }
 
-/// `(pack, pack size, position in that pack's index)` of a chunk, `None` if unknown.
-pub trait Locate: Fn(&ChunkHash) -> Option<(PackHash, u64, u16)> {}
-impl<F: Fn(&ChunkHash) -> Option<(PackHash, u64, u16)>> Locate for F {}
+/// chunk → `(pack, pack size, position in that pack's index)`.
+#[derive(Default)]
+pub struct KnownChunks(HashMap<ChunkHash, (PackHash, u64, u16)>);
+
+impl KnownChunks {
+    pub fn add(&mut self, pack: PackHash, index: &PackIndex) {
+        let size = index.size();
+        for (i, e) in index.entries.iter().enumerate() {
+            self.0.entry(e.hash).or_insert((pack, size, i as u16));
+        }
+    }
+
+    pub fn contains(&self, hash: &ChunkHash) -> bool {
+        self.0.contains_key(hash)
+    }
+}
 
 fn from_file_tree(
     tree: &FileTree<ChunkList>,
     writer: &mut SegmentWriter,
-    locate: &impl Locate,
+    known: &KnownChunks,
 ) -> Option<Node> {
     Some(match &tree.0 {
         FileSystemObject::Regular(r) => {
             let mut chunks = Vec::with_capacity(r.contents.chunks.len());
             for h in &r.contents.chunks {
-                let (pack, size, chunk) = locate(h)?;
+                let &(pack, size, chunk) = known.0.get(h)?;
                 chunks.push(ChunkRef {
                     pack: writer.pack(pack, size),
                     chunk,
@@ -325,7 +365,7 @@ fn from_file_tree(
         FileSystemObject::Directory(d) => {
             let mut entries = BTreeMap::new();
             for (name, child) in &d.entries {
-                entries.insert(name.clone(), from_file_tree(child, writer, locate)?);
+                entries.insert(name.clone(), from_file_tree(child, writer, known)?);
             }
             Node::Directory { entries }
         }
@@ -336,9 +376,9 @@ fn from_file_tree(
 pub fn push_entry(
     writer: &mut SegmentWriter,
     entry: &PathEntry,
-    locate: &impl Locate,
+    known: &KnownChunks,
 ) -> Option<()> {
-    let tree = from_file_tree(&entry.tree, writer, locate)?;
+    let tree = from_file_tree(&entry.tree, writer, known)?;
     writer.push(segment::Entry {
         path: entry.store_path.clone(),
         nar_hash: entry.nar_hash,
@@ -407,33 +447,4 @@ pub fn pack_indexes(manifest: &Manifest) -> BTreeMap<PackHash, PackIndex> {
         index.entries.sort_by_key(|e| e.offset);
     }
     out
-}
-
-/// A legacy manifest as pack indexes plus one segment per root.
-pub fn convert_manifest(
-    manifest: &Manifest,
-) -> (BTreeMap<PackHash, PackIndex>, Vec<(String, Sealed)>) {
-    let indexes = pack_indexes(manifest);
-    let mut position: HashMap<ChunkHash, (PackHash, u64, u16)> = HashMap::new();
-    for (pack, index) in &indexes {
-        let size = manifest.packs.get(pack).map_or(0, |p| p.size);
-        for (i, e) in index.entries.iter().enumerate() {
-            position.insert(e.hash, (*pack, size, i as u16));
-        }
-    }
-    let locate = |h: &ChunkHash| position.get(h).copied();
-    let mut segments = Vec::new();
-    for (root, members) in &manifest.roots {
-        let mut writer = SegmentWriter::default();
-        for entry in members.paths.iter().filter_map(|h| manifest.paths.get(h)) {
-            push_entry(&mut writer, entry, &locate);
-        }
-        if !writer.is_empty() {
-            segments.push((
-                root.clone(),
-                writer.seal().expect("located chunks are in range"),
-            ));
-        }
-    }
-    (indexes, segments)
 }

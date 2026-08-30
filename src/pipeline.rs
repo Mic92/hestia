@@ -10,11 +10,9 @@
 //!    (those get their `last_pushed` clock bumped instead).
 //! 3. Chunk each new path (FastCDC over NAR events) and verify the chunked
 //!    representation reproduces the NAR hash recorded by Nix.
-//! 4. Pack new chunks, upload the pack (Twirp reserve → Azure PUT →
-//!    finalize; `already_exists` means an identical pack is already there).
-//! 5. Commit the manifest: new path entries, chunk locations, pack ref, and
-//!    the root for this branch+system = pushed ∪ accessed paths.
-//!    SaveMutable handles write conflicts by re-merging.
+//! 4. Pack new chunks, upload each pack with its index.
+//! 5. Publish the new paths as a segment plus head under this root, and
+//!    (until GC reads segments) also commit them to the legacy manifest.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +27,8 @@ use crate::manifest::{Manifest, PackInfo, PathEntry, PathHash, Root};
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
 use crate::refnorm::RefTable;
+use crate::segment::SegmentWriter;
+use crate::store::{self, Snapshot};
 use crate::substituter::ManifestStore;
 use crate::upstream::UpstreamFilter;
 use futures_util::{StreamExt as _, TryStreamExt as _};
@@ -77,6 +77,9 @@ pub enum Error {
 
     #[error("store database error: {0}")]
     PathInfo(#[from] PathInfoError),
+
+    #[error(transparent)]
+    Store(#[from] store::Error),
 }
 
 /// Shared record of paths served through the substituter.
@@ -178,6 +181,12 @@ pub async fn upload_pack(backend: &Backend, pack: &chunker::Pack) -> Result<bool
     if !created {
         backend.touch(&key).await?;
     }
+    backend
+        .put(
+            &store::pack_index_key(&pack.hash),
+            pack.index().encode().into(),
+        )
+        .await?;
     Ok(created)
 }
 
@@ -303,6 +312,23 @@ impl PipelineContext {
         // `current` is the basis for every dedup decision below; the commit
         // at the end must include all of it (see the merge closure).
         let current = loaded.merge(known);
+        let snapshot = match self.publish.as_ref().and_then(ManifestStore::snapshot) {
+            Some(s) => s,
+            None => Arc::new(
+                Snapshot::load(
+                    self.backend.clone(),
+                    std::slice::from_ref(&self.root_key),
+                    None,
+                )
+                .await?,
+            ),
+        };
+        let mut known_chunks = snapshot.known_chunks();
+        // Legacy packs have no index. A segment referencing one uploads it.
+        let legacy_indexes = store::pack_indexes(&current);
+        for (pack, index) in &legacy_indexes {
+            known_chunks.add(*pack, index);
+        }
         // Reservation floor: never reserve at or below a version we have
         // already seen, even when commit-time lookups regress below it
         // (non-monotonic eventually consistent reads).
@@ -374,6 +400,11 @@ impl PipelineContext {
                 let mut entry = existing.clone();
                 entry.last_pushed = now;
                 bumped.insert(hash, entry);
+                stats.skipped_existing += 1;
+                continue;
+            }
+            if snapshot.contains(&hash) {
+                root_paths.insert(hash);
                 stats.skipped_existing += 1;
                 continue;
             }
@@ -493,7 +524,7 @@ impl PipelineContext {
                     .chunks
                     .into_iter()
                     .filter(|chunk| {
-                        !current.chunks.contains_key(&chunk.hash) && batch_chunks.insert(chunk.hash)
+                        !known_chunks.contains(&chunk.hash) && batch_chunks.insert(chunk.hash)
                     })
                     .collect();
 
@@ -608,9 +639,34 @@ impl PipelineContext {
                 stats.packs_uploaded += 1;
                 stats.bytes_uploaded += size;
             }
+            known_chunks.add(pack.hash, &pack.index());
             packs.push((size, pack));
         }
         stats.new_chunks = packs.iter().map(|(_, pack)| pack.chunks.len()).sum();
+
+        let mut writer = SegmentWriter::default();
+        for path in &prepared {
+            store::push_entry(&mut writer, &path.entry, &known_chunks)
+                .expect("every chunk is either known or in a pack of this drain");
+        }
+        for pack in writer.pack_hashes() {
+            if let Some(index) = legacy_indexes.get(&pack) {
+                self.backend
+                    .put(&store::pack_index_key(&pack), index.encode().into())
+                    .await
+                    .map_err(store::Error::from)?;
+            }
+        }
+        if !writer.is_empty() {
+            let sealed = writer.seal().map_err(store::Error::from)?;
+            store::publish(&self.backend, &snapshot.view, &self.root_key, &sealed).await?;
+            if let Some(publish) = &self.publish {
+                match snapshot.refresh_with(&sealed).await {
+                    Ok(next) => publish.set_snapshot(Arc::new(next)),
+                    Err(err) => eprintln!("hestia: cannot refresh the served segments: {err}"),
+                }
+            }
+        }
 
         for (size, pack) in &packs {
             for (chunk_hash, location) in pack.locations() {

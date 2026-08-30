@@ -22,6 +22,7 @@ use crate::manifest::{
     Regular, Rewrite, Symlink,
 };
 use crate::refnorm::RefTable;
+use crate::segment::{PackIndex, PackIndexEntry};
 
 /// FastCDC parameters. Pinned: changing them changes every chunk boundary
 /// and therefore invalidates all existing chunks in the cache.
@@ -363,6 +364,21 @@ impl Pack {
     /// Cache key for this pack.
     pub fn cache_key(&self) -> String {
         pack_cache_key(&self.hash)
+    }
+
+    pub fn index(&self) -> PackIndex {
+        PackIndex {
+            entries: self
+                .chunks
+                .iter()
+                .map(|(hash, packed)| PackIndexEntry {
+                    hash: *hash,
+                    offset: packed.offset,
+                    compressed_size: packed.compressed_size,
+                    uncompressed_size: packed.uncompressed_size,
+                })
+                .collect(),
+        }
     }
 
     /// Manifest chunk locations pointing into this pack.
