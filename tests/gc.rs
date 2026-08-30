@@ -59,7 +59,7 @@ async fn compacts_each_root_to_one_segment_and_folds_heads() {
         assert!(sim.stored_keys("h-").await.is_empty());
         sim.assert_readable(&[&a, &b]).await;
         // Inputs are retired, not deleted: a reader may still hold them.
-        assert_eq!(sim.stored_keys("seg-").await.len(), 2 * 4);
+        assert_eq!(sim.stored_keys("seg-").await.len(), 4);
 
         fake.set_clock(T0 + 4 * HOUR);
         let stats = sim.run_gc(GcPolicy::default(), T0 + 4 * HOUR).await;
@@ -68,7 +68,7 @@ async fn compacts_each_root_to_one_segment_and_folds_heads() {
             2 * 2 + 1,
             "two segments and the previous g-*"
         );
-        assert_eq!(sim.stored_keys("seg-").await.len(), 2 * 2);
+        assert_eq!(sim.stored_keys("seg-").await.len(), 2);
         sim.assert_readable(&[&a, &b]).await;
         sim.assert_no_dangling_references().await;
     })
@@ -143,7 +143,6 @@ async fn dropped_path_gets_repacked_away() {
         sim.run_gc(GcPolicy::default(), T0 + 3 * DAY).await;
         assert_eq!(sim.stored_keys("pack-").await.len(), 1);
         assert!(sim.stored_pack_bytes().await < both / 2);
-        assert_eq!(sim.stored_keys("idx-").await.len(), 1);
         sim.assert_readable(&[&keep]).await;
         sim.assert_no_dangling_references().await;
     })
@@ -226,7 +225,7 @@ async fn orphan_pack_is_swept_only_once_old_enough() {
 
         fake.set_clock(T0 + 3 * HOUR);
         let stats = sim.run_gc(GcPolicy::default(), T0 + 3 * HOUR).await;
-        assert_eq!(stats.deleted, 3, "orphan pack, its index, the previous g-*");
+        assert_eq!(stats.deleted, 2, "orphan pack and the previous g-*");
         assert!(!sim.stored_keys("pack-").await.contains(&orphan));
         sim.assert_readable(&[&a]).await;
     })
@@ -424,7 +423,7 @@ async fn drain_compaction_folds_pending_segments_and_gc_folds_it() {
         assert_eq!(after.view.roots[ROOT].len(), 1, "{:?}", after.view);
         assert_eq!(after.view.heads.len(), 1);
         sim.assert_readable(&refs).await;
-        assert_eq!(sim.stored_keys("seg-").await.len(), 12, "nothing deleted");
+        assert_eq!(sim.stored_keys("seg-").await.len(), 6, "nothing deleted");
 
         fake.set_clock(T0 + 3 * HOUR);
         let stats = sim.run_gc(GcPolicy::default(), T0 + 3 * HOUR).await;
@@ -433,7 +432,7 @@ async fn drain_compaction_folds_pending_segments_and_gc_folds_it() {
         assert!(after.view.heads.is_empty());
         assert_eq!(after.view.roots[ROOT].len(), 1);
         sim.assert_readable(&refs).await;
-        assert_eq!(sim.stored_keys("seg-").await.len(), 2, "inputs swept");
+        assert_eq!(sim.stored_keys("seg-").await.len(), 1, "inputs swept");
     })
     .await;
 }

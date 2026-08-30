@@ -1,7 +1,7 @@
 //! Head names, head records, and the view rule.
 //!
 //! ```text
-//! g-<epoch>-<d>                   GC head, body = GcRecord, <d> = blake3(body)
+//! g-<epoch>-<d>                   GC head, body = GcRecord, <d> = sha256(body)
 //! h-<base_epoch>-<root>-<seg>     drain head, no body
 //! c-<base_epoch>-<root>-<d>       compaction head, body = CompactionRecord
 //! ```

@@ -182,7 +182,16 @@ enum FetchError {
     Chunker(#[from] chunker::Error),
 
     #[error(transparent)]
-    Store(#[from] crate::store::Error),
+    Store(crate::store::Error),
+}
+
+impl From<crate::store::Error> for FetchError {
+    fn from(err: crate::store::Error) -> Self {
+        match err {
+            crate::store::Error::MissingPack(p) => FetchError::PackUnavailable(p),
+            err => FetchError::Store(err),
+        }
+    }
 }
 
 /// Decompressed chunks kept in memory, evicted least-recently-used first
@@ -730,19 +739,9 @@ async fn nar(
             None => return StatusCode::NOT_FOUND.into_response(),
         },
     };
-    let resolve = |view: Arc<ManifestView>| async move {
-        match view.resolve(&path_hash).await {
-            Ok(Some(r)) if r.entry.nar_hash == nar_hash => Some(r),
-            Ok(_) => None,
-            Err(err) => {
-                eprintln!("hestia substituter: cannot resolve {path_hash}: {err}");
-                None
-            }
-        }
-    };
-    let Some(mut resolved) = resolve(view.clone()).await else {
+    if !view.contains(&path_hash) {
         return StatusCode::NOT_FOUND.into_response();
-    };
+    }
     let mut manifest_view = view;
 
     // A NAR download is an access (the GC liveness signal), just like a
@@ -756,9 +755,24 @@ async fn nar(
     // data. A missing pack gets one retry against a freshly loaded
     // manifest (see [`ManifestReload`]).
     let mut reloaded = false;
-    let chunks = loop {
-        match state.fetcher.fetch_path_chunks(path_hash, &resolved).await {
-            Ok(chunks) => break chunks,
+    let (resolved, chunks) = loop {
+        let attempt = async {
+            let Some(resolved) = manifest_view
+                .resolve(&path_hash)
+                .await?
+                .filter(|r| r.entry.nar_hash == nar_hash)
+            else {
+                return Ok(None);
+            };
+            let chunks = state
+                .fetcher
+                .fetch_path_chunks(path_hash, &resolved)
+                .await?;
+            Ok::<_, FetchError>(Some((resolved, chunks)))
+        };
+        match attempt.await {
+            Ok(Some(done)) => break done,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
             Err(err @ (FetchError::PackUnavailable(_) | FetchError::UnknownChunk(_)))
                 if !reloaded && state.manifest_reload.is_some() =>
             {
@@ -766,10 +780,6 @@ async fn nar(
                 eprintln!("hestia substituter: {err}; reloading (concurrent gc repack?)");
                 (state.manifest_reload.as_ref().expect("checked above"))().await;
                 manifest_view = state.manifest.view();
-                match resolve(manifest_view.clone()).await {
-                    Some(fresh) => resolved = fresh,
-                    None => return StatusCode::NOT_FOUND.into_response(),
-                }
             }
             Err(err) => {
                 // Later narinfos for paths in this pack miss upfront.

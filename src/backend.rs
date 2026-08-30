@@ -98,23 +98,27 @@ impl Backend {
 
     /// `None` if the key does not exist.
     pub async fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Option<Bytes>, Error> {
-        let Some(url) = self.url(key, false).await? else {
-            return Ok(None);
-        };
         let gone = || Error::Status {
             status: 404,
             url: key.to_owned(),
             body: String::new(),
         };
-        let refresh = async || self.url(key, true).await?.ok_or_else(gone);
-        match blob::get_with_refresh(&self.http, &url, range, refresh).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Status { status: 404, .. }) => {
-                self.urls.lock().unwrap().remove(key);
-                Ok(None)
+        // A cached URL outlives its entry when the key was deleted and put
+        // again, so a 404 on it is retried with a fresh lookup.
+        for force in [false, true] {
+            let Some(url) = self.url(key, force).await? else {
+                return Ok(None);
+            };
+            let refresh = async || self.url(key, true).await?.ok_or_else(gone);
+            match blob::get_with_refresh(&self.http, &url, range.clone(), refresh).await {
+                Ok(bytes) => return Ok(Some(bytes)),
+                Err(Error::Status { status: 404, .. }) => {
+                    self.urls.lock().unwrap().remove(key);
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => Err(err),
         }
+        Ok(None)
     }
 
     /// 1-byte read to reset the LRU clock. `false` if the key is gone.

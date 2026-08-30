@@ -7,12 +7,15 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
 use crate::backend::{Backend, Listed};
+use crate::chunker::pack_cache_key;
 use crate::heads::{self, CompactionRecord, GcRecord, HeadName, View, root_id};
 use crate::manifest::{
     ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Hash32, PackHash,
     PathEntry, PathHash, Regular, SegDigest, Symlink,
 };
-use crate::segment::{self, ChunkRef, Chunks, Meta, Node, PackIndex, Sealed, SegmentWriter, Tree};
+use crate::segment::{
+    self, ChunkRef, Chunks, Meta, Node, PackIndex, PackRow, Sealed, SegmentWriter, Tree,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -22,17 +25,16 @@ pub enum Error {
     Segment(#[from] segment::Error),
     #[error("{0} missing from the store")]
     Missing(String),
+    #[error("pack {0} missing from the store")]
+    MissingPack(PackHash),
 }
 
+/// Every key but a head's is `<kind>-<sha256 of the body>`.
 pub fn meta_key(d: &SegDigest) -> String {
-    format!("seg-{d}.meta")
+    format!("seg-{d}")
 }
 pub fn tree_key(d: &SegDigest) -> String {
-    format!("seg-{d}.tree")
-}
-/// Not `pack-<h>.idx`: gha lookups are prefix matches.
-pub fn pack_index_key(p: &PackHash) -> String {
-    format!("idx-{p}")
+    format!("tree-{d}")
 }
 
 pub struct Segment {
@@ -70,6 +72,15 @@ async fn fetch(backend: &Backend, key: &str) -> Result<bytes::Bytes, Error> {
         .get(key, None)
         .await?
         .ok_or_else(|| Error::Missing(key.to_owned()))
+}
+
+pub async fn fetch_pack_index(backend: &Backend, row: &PackRow) -> Result<PackIndex, Error> {
+    let range = PackIndex::range(row.size, row.chunks);
+    let bytes = backend
+        .get(&pack_cache_key(&row.hash), Some(range))
+        .await?
+        .ok_or(Error::MissingPack(row.hash))?;
+    Ok(PackIndex::decode(&bytes)?)
 }
 
 /// A `g-*` body that decodes and hashes back to its name.
@@ -290,7 +301,7 @@ impl Snapshot {
                     .for_each_chunk(&mut |c| _ = packs.insert(c.pack));
             }
             for p in packs {
-                self.pack_index(seg.meta.packs[p as usize].hash).await?;
+                self.pack_index(&seg.meta.packs[p as usize]).await?;
             }
         }
         Ok(())
@@ -368,20 +379,21 @@ impl Snapshot {
         seg.tree
             .get_or_try_init(|| async {
                 Ok(Tree::open(
-                    &fetch(&self.backend, &tree_key(&seg.digest)).await?,
+                    &fetch(&self.backend, &tree_key(&seg.meta.tree)).await?,
                 )?)
             })
             .await
     }
 
-    async fn pack_index(&self, pack: PackHash) -> Result<Arc<PackIndex>, Error> {
-        if let Some(idx) = self.pack_indexes.lock().unwrap().get(&pack) {
+    async fn pack_index(&self, row: &PackRow) -> Result<Arc<PackIndex>, Error> {
+        if let Some(idx) = self.pack_indexes.lock().unwrap().get(&row.hash) {
             return Ok(idx.clone());
         }
-        let idx = Arc::new(PackIndex::decode(
-            &fetch(&self.backend, &pack_index_key(&pack)).await?,
-        )?);
-        self.pack_indexes.lock().unwrap().insert(pack, idx.clone());
+        let idx = Arc::new(fetch_pack_index(&self.backend, row).await?);
+        self.pack_indexes
+            .lock()
+            .unwrap()
+            .insert(row.hash, idx.clone());
         Ok(idx)
     }
 
@@ -399,10 +411,10 @@ impl Snapshot {
             let (pack, index) = match indexes.get(&c.pack) {
                 Some(x) => x,
                 None => {
-                    let hash = seg.meta.packs[c.pack as usize].hash;
-                    let index = self.pack_index(hash).await?;
-                    map.packs.insert(hash, index.clone());
-                    indexes.entry(c.pack).or_insert((hash, index))
+                    let row = &seg.meta.packs[c.pack as usize];
+                    let index = self.pack_index(row).await?;
+                    map.packs.insert(row.hash, index.clone());
+                    indexes.entry(c.pack).or_insert((row.hash, index))
                 }
             };
             let e = index
@@ -547,12 +559,12 @@ const COMPACT_MIN: usize = 4;
 const COMPACT_WINDOW: u64 = 60;
 
 async fn put_segment(backend: &Backend, sealed: &Sealed) -> Result<SegDigest, Error> {
+    backend
+        .put(&tree_key(&sealed.tree_digest()), sealed.tree.clone().into())
+        .await?;
     let digest = sealed.digest();
     backend
         .put(&meta_key(&digest), sealed.meta.clone().into())
-        .await?;
-    backend
-        .put(&tree_key(&digest), sealed.tree.clone().into())
         .await?;
     Ok(digest)
 }

@@ -14,8 +14,8 @@ use crate::gha::twirp::TwirpClient;
 use crate::heads::{GcRecord, HeadName, RootId, RootRow, root_id};
 use crate::manifest::{ChunkHash, PackHash, SegDigest};
 use crate::pipeline::{now_unix, upload_pack};
-use crate::segment::{self, Meta, PackIndex, Relocated, Tree};
-use crate::store::{self, Heads, meta_key, pack_index_key, tree_key};
+use crate::segment::{self, Meta, PackRow, Relocated, Tree};
+use crate::store::{self, Heads, fetch_pack_index, meta_key, tree_key};
 
 pub const SECS_PER_HOUR: u64 = 3_600;
 pub const SECS_PER_DAY: u64 = 86_400;
@@ -91,7 +91,7 @@ struct Root {
 
 /// Live chunks of one pack, OR-ed over every input segment.
 struct PackUse {
-    chunks: u32,
+    row: PackRow,
     bits: Vec<u8>,
 }
 
@@ -106,7 +106,7 @@ impl PackUse {
     }
     fn ratio(&self) -> f64 {
         let live: u32 = self.bits.iter().map(|b| b.count_ones()).sum();
-        f64::from(live) / f64::from(self.chunks.max(1))
+        f64::from(live) / f64::from(self.row.chunks.max(1))
     }
     fn is_live(&self, i: usize) -> bool {
         self.bits
@@ -132,7 +132,7 @@ impl Repacker {
         if !gc.dry_run {
             upload_pack(&gc.backend, &pack).await?;
         }
-        let size = pack.data.len() as u64;
+        let size = pack.index().size();
         let n = pack.chunks.len() as u32;
         let position: HashMap<ChunkHash, u16> = pack
             .chunks
@@ -148,20 +148,11 @@ impl Repacker {
     }
 }
 
-fn object_key(key: &str) -> Option<Object> {
-    if let Some(h) = key.strip_prefix("pack-") {
-        return PackHash::from_hex(h).map(Object::Pack);
-    }
-    if let Some(h) = key.strip_prefix("idx-") {
-        return PackHash::from_hex(h).map(Object::Pack);
-    }
-    let d = key.strip_prefix("seg-")?.split('.').next()?;
-    SegDigest::from_hex(d).map(Object::Segment)
-}
-
-enum Object {
-    Pack(PackHash),
-    Segment(SegDigest),
+/// Everything a live segment pins.
+fn object_keys(seg: &SegDigest, meta: &Meta) -> impl Iterator<Item = String> {
+    [meta_key(seg), tree_key(&meta.tree)]
+        .into_iter()
+        .chain(meta.packs.iter().map(|p| pack_cache_key(&p.hash)))
 }
 
 impl Gc {
@@ -199,8 +190,8 @@ impl Gc {
         stats.epoch = prev.map_or(0, |g| g.epoch) + 1;
 
         let mut objects = self.list("pack-").await?;
-        objects.extend(self.list("idx-").await?);
         objects.extend(self.list("seg-").await?);
+        objects.extend(self.list("tree-").await?);
         let stored_packs: HashMap<PackHash, &Listed> = objects
             .iter()
             .filter(|l| l.key.starts_with("pack-"))
@@ -258,7 +249,7 @@ impl Gc {
                 usage
                     .entry(row.hash)
                     .or_insert(PackUse {
-                        chunks: row.chunks,
+                        row: PackRow::new(row.hash, row.size, row.chunks),
                         bits: Vec::new(),
                     })
                     .add(&row.live_bits);
@@ -294,6 +285,7 @@ impl Gc {
         // Compact each root to one segment.
         let mut rows = Vec::new();
         let mut live_packs: BTreeSet<PackHash> = BTreeSet::new();
+        let mut keep: BTreeSet<String> = BTreeSet::new();
         for root in roots {
             let clean = root.inputs.len() == 1
                 && heads.view.roots[&root.name].len() == 1
@@ -305,6 +297,7 @@ impl Gc {
                     .await?
             };
             live_packs.extend(meta.packs.iter().map(|p| p.hash));
+            keep.extend(object_keys(&seg, &meta));
             retired.remove(&seg);
             rows.push(RootRow {
                 name: root.name,
@@ -330,24 +323,13 @@ impl Gc {
         // Sweep. This run's inputs and their packs stay one more epoch: a
         // reader may hold the previous view. Anything else unreferenced and
         // older than `min_age` goes, which covers what the last run retired.
-        let mut keep_packs = live_packs.clone();
         for d in &retired {
             if let Some(body) = self.backend.get(&meta_key(d), None).await? {
-                keep_packs.extend(Meta::open(&body)?.packs.iter().map(|p| p.hash));
+                keep.extend(object_keys(d, &Meta::open(&body)?));
             }
         }
-        let keep_segments: BTreeSet<SegDigest> = record
-            .roots
-            .iter()
-            .map(|r| r.seg)
-            .chain(retired.iter().copied())
-            .collect();
         for l in &objects {
-            let referenced = match object_key(&l.key) {
-                Some(Object::Pack(p)) => keep_packs.contains(&p),
-                Some(Object::Segment(d)) => keep_segments.contains(&d),
-                None => true,
-            };
+            let referenced = keep.contains(&l.key);
             let old = l
                 .created
                 .is_some_and(|c| now.saturating_sub(c) > self.policy.min_age);
@@ -385,10 +367,11 @@ impl Gc {
         used: &PackUse,
         out: &mut Repacker,
     ) -> Result<bool, Error> {
-        let Some(body) = self.backend.get(&pack_index_key(&source), None).await? else {
-            return Ok(false);
+        let index = match fetch_pack_index(&self.backend, &used.row).await {
+            Ok(index) => index,
+            Err(store::Error::MissingPack(_)) => return Ok(false),
+            Err(err) => return Err(err.into()),
         };
-        let index = PackIndex::decode(&body)?;
         let live = index
             .entries
             .iter()
@@ -428,12 +411,12 @@ impl Gc {
         stats: &mut GcStats,
     ) -> Result<(SegDigest, Meta), Error> {
         let mut trees = Vec::new();
-        for (d, _) in inputs {
+        for (_, m) in inputs {
             let body = self
                 .backend
-                .get(&tree_key(d), None)
+                .get(&tree_key(&m.tree), None)
                 .await?
-                .ok_or_else(|| store::Error::Missing(tree_key(d)))?;
+                .ok_or_else(|| store::Error::Missing(tree_key(&m.tree)))?;
             trees.push(Tree::open(&body)?);
         }
         let pairs: Vec<(&Meta, &Tree)> = inputs.iter().map(|(_, m)| m).zip(&trees).collect();
@@ -448,8 +431,8 @@ impl Gc {
         stats.segments_written += 1;
         let d = sealed.digest();
         let meta = Meta::open(&sealed.meta)?;
+        self.put(&tree_key(&meta.tree), sealed.tree).await?;
         self.put(&meta_key(&d), sealed.meta).await?;
-        self.put(&tree_key(&d), sealed.tree).await?;
         Ok((d, meta))
     }
 }
@@ -501,7 +484,7 @@ mod tests {
     #[test]
     fn pack_use_ors_bitsets() {
         let mut u = PackUse {
-            chunks: 16,
+            row: PackRow::new(PackHash([0; 32]), 0, 16),
             bits: vec![],
         };
         u.add(&[0b0000_0101]);

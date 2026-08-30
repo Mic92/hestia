@@ -257,7 +257,10 @@ impl PackBuilder {
 
     /// Finalize: the pack hash is the BLAKE3 of the complete blob, which
     /// makes packs content-addressed (`pack-{hash}` cache keys).
-    pub fn finish(self) -> Pack {
+    /// The index rides as a trailer so one content address covers both.
+    pub fn finish(mut self) -> Pack {
+        let index = Pack::index_of(&self.chunks).encode();
+        self.buffer.extend(&index);
         Pack {
             hash: PackHash::digest(&self.buffer),
             data: Bytes::from(self.buffer),
@@ -324,8 +327,8 @@ pub fn compress_chunks(chunks: Vec<Chunk>) -> Result<Vec<CompressedChunk>, Error
 #[derive(Debug, Clone)]
 pub struct Pack {
     pub hash: PackHash,
-    /// The blob: concatenated zstd frames (`Bytes`, so upload retries
-    /// clone it cheaply).
+    /// The blob: zstd frames, then the encoded [`PackIndex`] (`Bytes`, so
+    /// upload retries clone it cheaply).
     pub data: Bytes,
     /// Chunk positions, in insertion order.
     pub chunks: Vec<(ChunkHash, PackedChunk)>,
@@ -355,7 +358,6 @@ pub fn coalesce_adjacent<T>(
     runs
 }
 
-/// GHA cache key for a pack blob (`pack-<blake3 hex>`).
 pub fn pack_cache_key(hash: &PackHash) -> String {
     format!("pack-{}", hash.to_hex())
 }
@@ -367,9 +369,12 @@ impl Pack {
     }
 
     pub fn index(&self) -> PackIndex {
+        Self::index_of(&self.chunks)
+    }
+
+    fn index_of(chunks: &[(ChunkHash, PackedChunk)]) -> PackIndex {
         PackIndex {
-            entries: self
-                .chunks
+            entries: chunks
                 .iter()
                 .map(|(hash, packed)| PackIndexEntry {
                     hash: *hash,
@@ -996,6 +1001,13 @@ mod tests {
         }
         let pack = builder.finish();
         assert_eq!(pack.hash, PackHash::digest(&pack.data));
+        let index = pack.index();
+        let r = PackIndex::range(index.size(), index.entries.len() as u32);
+        assert_eq!(r.end, pack.data.len() as u64);
+        assert_eq!(
+            PackIndex::decode(&pack.data[r.start as usize..]).unwrap(),
+            index
+        );
         assert_eq!(pack.cache_key(), format!("pack-{}", pack.hash.to_hex()));
 
         // Every chunk must be recoverable from its (offset, compressed_size)
@@ -1017,7 +1029,7 @@ mod tests {
             assert_eq!(packed.offset, expected_offset);
             expected_offset += packed.compressed_size as u64;
         }
-        assert_eq!(expected_offset, pack.data.len() as u64);
+        assert_eq!(expected_offset, pack.index().size());
     }
 
     #[test]
@@ -1125,15 +1137,16 @@ mod tests {
         let mut builder = PackBuilder::new();
         builder.add(&chunks[0]).unwrap();
         let pack = builder.finish();
+        let frame = &pack.data[..pack.chunks[0].1.compressed_size as usize];
 
         // Wrong expected hash -> HashMismatch.
         let wrong_hash = ChunkHash::digest(b"something else");
-        let result = extract_chunk(&pack.data, &wrong_hash);
+        let result = extract_chunk(frame, &wrong_hash);
         assert!(matches!(result, Err(Error::HashMismatch { .. })));
 
         // Corrupted compressed bytes -> decompression error or hash mismatch,
         // but never silently wrong data.
-        let mut corrupted = pack.data.to_vec();
+        let mut corrupted = frame.to_vec();
         let middle = corrupted.len() / 2;
         corrupted[middle] ^= 0xff;
         assert!(extract_chunk(&corrupted, &chunks[0].hash).is_err());

@@ -146,12 +146,6 @@ pub async fn upload_pack(backend: &Backend, pack: &chunker::Pack) -> Result<bool
     if !created {
         backend.touch(&key).await?;
     }
-    backend
-        .put(
-            &store::pack_index_key(&pack.hash),
-            pack.index().encode().into(),
-        )
-        .await?;
     Ok(created)
 }
 

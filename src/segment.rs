@@ -123,6 +123,8 @@ impl PackRow {
 struct Header {
     #[n(0)]
     packs: Vec<PackRow>,
+    #[n(1)]
+    tree: SegDigest,
 }
 
 /// A chunk by location: row in the segment's pack table, entry in that pack's index.
@@ -338,13 +340,14 @@ impl Index {
 /// An opened `.meta` object: pack table, index, and undecoded bodies.
 pub struct Meta {
     pub packs: Vec<PackRow>,
+    /// Digest of the `.tree` that goes with it.
+    pub tree: SegDigest,
     index: Index,
     bodies: Vec<u8>,
 }
 
 impl Meta {
-    /// Bytes to Range-read from the front of a `.meta` for [`Meta::packs_only`].
-    pub fn header_len(prefix: &[u8]) -> Result<usize, Error> {
+    fn header_len(prefix: &[u8]) -> Result<usize, Error> {
         if prefix.get(..4) != Some(MAGIC_META) {
             return Err(bad("not a .meta object"));
         }
@@ -355,19 +358,14 @@ impl Meta {
         Ok(8 + len)
     }
 
-    pub fn packs_only(prefix: &[u8]) -> Result<Vec<PackRow>, Error> {
-        let end = Self::header_len(prefix)?;
+    pub fn open(bytes: &[u8]) -> Result<Meta, Error> {
+        let end = Self::header_len(bytes)?;
         let header: Header =
-            minicbor::decode(prefix.get(8..end).ok_or_else(|| bad("header truncated"))?)?;
+            minicbor::decode(bytes.get(8..end).ok_or_else(|| bad("header truncated"))?)?;
         if header.packs.len() > MAX_PACKS {
             return Err(bad("pack table exceeds cap"));
         }
-        Ok(header.packs)
-    }
-
-    pub fn open(bytes: &[u8]) -> Result<Meta, Error> {
-        let packs = Self::packs_only(bytes)?;
-        let compressed = &bytes[Self::header_len(bytes)?..];
+        let compressed = &bytes[end..];
         let mut raw = Vec::new();
         zstd::Decoder::with_buffer(compressed)?
             .take(MAX_META_RAW_BYTES + 1)
@@ -381,7 +379,8 @@ impl Meta {
         }
         raw.drain(..index_len);
         let meta = Meta {
-            packs,
+            packs: header.packs,
+            tree: header.tree,
             index,
             bodies: raw,
         };
@@ -576,12 +575,12 @@ pub struct Sealed {
 }
 
 impl Sealed {
+    /// The `.meta` names the `.tree`, so this covers both.
     pub fn digest(&self) -> SegDigest {
-        let mut h = blake3::Hasher::new();
-        h.update(&(self.meta.len() as u64).to_le_bytes());
-        h.update(&self.meta);
-        h.update(&self.tree);
-        SegDigest(*h.finalize().as_bytes())
+        SegDigest::digest(&self.meta)
+    }
+    pub fn tree_digest(&self) -> SegDigest {
+        SegDigest::digest(&self.tree)
     }
 }
 
@@ -705,15 +704,9 @@ impl SegmentWriter {
             minicbor::encode(&body, &mut bodies).expect("Vec write");
             lens.push(bodies.len() - start);
         }
-        let mut raw = Vec::new();
-        Index::write(&keys, &lens, &mut raw);
-        raw.extend(&bodies);
-        let header = minicbor::to_vec(Header { packs: self.packs }).expect("Vec write");
-        let mut meta = Vec::new();
-        meta.extend(MAGIC_META);
-        push_u32(&mut meta, header.len());
-        meta.extend(&header);
-        meta.extend(zstd::bulk::compress(&raw, ZSTD_LEVEL)?);
+        let mut meta_raw = Vec::new();
+        Index::write(&keys, &lens, &mut meta_raw);
+        meta_raw.extend(&bodies);
 
         let mut lens = Vec::with_capacity(keys.len());
         let mut frames = Vec::new();
@@ -745,6 +738,16 @@ impl SegmentWriter {
         }
         tree.extend(&frames);
 
+        let header = Header {
+            packs: self.packs,
+            tree: SegDigest::digest(&tree),
+        };
+        let header = minicbor::to_vec(header).expect("Vec write");
+        let mut meta = Vec::new();
+        meta.extend(MAGIC_META);
+        push_u32(&mut meta, header.len());
+        meta.extend(&header);
+        meta.extend(zstd::bulk::compress(&meta_raw, ZSTD_LEVEL)?);
         Ok(Sealed { meta, tree })
     }
 }
@@ -820,6 +823,11 @@ pub struct PackIndex {
 impl PackIndex {
     const ROW: usize = 16 + 8 + 4 + 4;
 
+    /// Where the index sits in a pack of `size` frame bytes and `chunks` entries.
+    pub fn range(size: u64, chunks: u32) -> std::ops::Range<u64> {
+        size..size + 8 + (chunks as u64) * Self::ROW as u64
+    }
+
     /// Packs are their frames back to back.
     pub fn size(&self) -> u64 {
         self.entries
@@ -883,7 +891,7 @@ impl PackIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{Blake3Chunk, Blake3Pack, Hash32};
+    use crate::manifest::{Blake3Chunk, Hash32, PackHash};
 
     fn path(seed: u32, name: &str) -> StorePath {
         let h = blake3::hash(&seed.to_le_bytes());
@@ -942,7 +950,7 @@ mod tests {
 
     fn packs(n: usize) -> Vec<PackRow> {
         (0..n)
-            .map(|i| PackRow::new(Blake3Pack([i as u8; 32]), 64 << 20, 100))
+            .map(|i| PackRow::new(PackHash([i as u8; 32]), 64 << 20, 100))
             .collect()
     }
 
@@ -1017,17 +1025,6 @@ mod tests {
     }
 
     #[test]
-    fn packs_only_reads_just_the_header() {
-        let mut w = SegmentWriter::new(packs(4));
-        w.push(entry(1, &[], &[c(3, 1)]));
-        let s = w.seal().unwrap();
-        let n = Meta::header_len(&s.meta[..8]).unwrap();
-        let rows = Meta::packs_only(&s.meta[..n]).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].hash, rows[0].live_count), (Blake3Pack([3; 32]), 1));
-    }
-
-    #[test]
     fn seal_rejects_pack_index_out_of_range() {
         let mut w = SegmentWriter::new(packs(1));
         w.push(entry(1, &[], &[c(1, 0)]));
@@ -1037,7 +1034,7 @@ mod tests {
     #[test]
     fn merge_later_wins_remaps_packs_and_drops_lost() {
         let pa = packs(3); // [0], [1], [2]
-        let pb = vec![pa[1].clone(), PackRow::new(Blake3Pack([9; 32]), 1, 1)]; // [1], [9]
+        let pb = vec![pa[1].clone(), PackRow::new(PackHash([9; 32]), 1, 1)]; // [1], [9]
         let gone = pa[2].hash;
         let e1 = entry(1, &[], &[c(0, 0)]);
         let e2_old = entry(2, &[], &[c(1, 1)]);
@@ -1064,11 +1061,7 @@ mod tests {
         let hashes: Vec<PackHash> = m.packs.iter().map(|p| p.hash).collect();
         assert_eq!(
             hashes,
-            vec![
-                Blake3Pack([0; 32]),
-                Blake3Pack([1; 32]),
-                Blake3Pack([9; 32])
-            ]
+            vec![PackHash([0; 32]), PackHash([1; 32]), PackHash([9; 32])]
         );
         assert_eq!(first_chunk(&m, &t, &e1), c(0, 0));
         assert_eq!(first_chunk(&m, &t, &e2_new), c(2, 2));
@@ -1086,7 +1079,7 @@ mod tests {
         let m2 = Meta::open(&sealed.meta).unwrap();
         assert_eq!(
             m2.packs.iter().map(|p| p.hash).collect::<Vec<_>>(),
-            vec![Blake3Pack([2; 32])]
+            vec![PackHash([2; 32])]
         );
     }
 
