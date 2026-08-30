@@ -110,6 +110,9 @@ pub struct RootRow {
     pub name: String,
     #[n(1)]
     pub seg: SegDigest,
+    /// Unix time GC last folded a writer head for this root.
+    #[n(2)]
+    pub stamp: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -354,6 +357,7 @@ mod tests {
             .map(|(n, s)| RootRow {
                 name: n.to_string(),
                 seg: d(*s),
+                stamp: 0,
             })
             .collect();
         roots.sort_by(|a, b| a.name.cmp(&b.name));

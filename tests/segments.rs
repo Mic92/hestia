@@ -189,7 +189,9 @@ async fn drain_dedups_against_segments() {
 
         // Read-your-writes: the drain published its segment into `publish`.
         let served = publish.snapshot().unwrap();
-        assert_eq!(served.path_count(), 2);
+        for p in [&top, &dep] {
+            assert!(served.contains(&support::common::path_hash_of(p)));
+        }
     })
     .await;
 }

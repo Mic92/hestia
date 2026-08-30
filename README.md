@@ -187,13 +187,14 @@ rebuild, never wrong build inputs.
 Every job records the paths it pushed and the paths it downloaded under a
 *root* named `<branch>-<system>`, e.g. `main-x86_64-linux`. The branch part
 comes from `$GITHUB_REF_NAME` (override with `--branch`), the system part is
-detected (override with `--system`). Anything reachable from a root survives
-garbage collection; everything else is deleted once it falls out of the push
-grace period.
+detected (override with `--system`). A job serves its own root plus the
+default branch's (`--serve-branch`, default `main`). What the roots hold
+survives garbage collection; everything else is deleted.
 
-Matrix jobs of one workflow run share their root: their closures are
-unioned, however far apart the jobs finish. A new run replaces the root, so
-old closures become collectable.
+Each GC run resets a root to what the jobs since the previous run pushed
+or downloaded, so matrix jobs and re-runs union while closures no job
+uses any more become collectable. A root no job touched keeps its last
+contents until it expires.
 
 Pull requests get their own roots (`123/merge-x86_64-linux`), so a PR cannot
 evict paths the default branch still needs. Roots that stop being updated

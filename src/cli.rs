@@ -174,15 +174,7 @@ pub struct GcArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Grace period in days before unreachable paths become garbage.
-    #[arg(long, value_name = "DAYS", default_value_t = 3)]
-    pub grace: u64,
-
-    /// Paths pushed within this many days are kept even when unreachable.
-    #[arg(long, value_name = "DAYS", default_value_t = 14)]
-    pub push_ttl: u64,
-
-    /// Roots not updated for this many days are dropped.
+    /// Roots without a drain for this many days are dropped.
     #[arg(long, value_name = "DAYS", default_value_t = 14)]
     pub root_ttl: u64,
 
@@ -340,8 +332,6 @@ mod tests {
             panic!("expected gc");
         };
         assert!(!args.dry_run);
-        assert_eq!(args.grace, 3);
-        assert_eq!(args.push_ttl, 14);
         assert_eq!(args.root_ttl, 14);
         assert_eq!(args.touch_age, 4);
 
@@ -349,10 +339,6 @@ mod tests {
             "hestia",
             "gc",
             "--dry-run",
-            "--grace",
-            "14",
-            "--push-ttl",
-            "30",
             "--root-ttl",
             "60",
             "--touch-age",
@@ -362,8 +348,6 @@ mod tests {
             panic!("expected gc");
         };
         assert!(args.dry_run);
-        assert_eq!(args.grace, 14);
-        assert_eq!(args.push_ttl, 30);
         assert_eq!(args.root_ttl, 60);
         assert_eq!(args.touch_age, 2);
     }

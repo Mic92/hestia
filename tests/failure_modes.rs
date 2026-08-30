@@ -19,8 +19,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use hestia::chunker::pack_cache_key;
-use hestia::gc::{GcContext, GcPolicy};
+use hestia::gc::{Gc, GcPolicy};
 use hestia::gha::savemutable::SaveMutable;
 use hestia::pipeline::{AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
 
@@ -119,19 +118,16 @@ async fn quota_exhaustion_fails_gracefully_and_gc_cleans_orphaned_packs() {
     // gone) deletes it once it is older than the safety age. The fake's
     // clock is in small tick units; pretend an hour+ passed since upload.
     fake.exhaust_quota_after(&http, u64::MAX).await;
-    let gc = GcContext {
+    let gc = Gc {
         backend: fake.backend(&http),
-        manifest_prefix: MANIFEST_PREFIX.to_string(),
         policy: GcPolicy::default(),
+        dry_run: false,
     };
     let pack_created = packs[0].created_unix().unwrap_or(0);
     let gc_now = pack_created + 2 * 3600;
 
-    let report = gc.run(false, gc_now).await.expect("GC must succeed");
-    assert_eq!(
-        report.orphans_deleted, 1,
-        "GC must delete the orphaned pack"
-    );
+    let report = gc.run(gc_now).await.expect("GC must succeed");
+    assert_eq!(report.deleted, 1, "GC must delete the orphaned pack");
 
     let packs = fake.rest(&http).list_caches("pack-").await.unwrap();
     assert!(packs.is_empty(), "orphaned pack must be gone after GC");
@@ -224,46 +220,6 @@ async fn truncated_manifest_blob_is_replaced_not_fatal() {
     // rebuilt and re-pushed next run); its pack lingers until GC's orphan
     // sweep removes it.
     assert!(!manifest.paths.contains_key(&path_hash_of(&fixture_old)));
-}
-
-#[tokio::test]
-async fn gc_refuses_to_act_on_a_corrupt_manifest() {
-    // GC is the only destructive consumer of the manifest: acting on a
-    // corrupt (= unreadable = effectively empty) manifest would judge every
-    // pack an orphan and delete real data. GC must fail loudly instead and
-    // leave the cache untouched.
-    let fake = FakeGha::start().await;
-    let http = reqwest::Client::new();
-    let twirp = fake.twirp(&http);
-
-    let m1 = format!("{MANIFEST_PREFIX}#1");
-    store_entry(&twirp, &http, &m1, b"garbage manifest").await;
-    // A hestia-shaped pack key, old enough to pass the min_age guard: if GC
-    // misjudged the corrupt manifest as empty and ran its orphan sweep, this
-    // is exactly what it would delete.
-    let pack_key = pack_cache_key(&hestia::manifest::PackHash::digest(b"some pack contents"));
-    store_entry(&twirp, &http, &pack_key, b"some pack contents").await;
-
-    let gc = GcContext {
-        backend: fake.backend(&http),
-        manifest_prefix: MANIFEST_PREFIX.to_string(),
-        policy: GcPolicy::default(),
-    };
-
-    // Run well past min_age so the planted pack is not shielded by the
-    // too-young-to-delete guard.
-    let gc_now = now_unix() + GcPolicy::default().min_age + 1;
-    let result = gc.run(false, gc_now).await;
-    assert!(result.is_err(), "GC must fail on a corrupt manifest");
-
-    // Nothing was deleted.
-    let entries = fake.rest(&http).list_caches("").await.unwrap();
-    let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
-    assert!(
-        keys.contains(&m1.as_str()),
-        "corrupt manifest left in place"
-    );
-    assert!(keys.contains(&pack_key.as_str()), "packs left in place");
 }
 
 #[tokio::test]

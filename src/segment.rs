@@ -13,7 +13,7 @@
 //! bodies compressed and inflates one frame at a time. The pack table is in
 //! front of the zstd stream so GC can Range-read it alone.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read as _;
 use std::sync::{Arc, Mutex};
 
@@ -79,18 +79,22 @@ pub struct PackRow {
     pub hash: PackHash,
     #[n(1)]
     pub size: u64,
-    /// Chunks of this pack referenced by this segment, for repack accounting.
+    /// Entries in the pack's index.
     #[n(2)]
+    pub chunks: u32,
+    /// Chunks of this pack referenced by this segment, for repack accounting.
+    #[n(3)]
     pub live_count: u32,
-    #[cbor(n(3), with = "minicbor::bytes")]
+    #[cbor(n(4), with = "minicbor::bytes")]
     pub live_bits: Vec<u8>,
 }
 
 impl PackRow {
-    pub fn new(hash: PackHash, size: u64) -> Self {
+    pub fn new(hash: PackHash, size: u64, chunks: u32) -> Self {
         PackRow {
             hash,
             size,
+            chunks,
             live_count: 0,
             live_bits: Vec::new(),
         }
@@ -605,10 +609,10 @@ impl SegmentWriter {
     }
 
     /// Row of `hash` in the pack table, appending it if new.
-    pub fn pack(&mut self, hash: PackHash, size: u64) -> u16 {
+    pub fn pack(&mut self, hash: PackHash, size: u64, chunks: u32) -> u16 {
         let packs = &mut self.packs;
         *self.pack_pos.entry(hash).or_insert_with(|| {
-            packs.push(PackRow::new(hash, size));
+            packs.push(PackRow::new(hash, size, chunks));
             (packs.len() - 1) as u16
         })
     }
@@ -619,6 +623,10 @@ impl SegmentWriter {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub fn contains(&self, hash: &PathHash) -> bool {
+        self.entries.contains_key(key_of(hash))
     }
 
     pub fn push(&mut self, entry: Entry) {
@@ -741,35 +749,56 @@ impl SegmentWriter {
     }
 }
 
-/// Merge segments of one root: later inputs win on the same key, `keep`
-/// filters paths, pack tables are unioned and unreferenced packs dropped.
-pub fn merge(inputs: &[(&Meta, &Tree)], keep: impl Fn(&PathHash) -> bool) -> Result<Sealed, Error> {
+/// Where a chunk lives after GC moved it: `(pack, pack size, pack entries, index)`.
+pub type Relocated = (PackHash, u64, u32, u16);
+
+/// Merge segments of one root: later inputs win on the same key, pack
+/// tables are unioned and unreferenced packs dropped. `relocate` maps a
+/// chunk of an input pack row to its current home, `None` drops the entry
+/// (its pack is gone). Returns how many paths were dropped.
+pub fn merge(
+    inputs: &[(&Meta, &Tree)],
+    relocate: impl Fn(&PackRow, u16) -> Option<Relocated>,
+) -> Result<(Sealed, usize), Error> {
     let mut writer = SegmentWriter::default();
+    let mut dropped = BTreeSet::new();
     for (meta, tree) in inputs {
         if meta.len() != tree.len() {
             return Err(bad(".meta and .tree disagree on entry count"));
         }
-        let remap: Vec<u16> = meta
-            .packs
-            .iter()
-            .map(|p| writer.pack(p.hash, p.size))
-            .collect();
-        if writer.packs.len() > MAX_PACKS {
-            return Err(bad("merged pack table exceeds u16"));
-        }
-        for i in 0..meta.len() {
-            if !keep(&meta.hash(i)) {
-                continue;
-            }
+        'entries: for i in 0..meta.len() {
             let mut node = tree.node(i)?;
-            node.map_chunks(&mut |c| ChunkRef {
-                pack: remap[c.pack as usize],
-                ..c
-            });
+            let mut lost = false;
+            node.map_chunks(
+                &mut |c| match relocate(&meta.packs[c.pack as usize], c.chunk) {
+                    Some((hash, size, n, chunk)) => ChunkRef {
+                        pack: writer.pack(hash, size, n),
+                        chunk,
+                    },
+                    None => {
+                        lost = true;
+                        c
+                    }
+                },
+            );
+            if lost {
+                dropped.insert(meta.hash(i));
+                continue 'entries;
+            }
+            if writer.packs.len() > MAX_PACKS {
+                return Err(bad("merged pack table exceeds u16"));
+            }
             writer.push(meta.entry(i, node));
         }
     }
-    writer.seal()
+    dropped.retain(|k| !writer.contains(k));
+    let n = dropped.len();
+    Ok((writer.seal()?, n))
+}
+
+/// `relocate` for [`merge`] that keeps every chunk where it is.
+pub fn in_place(row: &PackRow, chunk: u16) -> Option<Relocated> {
+    Some((row.hash, row.size, row.chunks, chunk))
 }
 
 // ---------------------------------------------------------------- pack index
@@ -913,7 +942,7 @@ mod tests {
 
     fn packs(n: usize) -> Vec<PackRow> {
         (0..n)
-            .map(|i| PackRow::new(Blake3Pack([i as u8; 32]), 64 << 20))
+            .map(|i| PackRow::new(Blake3Pack([i as u8; 32]), 64 << 20, 100))
             .collect()
     }
 
@@ -1006,26 +1035,31 @@ mod tests {
     }
 
     #[test]
-    fn merge_later_wins_remaps_packs_and_drops_dead() {
-        let pa = packs(2); // [0], [1]
-        let pb = vec![pa[1].clone(), PackRow::new(Blake3Pack([9; 32]), 1)]; // [1], [9]
+    fn merge_later_wins_remaps_packs_and_drops_lost() {
+        let pa = packs(3); // [0], [1], [2]
+        let pb = vec![pa[1].clone(), PackRow::new(Blake3Pack([9; 32]), 1, 1)]; // [1], [9]
+        let gone = pa[2].hash;
         let e1 = entry(1, &[], &[c(0, 0)]);
         let e2_old = entry(2, &[], &[c(1, 1)]);
         let mut e2_new = entry(2, &[], &[c(1, 2)]); // pack [9]
         e2_new.nar_size = 5;
         let e3 = entry(3, &[&e1.path], &[c(0, 3)]); // pack [1]
-        let dead = entry(4, &[], &[c(0, 0)]);
+        let lost = entry(4, &[], &[c(0, 0), c(2, 0)]); // pack [2] is gone
 
-        let (ma, ta, _) = roundtrip(vec![e1.clone(), e2_old, dead.clone()], pa);
+        let (ma, ta, _) = roundtrip(vec![e1.clone(), e2_old, lost.clone()], pa);
         let (mb, tb, _) = roundtrip(vec![e2_new.clone(), e3.clone()], pb);
-        let sealed = merge(&[(&ma, &ta), (&mb, &tb)], |k| *k != dead.key()).unwrap();
+        let sealed = merge(&[(&ma, &ta), (&mb, &tb)], |row, c| {
+            (row.hash != gone).then_some((row.hash, row.size, row.chunks, c))
+        })
+        .unwrap()
+        .0;
         let (m, t) = (
             Meta::open(&sealed.meta).unwrap(),
             Tree::open(&sealed.tree).unwrap(),
         );
 
         assert_eq!(m.len(), 3);
-        assert_eq!(m.find(&dead.key()), None);
+        assert_eq!(m.find(&lost.key()), None);
         assert_eq!(m.body(m.find(&e2_new.key()).unwrap()).nar_size, 5);
         let hashes: Vec<PackHash> = m.packs.iter().map(|p| p.hash).collect();
         assert_eq!(
@@ -1048,7 +1082,7 @@ mod tests {
     #[test]
     fn merge_drops_unreferenced_packs() {
         let (m, t, _) = roundtrip(vec![entry(1, &[], &[c(2, 0)])], packs(3));
-        let sealed = merge(&[(&m, &t)], |_| true).unwrap();
+        let (sealed, _) = merge(&[(&m, &t)], in_place).unwrap();
         let m2 = Meta::open(&sealed.meta).unwrap();
         assert_eq!(
             m2.packs.iter().map(|p| p.hash).collect::<Vec<_>>(),
