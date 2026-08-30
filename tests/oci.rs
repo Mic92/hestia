@@ -50,24 +50,36 @@ async fn content_keys_are_blobs_and_heads_are_tags() {
 
         assert_eq!(b.list("h-", None).await.unwrap().unwrap(), vec![]);
         let record = Bytes::from_static(b"record body");
-        b.put("c-0000000000000000-00000000075bcd15-x", record.clone())
-            .await
-            .unwrap();
-        b.put("h-0000000000000000-00000000075bcd15-y", Bytes::new())
-            .await
-            .unwrap();
+        b.put(
+            "c-0000000000000000-00000000075bcd15-0000000000000001-x",
+            record.clone(),
+        )
+        .await
+        .unwrap();
+        b.put(
+            "h-0000000000000000-00000000075bcd15-0000000000000001-y",
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            b.get("c-0000000000000000-00000000075bcd15-x", None)
-                .await
-                .unwrap()
-                .unwrap(),
+            b.get(
+                "c-0000000000000000-00000000075bcd15-0000000000000001-x",
+                None
+            )
+            .await
+            .unwrap()
+            .unwrap(),
             record
         );
         assert_eq!(
-            b.get("h-0000000000000000-00000000075bcd15-y", None)
-                .await
-                .unwrap()
-                .unwrap(),
+            b.get(
+                "h-0000000000000000-00000000075bcd15-0000000000000001-y",
+                None
+            )
+            .await
+            .unwrap()
+            .unwrap(),
             Bytes::new()
         );
         let listed: Vec<String> = b
@@ -78,7 +90,10 @@ async fn content_keys_are_blobs_and_heads_are_tags() {
             .into_iter()
             .map(|l| l.key)
             .collect();
-        assert_eq!(listed, ["c-0000000000000000-00000000075bcd15-x"]);
+        assert_eq!(
+            listed,
+            ["c-0000000000000000-00000000075bcd15-0000000000000001-x"]
+        );
         assert_eq!(
             b.list("pack-", None).await.unwrap(),
             None,
@@ -105,7 +120,7 @@ async fn listing_pages_and_lags() {
         let b = fake.backend(&http);
         for i in 0..2100 {
             b.put(
-                &format!("h-0000000000000000-00000000075bcd15-{i:04}"),
+                &format!("h-0000000000000000-00000000075bcd15-0000000000000001-{i:04}"),
                 Bytes::new(),
             )
             .await
@@ -115,16 +130,24 @@ async fn listing_pages_and_lags() {
         assert_eq!(b.list("h-", Some(10)).await.unwrap(), None);
 
         fake.set_tag_lag(5);
-        b.put("g-0000000000000001-z", Bytes::from_static(b"r"))
-            .await
-            .unwrap();
+        b.put(
+            "g-0000000000000001-0000000000000001-z",
+            Bytes::from_static(b"r"),
+        )
+        .await
+        .unwrap();
         assert!(b.list("g-", None).await.unwrap().unwrap().is_empty());
         assert!(
-            b.get("g-0000000000000001-z", None).await.unwrap().is_some(),
+            b.get("g-0000000000000001-0000000000000001-z", None)
+                .await
+                .unwrap()
+                .is_some(),
             "readable by name before it is listed"
         );
         for _ in 0..5 {
-            b.touch("g-0000000000000001-z").await.unwrap();
+            b.touch("g-0000000000000001-0000000000000001-z")
+                .await
+                .unwrap();
         }
         assert_eq!(b.list("g-", None).await.unwrap().unwrap().len(), 1);
     })

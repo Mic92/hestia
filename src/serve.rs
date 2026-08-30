@@ -597,6 +597,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         read_only: read_only.clone(),
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.
         publish: None,
+        clock: crate::pipeline::system_clock(),
     };
 
     let manifest_store = ManifestStore::new();

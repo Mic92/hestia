@@ -21,7 +21,7 @@ use hestia::manifest::{
     Regular, StorePath, StorePathHash,
 };
 use hestia::pathinfo::StoreDir;
-use hestia::pipeline::{AccessLog, upload_pack};
+use hestia::pipeline::{AccessLog, Clock, upload_pack};
 use hestia::refnorm::RefTable;
 use hestia::segment::SegmentWriter;
 use hestia::store::{self, Snapshot};
@@ -106,6 +106,8 @@ pub struct SimCache {
     pub http: reqwest::Client,
     pub rest: RestClient,
     pub backend: Backend,
+    /// The fake's clock, so head names age with `set_clock`.
+    pub clock: Clock,
 }
 
 impl SimCache {
@@ -114,6 +116,7 @@ impl SimCache {
             http: http.clone(),
             rest: fake.rest(http),
             backend: fake.backend(http),
+            clock: fake.clock(),
         }
     }
 
@@ -203,9 +206,15 @@ impl SimCache {
             return;
         }
         let sealed = writer.seal().expect("seal");
-        store::publish(&self.backend, &snapshot.view, root_key, &sealed)
-            .await
-            .expect("publish");
+        store::publish(
+            &self.backend,
+            &snapshot.view,
+            root_key,
+            &sealed,
+            (self.clock)(),
+        )
+        .await
+        .expect("publish");
     }
 
     /// Upload a pack no segment references (a drain that crashed before

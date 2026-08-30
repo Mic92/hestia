@@ -175,6 +175,14 @@ pub struct PipelineContext {
     /// Where the published segment is handed to the substituter, so the
     /// paths this drain pushed are served even while listings lag.
     pub publish: Option<ManifestStore>,
+    /// Unix seconds for head names.
+    pub clock: Clock,
+}
+
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+pub fn system_clock() -> Clock {
+    Arc::new(now_unix)
 }
 
 /// A path that chunked and passed NAR verification.
@@ -542,8 +550,10 @@ impl PipelineContext {
         }
         let commit_started = std::time::Instant::now();
         let sealed = writer.seal().map_err(store::Error::from)?;
-        stats.head =
-            Some(store::publish(&self.backend, &snapshot.view, &self.root_key, &sealed).await?);
+        let now = (self.clock)();
+        stats.head = Some(
+            store::publish(&self.backend, &snapshot.view, &self.root_key, &sealed, now).await?,
+        );
         stats.commit_ms = commit_started.elapsed().as_millis() as u64;
         let next = match snapshot.refresh_with(&sealed).await {
             Ok(next) => next,
@@ -557,7 +567,7 @@ impl PipelineContext {
             .unwrap()
             .subsec_nanos();
         match next
-            .maybe_compact(&self.root_key, now_unix(), f64::from(nanos) / 1e9)
+            .maybe_compact(&self.root_key, now, f64::from(nanos) / 1e9)
             .await
         {
             Ok(Some(name)) => eprintln!("hestia: compacted {} into {name}", self.root_key),
