@@ -12,7 +12,6 @@
 
 pub mod blob;
 pub mod rest;
-pub mod savemutable;
 pub mod twirp;
 
 /// Errors shared by all GHA cache client modules.

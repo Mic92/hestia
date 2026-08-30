@@ -18,7 +18,7 @@ use hestia::protocol::{self, DrainStats, Request};
 use hestia::serve::Daemon;
 use hestia::substituter::{ManifestStore, Substituter};
 
-use support::common::{TEST_ROOT_KEY, committed_manifest, path_hash_of, pipeline_context};
+use support::common::{load_snapshot, path_hash_of, pipeline_context};
 use support::fake_gha::FakeGha;
 use support::store::ScratchStore;
 
@@ -109,8 +109,8 @@ async fn read_only_daemon_never_writes() {
 
     daemon.add(&[&fixture]).await;
     let stats = daemon.stop().await.expect("final drain");
-    assert_eq!(stats.manifest_version, 0);
-    assert!(committed_manifest(&fake, &http).await.is_none());
+    assert!(stats.head.is_none());
+    assert_eq!(load_snapshot(&fake, &http).await.path_count(), 0);
     assert!(fake.blob_requests().is_empty());
 }
 
@@ -152,16 +152,15 @@ async fn hook_drain_status_lifecycle() {
     assert_eq!(stats.paths_received, 2);
     assert_eq!(stats.pushed, 2);
     assert_eq!(stats.packs_uploaded, 1);
-    assert!(stats.manifest_version > 0);
+    assert!(stats.head.is_some());
 
     // Buffer is empty afterwards.
     let status = daemon.request(&Request::Status).await;
     assert_eq!(status.buffered, Some(0));
 
-    // The manifest contains both paths.
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert!(manifest.paths.contains_key(&path_hash_of(&fixture_a)));
-    assert!(manifest.paths.contains_key(&path_hash_of(&fixture_b)));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&fixture_a)));
+    assert!(snapshot.contains(&path_hash_of(&fixture_b)));
 
     // Shutdown: final drain has nothing to do.
     let final_stats = daemon.stop().await.expect("final drain failed");
@@ -219,16 +218,15 @@ async fn drain_under_concurrent_hook_sends_loses_no_paths() {
     // Shutdown drains whatever the racing drains did not catch.
     daemon.stop().await.expect("final drain failed");
 
-    // No path lost: all fixtures are in the manifest and pinned by the root.
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
+    // No path lost.
+    let snapshot = load_snapshot(&fake, &http).await;
     for fixture in &fixtures {
         let hash = path_hash_of(fixture);
         assert!(
-            manifest.paths.contains_key(&hash),
+            snapshot.contains(&hash),
             "path {} lost during concurrent hook/drain",
             fixture.display()
         );
-        assert!(manifest.roots[TEST_ROOT_KEY].paths.contains(&hash));
     }
 }
 
@@ -256,8 +254,8 @@ async fn shutdown_drains_buffered_paths() {
     assert_eq!(stats.pushed, 1);
     assert_eq!(stats.packs_uploaded, 1);
 
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert!(manifest.paths.contains_key(&path_hash_of(&fixture)));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&fixture)));
 }
 
 #[tokio::test]
@@ -302,8 +300,8 @@ async fn idle_exit_drains_and_returns() {
         .expect("final drain failed");
     assert_eq!(stats.pushed, 1);
 
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert!(manifest.paths.contains_key(&path_hash_of(&fixture)));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&fixture)));
 }
 
 #[tokio::test]
@@ -762,8 +760,7 @@ async fn substituter_serves_paths_pushed_by_daemon_drains() {
         // was pushed.
         daemon.stop().await.expect("final drain failed");
         server.abort();
-        let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-        assert!(manifest.roots[TEST_ROOT_KEY].paths.contains(&hash));
+        assert!(load_snapshot(&fake, &http).await.contains(&hash));
     };
     tokio::time::timeout(Duration::from_secs(120), test)
         .await

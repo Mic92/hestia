@@ -371,9 +371,14 @@ function serveFlags() {
   if (readOnly()) {
     flags.push('--read-only');
   }
-  const waitManifestVersion = getInput('wait-manifest-version');
-  if (waitManifestVersion && waitManifestVersion !== '0') {
-    flags.push('--wait-manifest-version', waitManifestVersion);
+  let waitHead = getInput('wait-head');
+  const legacyWait = getInput('wait-manifest-version');
+  if (!waitHead && legacyWait) {
+    console.log('::warning::hestia: wait-manifest-version is deprecated, use wait-head');
+    waitHead = legacyWait;
+  }
+  if (waitHead) {
+    flags.push('--wait-head', waitHead);
   }
   return flags;
 }

@@ -284,8 +284,6 @@ async fn drain_racing_gc_is_kept() {
             ca: None,
             deriver: None,
             tree,
-            last_reachable: 0,
-            last_pushed: 0,
         };
         hestia::store::push_entry(&mut writer, &entry, &known).unwrap();
         stale_view

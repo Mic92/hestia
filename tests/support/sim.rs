@@ -177,8 +177,6 @@ impl SimCache {
                 ca: None,
                 deriver: None,
                 tree,
-                last_reachable: 0,
-                last_pushed: 0,
             });
         }
         if !builder.is_empty() {

@@ -133,7 +133,12 @@ impl ScratchStore {
     ///
     /// Same `name` + `seed` always produces the same store path.
     pub fn add_fixture(&self, name: &str, seed: u64) -> PathBuf {
-        let fixture = self.dir.path().join(format!("fixture-{name}"));
+        self.add_path(&self.write_fixture(self.dir.path(), name, seed))
+    }
+
+    /// [`Self::add_fixture`]'s tree under `parent`, not yet added.
+    pub fn write_fixture(&self, parent: &Path, name: &str, seed: u64) -> PathBuf {
+        let fixture = parent.join(format!("fixture-{name}"));
         std::fs::create_dir_all(fixture.join("bin")).unwrap();
 
         // Executable script.
@@ -158,8 +163,7 @@ impl ScratchStore {
 
         std::fs::write(fixture.join("empty"), b"").unwrap();
         std::os::unix::fs::symlink(format!("bin/{name}"), fixture.join("link")).unwrap();
-
-        self.add_path(&fixture)
+        fixture
     }
 
     /// Register two text paths where `top` references `dep`

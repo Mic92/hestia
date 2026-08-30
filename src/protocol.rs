@@ -80,14 +80,13 @@ pub struct DrainStats {
     /// Pack blobs uploaded.
     #[serde(default)]
     pub packs_uploaded: usize,
-    /// Compressed bytes uploaded (packs only, not the manifest).
+    /// Compressed pack bytes uploaded.
     #[serde(default)]
     pub bytes_uploaded: u64,
-    /// Manifest version this drain committed (`m#N`), 0 if nothing
-    /// needed committing.
+    /// Head this drain published, if anything needed publishing.
     #[serde(default)]
-    pub manifest_version: u64,
-    /// Time spent loading the manifest and querying the local store
+    pub head: Option<String>,
+    /// Time spent loading heads and querying the local store
     /// (everything before chunking starts), in milliseconds.
     #[serde(default)]
     pub load_ms: u64,
@@ -250,7 +249,7 @@ mod tests {
             skipped_upstream: 3,
             packs_uploaded: 1,
             bytes_uploaded: 12345,
-            manifest_version: 7,
+            head: Some("h-x".into()),
             ..DrainStats::default()
         };
         let response = Response::ok().with_stats(stats.clone());

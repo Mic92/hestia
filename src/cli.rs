@@ -59,6 +59,12 @@ pub struct ServeArgs {
     #[arg(long = "serve-branch", value_name = "BRANCH", default_value = "main")]
     pub serve_branches: Vec<String>,
 
+    /// Wait up to 60s at startup until this head is listed. Build jobs
+    /// pass the head an eval job published so its drv closures are
+    /// visible despite cache listing lag.
+    #[arg(long, value_name = "NAME", alias = "wait-manifest-version")]
+    pub wait_head: Option<String>,
+
     /// Skip paths signed by an upstream cache (see
     /// --upstream-cache-key-name) instead of caching them.
     #[arg(long)]
@@ -93,13 +99,6 @@ pub struct ServeArgs {
     /// Nix store database to read path metadata from.
     #[arg(long, default_value = crate::pathinfo::DEFAULT_DB_PATH)]
     pub db_path: PathBuf,
-
-    /// Wait up to 60s at startup until the loaded manifest's version is at
-    /// least this (0 = don't wait). Build jobs pass the version committed
-    /// by an eval job so its drv closures are visible despite GHA cache
-    /// lookup lag.
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    pub wait_manifest_version: u64,
 }
 
 #[derive(Args, Debug)]

@@ -42,12 +42,14 @@ outputs:
   any-jobs:
     description: '"true" when the matrix has at least one job.'
     value: ${{ steps.matrix.outputs.any-jobs }}
-  manifest-version:
+  head:
     description: >
-      Cache manifest version that contains the registered drv closures.
-      Pass to the main hestia action's `wait-manifest-version` input in
-      build jobs.
-    value: ${{ steps.matrix.outputs.manifest-version }}
+      Cache head that publishes the registered drv closures. Pass to the
+      main hestia action's `wait-head` input in build jobs.
+    value: ${{ steps.matrix.outputs.head }}
+  manifest-version:
+    description: Deprecated alias of `head`.
+    value: ${{ steps.matrix.outputs.head }}
 
 runs:
   using: composite

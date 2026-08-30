@@ -10,7 +10,6 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::cli::DrainArgs;
-use crate::pipeline::MANIFEST_PREFIX;
 use crate::protocol::{self, DrainStats, Request};
 
 /// `1 path`, `5 paths`.
@@ -79,13 +78,9 @@ pub fn summarize(stats: &DrainStats) -> String {
         }
         summary.push_str(&format!(" ({inner})"));
     }
-    if stats.manifest_version > 0 {
-        summary.push_str(&format!(
-            "; manifest {MANIFEST_PREFIX}#{}",
-            stats.manifest_version
-        ));
-    } else {
-        summary.push_str("; nothing to commit");
+    match &stats.head {
+        Some(head) => summary.push_str(&format!("; head {head}")),
+        None => summary.push_str("; nothing to publish"),
     }
     summary
 }
@@ -191,7 +186,7 @@ mod tests {
             new_chunks: 123,
             packs_uploaded: 1,
             bytes_uploaded: 456_789,
-            manifest_version: 7,
+            head: Some("h-abc".into()),
             load_ms: 200,
             chunk_ms: 1_000,
             pack_ms: 500,
@@ -202,7 +197,7 @@ mod tests {
         assert_eq!(
             summarize(&stats),
             "pushed 4 paths, 3 already cached, 2 upstream-signed, 1 invalid \
-             (446.1 KiB in 2.0s, 2.2 MiB/s); manifest m3#7"
+             (446.1 KiB in 2.0s, 2.2 MiB/s); head h-abc"
         );
         assert_eq!(
             stage_breakdown(&stats),
@@ -215,14 +210,14 @@ mod tests {
     fn deduplicated_drain_has_no_upload_in_summary_or_breakdown() {
         let stats = DrainStats {
             pushed: 2,
-            manifest_version: 3,
+            head: Some("h-abc".into()),
             load_ms: 100,
             chunk_ms: 400,
             commit_ms: 100,
             elapsed_ms: 600,
             ..DrainStats::default()
         };
-        assert_eq!(summarize(&stats), "pushed 2 paths; manifest m3#3");
+        assert_eq!(summarize(&stats), "pushed 2 paths; head h-abc");
         assert_eq!(
             stage_breakdown(&stats),
             "load 0.1s, chunk 0.4s, commit 0.1s, total 0.6s"
@@ -238,7 +233,6 @@ mod tests {
             pushed: 2,
             new_chunks: 50,
             packs_uploaded: 0,
-            manifest_version: 3,
             load_ms: 100,
             chunk_ms: 400,
             pack_ms: 700,
@@ -261,7 +255,7 @@ mod tests {
             new_chunks: 1,
             packs_uploaded: 1,
             bytes_uploaded: 1_048_576,
-            manifest_version: 1,
+            head: Some("h-abc".into()),
             chunk_ms: 300,
             pack_ms: 100,
             upload_ms: 500,
@@ -271,7 +265,7 @@ mod tests {
         };
         assert_eq!(
             summarize(&stats),
-            "pushed 1 path (1.0 MiB in 1.0s, 2.0 MiB/s); manifest m3#1"
+            "pushed 1 path (1.0 MiB in 1.0s, 2.0 MiB/s); head h-abc"
         );
         assert_eq!(
             stage_breakdown(&stats),
@@ -281,10 +275,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_drain_summary_says_nothing_to_commit() {
+    fn empty_drain_summary_says_nothing_to_publish() {
         assert_eq!(
             summarize(&DrainStats::default()),
-            "pushed 0 paths; nothing to commit"
+            "pushed 0 paths; nothing to publish"
         );
     }
 

@@ -17,7 +17,7 @@ job builds, and an HTTP listener serving the Nix binary cache protocol.
 
 The action puts the daemon first in `extra-substituters`, so Nix asks
 it before cache.nixos.org. A narinfo hit answers straight from the
-manifest. A NAR request is more involved: the daemon fetches the path's
+segments loaded at startup. A NAR request is more involved: the daemon fetches the path's
 chunks from pack blobs with HTTP Range reads, reassembles the NAR, and
 verifies its hash before the first byte leaves the process. Any failure
 along the way (evicted pack, missing chunk, hash mismatch) becomes a
@@ -32,37 +32,35 @@ Nix runs `hestia hook` after every successful build; the hook forwards
 the built paths over the unix socket and the daemon buffers them in
 memory. Uploads happen on drain: the action's post step, the idle
 timeout, or SIGTERM. A drain takes the buffered paths plus everything
-the substituter served, chunks the new ones, uploads packs, and commits
-a new manifest version.
+the substituter served, chunks the new ones, uploads packs, and
+publishes a segment plus a head naming it.
 
 ## Storage view
 
-![manifest and pack layout](architecture.svg)
+![segments, heads and packs](segments.svg)
 
-hestia creates only two kinds of cache entry: the manifest, and pack
-blobs.
+hestia creates four kinds of cache entry, all write-once and named by
+content or by what they claim: pack blobs (`pack-<hash>`) with a
+per-pack chunk index (`idx-<hash>`), segments (`seg-<digest>.meta` and
+`.tree`), and heads (`g-*`, `h-*`, `c-*`).
 
-### Manifest
+### Segments and heads
 
-The manifest is a single zstd-compressed CBOR document describing
-everything hestia has stored: four maps over paths, chunks, packs, and
-GC roots. The wire form is columnar (hash tables plus parallel arrays)
-to keep repeated 32-byte hashes from bloating the encoding; the
-in-memory form is plain B-tree maps optimized for merging.
+A segment is what one writer published for one root: `.meta` holds a
+sorted path index, per-path narinfo fields and a pack table with a
+live-chunk bitset per pack; `.tree` holds the file trees, where a
+file's contents is a list of `(pack row, index in pack)` references
+plus reference rewrites (see below). Nothing in a segment is ever
+modified, so there is no merge conflict to resolve: concurrent drains
+simply publish one segment each.
 
-The cache is write-once, but the manifest must change. SaveMutable (a
-pattern borrowed from go-actions-cache) fakes mutability with a key
-sequence `m#1`, `m#2`, …: the highest index is the current version, and
-a writer claims the next index by reserving it. When two drains race,
-one loses the reservation, reloads the winner's version, merges its own
-changes on top, and tries again. All manifest merges are commutative
-and idempotent, so the outcome does not depend on who wins.
-
-A `PathEntry` holds what narinfo needs (store path, NAR hash and size,
-references) plus the path's file tree, where each file's contents is a
-list of chunk hashes (plus a table of reference rewrites -- see below).
-Chunk hashes resolve through the `chunks` map to a location: which
-pack, at what offset, how many bytes.
+Which segments make up a root is decided by heads, empty-bodied or
+small entries whose *names* carry the claim: `h-<epoch>-<root>-<seg>`
+(a drain added a segment), `c-<epoch>-<root>-<id>` (a compaction
+replaced some), `g-<epoch>-<id>` (GC rewrote every root). A reader
+lists the heads, takes the newest GC record as the base and applies
+the drain and compaction heads published since. `docs/spec/segments.qnt`
+is the model of these rules.
 
 ### Packs
 
@@ -115,18 +113,20 @@ serving. Any disagreement is a 404, and Nix falls through.
 ### Roots and GC
 
 What stays alive is decided by roots, one per branch and system (e.g.
-`main-x86_64-linux`). Every drain rewrites its root to the paths the
-job pushed or accessed. Roots from the same workflow run merge by
-union, so matrix legs accumulate into one closure no matter how far
-apart they finish; a later run replaces the root, which is what lets
-old closures die. The full GC story (mark, sweep, repack, eviction
-touching) lives at the top of `src/gc.rs`.
+`main-x86_64-linux`). Every drain publishes a segment naming what the
+job pushed, found stored, or substituted. GC compacts each root to the
+union of what drains named since its previous run, so matrix legs and
+re-runs accumulate while closures no job uses any more die. GC is the
+only deleter: it repacks mostly-dead packs, publishes the new GC head
+and only then deletes what neither the new view nor the previous one
+references (`src/gc.rs`).
 
 ### Crash safety
 
 Order of operations does the heavy lifting. Packs are uploaded before
-the manifest version that references them, so a manifest never points
-at a blob that was never finalized. A crash between the two leaves an
-orphaned pack, which GC's orphan scan deletes later. The reverse
-hazard, GitHub evicting a pack the manifest still references, is
-handled at read time (404 → next substituter) and reconciled by GC.
+the segment that references them, the segment before its head, so a
+head never points at a blob that was never finalized. A crash in
+between leaves orphans, which GC deletes once they are older than a
+drain could take. The reverse hazard, GitHub evicting a pack a segment
+still references, is handled at read time (404 → next substituter) and
+by GC dropping the affected entries so the next job pushes them again.

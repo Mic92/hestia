@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hestia::manifest::Hash32;
-use hestia::pipeline::{AccessLog, now_unix};
+use hestia::pipeline::AccessLog;
 use hestia::protocol::DrainStats;
 use hestia::store::Snapshot;
 use hestia::substituter::{ManifestStore, Substituter};
@@ -30,12 +30,12 @@ async fn push(
     paths: &[&std::path::Path],
 ) -> DrainStats {
     let ctx = pipeline_context(fake, http, store.database());
-    ctx.run(to_path_set(paths), BTreeSet::new(), now_unix())
+    ctx.run(to_path_set(paths), BTreeSet::new())
         .await
         .expect("pipeline run")
 }
 
-/// Serves segments only: the legacy manifest is never loaded.
+/// Serves what the drains published.
 async fn serve(
     fake: &FakeGha,
     http: &reqwest::Client,
@@ -173,7 +173,6 @@ async fn drain_dedups_against_segments() {
         assert_eq!(first.pushed, 1);
 
         let mut ctx = pipeline_context(&fake, &http, store.database());
-        ctx.manifest_prefix = "other".to_string();
         let publish = ManifestStore::new();
         let snapshot = Snapshot::load(fake.backend(&http), &[TEST_ROOT_KEY.to_string()], None)
             .await
@@ -181,7 +180,7 @@ async fn drain_dedups_against_segments() {
         publish.set_snapshot(Arc::new(snapshot));
         ctx.publish = Some(publish.clone());
         let second = ctx
-            .run(to_path_set(&[&top, &dep]), BTreeSet::new(), now_unix())
+            .run(to_path_set(&[&top, &dep]), BTreeSet::new())
             .await
             .unwrap();
         assert_eq!(second.pushed, 1);
@@ -192,51 +191,6 @@ async fn drain_dedups_against_segments() {
         for p in [&top, &dep] {
             assert!(served.contains(&support::common::path_hash_of(p)));
         }
-    })
-    .await;
-}
-
-/// A store from before segments: packs and a legacy manifest, but no
-/// heads or pack indexes. A drain that dedups against those packs must
-/// upload their indexes so the new segment stays servable.
-#[tokio::test]
-async fn dedup_against_legacy_packs_uploads_their_index() {
-    timed(async {
-        let Some(store) = ScratchStore::create() else {
-            return;
-        };
-        let old = store.add_fixture("seglegacy-a", 93);
-        let new = store.add_fixture("seglegacy-b", 93);
-        let fake = FakeGha::start().await;
-        let http = reqwest::Client::new();
-        let first = push(&fake, &http, &store, &[&old]).await;
-        assert!(first.new_chunks > 1);
-        let backend = fake.backend(&http);
-        for prefix in ["g-", "h-", "c-", "seg-", "idx-"] {
-            for entry in backend.list(prefix, None).await.unwrap().unwrap() {
-                backend.delete(&entry.key).await.unwrap();
-            }
-        }
-
-        let second = push(&fake, &http, &store, &[&new]).await;
-        assert!(
-            second.new_chunks < first.new_chunks,
-            "{second:?} vs {first:?}"
-        );
-        let (base, _log, _task) = serve(&fake, &http, &store).await;
-        let hash = &new.file_name().unwrap().to_str().unwrap()[..32];
-        let narinfo = http
-            .get(format!("{base}/{hash}.narinfo"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(narinfo.status(), 200);
-        let text = narinfo.text().await.unwrap();
-        let url = text.lines().find_map(|l| l.strip_prefix("URL: ")).unwrap();
-        let nar = http.get(format!("{base}/{url}")).send().await.unwrap();
-        assert_eq!(nar.status(), 200);
-        let (expected_hash, _) = store.nar_hash_oracle(&new).expect("nix oracle");
-        assert_eq!(Hash32::digest(nar.bytes().await.unwrap()), expected_hash);
     })
     .await;
 }

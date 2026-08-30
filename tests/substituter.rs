@@ -10,14 +10,17 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hestia::chunker::pack_cache_key;
-use hestia::manifest::{Hash32, Manifest, PathHash};
+use hestia::gc::{Gc, GcPolicy};
+use hestia::manifest::{Hash32, PathHash};
 use hestia::pipeline::{AccessLog, now_unix};
+use hestia::store::Snapshot;
 use hestia::substituter::{ManifestStore, Substituter, verify_packs};
 
-use support::common::{TEST_ROOT_KEY, pipeline_context, store_entry, to_path_set};
+use support::common::{TEST_ROOT_KEY, load_snapshot, pipeline_context, to_path_set};
 use support::fake_gha::FakeGha;
 use support::store::{ScratchStore, assert_trees_equal, nix_copy};
 
@@ -50,14 +53,10 @@ impl Drop for RunningSubstituter {
 }
 
 impl RunningSubstituter {
-    /// Start a substituter for `store`, serving the manifest currently
-    /// committed in `fake`.
+    /// Start a substituter for `store`, serving what `fake` publishes.
     async fn start(fake: &FakeGha, http: &reqwest::Client, store: &ScratchStore) -> Self {
-        let ctx = pipeline_context(fake, http, store.database());
-        let manifest = ctx.load_manifest().await.expect("loading manifest failed");
-
         let manifest_store = ManifestStore::new();
-        manifest_store.set(manifest);
+        manifest_store.set_snapshot(load_snapshot(fake, http).await);
         let access_log = AccessLog::new();
 
         let substituter = Substituter::new(
@@ -112,20 +111,20 @@ fn path_hash_of(store_path: &Path) -> PathHash {
     path_hash_str(store_path).parse().unwrap()
 }
 
-/// Push paths through the write pipeline and return the committed manifest.
+/// Push paths through the write pipeline and return what is published.
 async fn push_paths(
     fake: &FakeGha,
     http: &reqwest::Client,
     store: &ScratchStore,
     paths: &[&Path],
-) -> Manifest {
+) -> Arc<Snapshot> {
     let ctx = pipeline_context(fake, http, store.database());
     let stats = ctx
-        .run(to_path_set(paths), BTreeSet::new(), now_unix())
+        .run(to_path_set(paths), BTreeSet::new())
         .await
         .expect("pipeline run failed");
     assert_eq!(stats.pushed, paths.len(), "all paths must be pushed");
-    ctx.load_manifest().await.expect("loading manifest failed")
+    load_snapshot(fake, http).await
 }
 
 /// Parse narinfo text into a key -> value map (References kept as one line).
@@ -304,7 +303,7 @@ async fn nar_round_trips_with_matching_hash() {
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
-        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let snapshot = push_paths(&fake, &http, &store, &[&fixture]).await;
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
         // Follow the URL from the narinfo response, like Nix does.
@@ -331,8 +330,8 @@ async fn nar_round_trips_with_matching_hash() {
         assert_eq!(body_hash, expected_hash, "NAR hash mismatch vs nix oracle");
         assert_eq!(
             body_hash,
-            manifest.paths[&path_hash_of(&fixture)].nar_hash,
-            "NAR hash mismatch vs manifest"
+            snapshot.lookup(&path_hash_of(&fixture)).unwrap().nar_hash,
+            "NAR hash mismatch vs narinfo"
         );
 
         // The same NAR is also reachable without the ?hash= parameter (pure
@@ -381,7 +380,6 @@ async fn drv_closure_bypasses_upstream_filter_and_imports_into_a_fresh_store() {
             .run(
                 to_path_set(&[&drv, &unrelated_upstream]),
                 BTreeSet::new(),
-                now_unix(),
             )
             .await
             .expect("pipeline run failed");
@@ -450,7 +448,6 @@ async fn drv_closure_bypasses_upstream_filter_and_imports_into_a_fresh_store() {
             .run(
                 to_path_set(&[&drv, &unrelated_upstream]),
                 BTreeSet::new(),
-                now_unix(),
             )
             .await
             .expect("pipeline run failed");
@@ -569,11 +566,11 @@ async fn evicted_pack_turns_nar_requests_into_404() {
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
-        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let snapshot = push_paths(&fake, &http, &store, &[&fixture]).await;
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
         // Simulate quota-pressure LRU eviction of the pack blob.
-        let pack_hash = *manifest.packs.keys().next().expect("one pack uploaded");
+        let pack_hash = *snapshot.pack_hashes().first().expect("one pack uploaded");
         fake.evict(&http, &pack_cache_key(&pack_hash)).await;
 
         // narinfo still answers (the manifest survived) ...
@@ -610,10 +607,10 @@ async fn evicted_pack_negative_caches_narinfo() {
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
-        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let snapshot = push_paths(&fake, &http, &store, &[&fixture]).await;
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
-        let pack_hash = *manifest.packs.keys().next().expect("one pack uploaded");
+        let pack_hash = *snapshot.pack_hashes().first().expect("one pack uploaded");
         fake.evict(&http, &pack_cache_key(&pack_hash)).await;
 
         // The eviction is not known yet.
@@ -633,13 +630,13 @@ async fn evicted_pack_negative_caches_narinfo() {
             "narinfo must miss once the pack is known to be evicted"
         );
 
-        // A manifest replacement resets the negative cache.
-        substituter.manifest.set(manifest.clone());
+        // A snapshot replacement resets the negative cache.
+        substituter.manifest.set_snapshot(snapshot.clone());
         let response = substituter.narinfo(&http, &fixture).await;
         assert_eq!(
             response.status(),
             200,
-            "a fresh manifest must clear the negative cache"
+            "a fresh snapshot must clear the negative cache"
         );
     })
     .await;
@@ -655,7 +652,7 @@ async fn eager_pack_verification_marks_evicted_packs_upfront() {
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
-        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let snapshot = push_paths(&fake, &http, &store, &[&fixture]).await;
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
         // One pack listed, zero threshold: verification must bail out
@@ -667,7 +664,7 @@ async fn eager_pack_verification_marks_evicted_packs_upfront() {
             "a bailed-out verification must not mark packs missing"
         );
 
-        let pack_hash = *manifest.packs.keys().next().expect("one pack uploaded");
+        let pack_hash = *snapshot.pack_hashes().first().expect("one pack uploaded");
         fake.evict(&http, &pack_cache_key(&pack_hash)).await;
 
         // The listing reveals the eviction before Nix ever asks.
@@ -710,27 +707,27 @@ async fn narinfo_hits_join_the_root_at_next_drain() {
             "only the served path is recorded"
         );
 
-        // A later drain (no new pushed paths) replaces the root with
-        // pushed ∪ accessed. A different run id makes the new root
-        // *replace* the old one instead of merging with it.
-        let mut ctx = pipeline_context(&fake, &http, store.database());
-        ctx.run_id = Some("another-run".to_string());
-        let later = now_unix() + 3600;
+        // A later drain (no new pushed paths) publishes a segment naming
+        // the accessed path only: that is what GC keeps of this root.
+        let ctx = pipeline_context(&fake, &http, store.database());
         let stats = ctx
-            .run(BTreeSet::new(), substituter.access_log.snapshot(), later)
+            .run(BTreeSet::new(), substituter.access_log.snapshot())
             .await
             .expect("drain failed");
-        assert!(stats.manifest_version > 0);
-
-        let manifest = ctx.load_manifest().await.unwrap();
-        let root = &manifest.roots[TEST_ROOT_KEY];
+        assert!(stats.head.is_some());
+        let snapshot = load_snapshot(&fake, &http).await;
+        let newest = &snapshot.view.roots[TEST_ROOT_KEY][1];
+        let body = fake
+            .backend(&http)
+            .get(&hestia::store::meta_key(newest), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let meta = hestia::segment::Meta::open(&body).unwrap();
+        assert!(meta.find(&path_hash_of(&fixture_a)).is_some());
         assert!(
-            root.paths.contains(&path_hash_of(&fixture_a)),
-            "accessed path must be pinned by the new root"
-        );
-        assert!(
-            !root.paths.contains(&path_hash_of(&fixture_b)),
-            "never-accessed, never-pushed path must drop out of the root"
+            meta.find(&path_hash_of(&fixture_b)).is_none(),
+            "never-accessed, never-pushed path is not named again"
         );
     })
     .await;
@@ -795,8 +792,8 @@ async fn expired_download_url_is_refreshed_mid_serving() {
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
-        let manifest = push_paths(&fake, &http, &store, &[&fixture_a, &fixture_b]).await;
-        assert_eq!(manifest.packs.len(), 1, "one shared pack expected");
+        let snapshot = push_paths(&fake, &http, &store, &[&fixture_a, &fixture_b]).await;
+        assert_eq!(snapshot.pack_hashes().len(), 1, "one shared pack expected");
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
         // Serve A: caches the signed pack URL.
@@ -840,7 +837,7 @@ async fn expired_download_url_is_refreshed_mid_serving() {
 }
 
 #[tokio::test]
-async fn manifest_updates_become_visible_without_restart() {
+async fn drains_become_visible_without_restart() {
     timed(async {
         let Some(store) = ScratchStore::create() else {
             return;
@@ -859,13 +856,13 @@ async fn manifest_updates_become_visible_without_restart() {
         assert_eq!(
             substituter.narinfo(&http, &fixture_b).await.status(),
             404,
-            "B is not in the manifest yet"
+            "B is not published yet"
         );
 
         // B gets pushed by a later drain; the daemon hands the refreshed
-        // manifest to the substituter (here: ManifestStore::set).
+        // snapshot to the substituter.
         let updated = push_paths(&fake, &http, &store, &[&fixture_b]).await;
-        substituter.manifest.set(updated);
+        substituter.manifest.set_snapshot(updated);
 
         // Both paths are servable now, including their NARs.
         for fixture in [&fixture_a, &fixture_b] {
@@ -946,12 +943,12 @@ async fn transient_blob_failure_is_retried_transparently() {
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
-        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let snapshot = push_paths(&fake, &http, &store, &[&fixture]).await;
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
         // Request the NAR directly: the narinfo round-trip is irrelevant
         // here, the injected failure targets the pack Range read.
-        let entry = &manifest.paths[&path_hash_of(&fixture)];
+        let entry = snapshot.lookup(&path_hash_of(&fixture)).unwrap();
         let nar_url = format!("nar/{}.nar", entry.nar_hash.to_hex());
 
         // Exactly one connection drop: within the retry budget.
@@ -990,11 +987,11 @@ async fn nar_downloads_record_access_without_a_narinfo_hit() {
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
-        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let snapshot = push_paths(&fake, &http, &store, &[&fixture]).await;
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
         let path_hash = path_hash_of(&fixture);
-        let entry = &manifest.paths[&path_hash];
+        let entry = snapshot.lookup(&path_hash).unwrap();
 
         // Fetch the NAR directly, both with and without the ?hash= parameter
         // a narinfo URL would carry. No narinfo request is ever made.
@@ -1019,30 +1016,27 @@ async fn nar_downloads_record_access_without_a_narinfo_hit() {
 }
 
 #[tokio::test]
-async fn concurrent_gc_repack_triggers_manifest_reload() {
+async fn concurrent_gc_repack_triggers_reload() {
     timed(async {
-        // A nightly `hestia gc` repack moves live chunks into a new pack,
-        // commits the manifest, and deletes the old pack — while a running
-        // daemon still serves the pre-repack view. The NAR handler must
-        // reload the manifest on the pack miss and serve from the new pack
-        // instead of 404ing every affected path for the rest of the job.
+        // A nightly `hestia gc` repack moves live chunks into a new pack
+        // and the old pack disappears while a running daemon still serves
+        // the pre-repack view. The NAR handler must reload on the pack
+        // miss and serve from the new pack instead of 404ing every
+        // affected path for the rest of the job.
         let Some(store) = ScratchStore::create() else {
             return;
         };
         let fixture = store.add_fixture("repack-reload", 157);
+        let dropped = store.add_fixture("repack-dropped", 163);
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
-        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
-        let twirp = fake.twirp(&http);
+        let snapshot = push_paths(&fake, &http, &store, &[&fixture, &dropped]).await;
 
-        // Substituter serving the pre-repack manifest, wired with the same
-        // reload hook hestia serve installs.
         let manifest_store = ManifestStore::new();
-        manifest_store.set(manifest.clone());
+        manifest_store.set_snapshot(snapshot.clone());
         let reload_store = manifest_store.clone();
-        let reload_twirp = twirp.clone();
-        let reload_http = http.clone();
+        let reload_backend = fake.backend(&http);
         let substituter = Substituter::new(
             store.database().store_dir().clone(),
             manifest_store.clone(),
@@ -1050,20 +1044,12 @@ async fn concurrent_gc_repack_triggers_manifest_reload() {
             fake.backend(&http),
         )
         .with_manifest_reload(std::sync::Arc::new(move || {
-            let twirp = reload_twirp.clone();
-            let http = reload_http.clone();
+            let backend = reload_backend.clone();
             let manifest_store = reload_store.clone();
             Box::pin(async move {
-                let save = hestia::gha::savemutable::SaveMutable::new(
-                    &twirp,
-                    &http,
-                    hestia::pipeline::MANIFEST_PREFIX,
-                );
-                if let Ok(Some(entry)) = save.load().await {
-                    manifest_store.set_version_if_newer(
-                        hestia::pipeline::decode_manifest_or_empty(&entry.data),
-                        entry.index,
-                    );
+                let roots = [TEST_ROOT_KEY.to_string()];
+                if let Ok(s) = Snapshot::load(backend, &roots, None).await {
+                    manifest_store.set_snapshot(Arc::new(s));
                 }
             })
         }));
@@ -1075,53 +1061,37 @@ async fn concurrent_gc_repack_triggers_manifest_reload() {
                 .unwrap();
         });
 
-        // Simulate the gc repack: copy the pack bytes into a new pack (one
-        // padding byte appended so the content hash changes; chunk offsets
-        // are unaffected), rewrite the manifest, delete the old pack.
-        let old_pack = *manifest.packs.keys().next().expect("one pack uploaded");
-        let url = match twirp
-            .get_download_url(&pack_cache_key(&old_pack), &[])
-            .await
-            .unwrap()
-        {
-            hestia::gha::twirp::DownloadUrl::Hit { url, .. } => url,
-            hestia::gha::twirp::DownloadUrl::Miss => panic!("pack must exist"),
+        // A later job uses only `fixture`, so after the next GC half the
+        // pack is dead: GC copies the live half into a new pack and the
+        // old one goes away.
+        let old_pack = *snapshot.pack_hashes().first().expect("one pack uploaded");
+        let gc = Gc {
+            backend: fake.backend(&http),
+            policy: GcPolicy {
+                min_liveness: 0.9,
+                ..GcPolicy::default()
+            },
+            dry_run: false,
         };
-        let mut pack_bytes = hestia::gha::blob::get(&http, &url, None)
+        let t = now_unix() + 2 * 3600;
+        gc.run(t).await.unwrap();
+        pipeline_context(&fake, &http, store.database())
+            .run(BTreeSet::new(), BTreeSet::from([path_hash_of(&fixture)]))
             .await
-            .unwrap()
-            .to_vec();
-        pack_bytes.push(0);
-        let new_pack = hestia::manifest::PackHash::digest(&pack_bytes);
-        store_entry(&twirp, &http, &pack_cache_key(&new_pack), &pack_bytes).await;
-
-        let mut repacked = manifest.clone();
-        let info = repacked.packs.remove(&old_pack).unwrap();
-        repacked.packs.insert(new_pack, info);
-        for location in repacked.chunks.values_mut() {
-            assert_eq!(location.pack, old_pack);
-            location.pack = new_pack;
-        }
-        let save = hestia::gha::savemutable::SaveMutable::new(
-            &twirp,
-            &http,
-            hestia::pipeline::MANIFEST_PREFIX,
-        );
-        save.save(|_| Ok(repacked.encode().expect("manifest encodes")))
-            .await
-            .expect("committing the repacked manifest failed");
+            .unwrap();
+        let stats = gc.run(t + 2 * 3600).await.unwrap();
+        assert_eq!(stats.packs_repacked, 1);
         fake.evict(&http, &pack_cache_key(&old_pack)).await;
 
         // The served view is stale (still points at the deleted pack), but
         // the NAR request must succeed via the reload.
-        let entry = &manifest.paths[&path_hash_of(&fixture)];
+        let entry = snapshot.lookup(&path_hash_of(&fixture)).unwrap();
         let nar_url = format!("{base_url}/nar/{}.nar", entry.nar_hash.to_hex());
         let response = http.get(&nar_url).send().await.unwrap();
         assert_eq!(
             response.status(),
             200,
-            "a pack deleted by a concurrent gc repack must trigger a manifest \
-             reload, not a 404"
+            "a pack deleted by a concurrent gc repack must trigger a reload, not a 404"
         );
         assert_eq!(
             Hash32::digest(response.bytes().await.unwrap()),
@@ -1145,10 +1115,10 @@ async fn persistent_blob_failures_yield_404_then_recover() {
 
         let fake = FakeGha::start().await;
         let http = reqwest::Client::new();
-        let manifest = push_paths(&fake, &http, &store, &[&fixture]).await;
+        let snapshot = push_paths(&fake, &http, &store, &[&fixture]).await;
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
-        let entry = &manifest.paths[&path_hash_of(&fixture)];
+        let entry = snapshot.lookup(&path_hash_of(&fixture)).unwrap();
         let nar_url = format!("nar/{}.nar", entry.nar_hash.to_hex());
 
         // More failures than the retry budget can absorb.

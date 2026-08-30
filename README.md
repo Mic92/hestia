@@ -70,7 +70,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       any-jobs: ${{ steps.matrix.outputs.any-jobs }}
-      manifest-version: ${{ steps.matrix.outputs.manifest-version }}
+      head: ${{ steps.matrix.outputs.head }}
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
@@ -96,7 +96,7 @@ jobs:
       - uses: NixOS/nix-installer-action@main
       - uses: Mic92/hestia@v3
         with:
-          wait-manifest-version: ${{ needs.eval.outputs.manifest-version }}
+          wait-head: ${{ needs.eval.outputs.head }}
       - name: Prefetch drv closure
         run: "$HESTIA_BIN" prefetch ${{ matrix.installables }}
       - run: nix build -L ${{ matrix.installables }}
@@ -304,7 +304,7 @@ when the branch is deleted. In practice this means:
 ### What hestia itself enforces
 
 Pack blobs are content-addressed (BLAKE3-named, hash-verified on every
-read), and NARs are verified against the manifest's SHA-256 NAR hash
+read), and NARs are verified against the recorded SHA-256 NAR hash
 before being served. Anything that doesn't check out is treated as a cache miss and gets
 rebuilt.
 

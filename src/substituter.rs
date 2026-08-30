@@ -48,12 +48,12 @@ use crate::backend::Backend;
 use crate::chunker::{self, extract_chunk, flatten_tree, nar_from_chunks, pack_cache_key};
 use crate::gha::Error as GhaError;
 use crate::manifest::{
-    ChunkHash, ChunkLocation, FileSystemObject, Hash32, Manifest, PackHash, PathEntry, PathHash,
+    ChunkHash, ChunkLocation, FileSystemObject, Hash32, PackHash, PathEntry, PathHash,
 };
 use crate::pipeline::AccessLog;
 use crate::refnorm::RefTable;
 use crate::segment::PackIndex;
-use crate::store::{ChunkMap, Resolved, Snapshot, pack_indexes};
+use crate::store::{ChunkMap, Resolved, Snapshot};
 
 /// Priority advertised in /nix-cache-info. Lower wins: 30 puts hestia ahead
 /// of cache.nixos.org (40), so Nix asks the local cache first and only falls
@@ -83,21 +83,12 @@ const PACK_READ_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
 /// matter how the packs distribute over paths.
 const MAX_CONCURRENT_PACK_FETCHES: usize = 8;
 
-/// What the substituter serves from: the segmented store first, the
-/// legacy single manifest as fallback.
+/// What the substituter serves from.
 #[derive(Default)]
 struct ManifestView {
     snapshot: Option<Arc<Snapshot>>,
-    manifest: Manifest,
-    /// NAR hash → manifest path key, for `/nar/{narhash}.nar` requests that
-    /// arrive without the `?hash=` parameter.
-    by_nar_hash: BTreeMap<Hash32, PathHash>,
-    pack_index: HashMap<PackHash, Arc<PackIndex>>,
-    /// SaveMutable index this manifest was loaded from / committed as
-    /// (0 = unknown or no manifest yet).
-    version: u64,
     /// Packs observed to be evicted from the cache. Affected paths 404
-    /// already at narinfo time. Lives inside the view so every manifest
+    /// already at narinfo time. Lives inside the view so every snapshot
     /// replacement starts from an empty set.
     missing_packs: Mutex<BTreeSet<PackHash>>,
 }
@@ -110,88 +101,41 @@ impl ManifestView {
             .insert(pack);
     }
 
-    /// Whether no chunk of `entry` lives in a known-missing pack. The
-    /// chunk walk only runs after an eviction was actually observed.
-    fn entry_available(&self, entry: &PathEntry) -> bool {
+    /// Whether no chunk of `hash` lives in a known-missing pack. The
+    /// tree walk only runs after an eviction was actually observed.
+    async fn available(&self, hash: &PathHash) -> bool {
         let missing = self
             .missing_packs
             .lock()
-            .expect("missing pack set poisoned");
-        if missing.is_empty() {
+            .expect("missing pack set poisoned")
+            .clone();
+        let Some(snapshot) = self.snapshot.as_ref().filter(|_| !missing.is_empty()) else {
             return true;
-        }
-        entry_chunks(entry).iter().all(|chunk| {
-            self.manifest
-                .chunks
-                .get(chunk)
-                .is_none_or(|location| !missing.contains(&location.pack))
-        })
+        };
+        snapshot
+            .packs_of(hash)
+            .await
+            .is_ok_and(|packs| packs.is_disjoint(&missing))
     }
 
     fn lookup(&self, hash: &PathHash) -> Option<PathEntry> {
-        if let Some(entry) = self.snapshot.as_ref().and_then(|s| s.lookup(hash)) {
-            return Some(entry);
-        }
-        self.manifest.paths.get(hash).cloned()
+        self.snapshot.as_ref()?.lookup(hash)
     }
 
     fn contains(&self, hash: &PathHash) -> bool {
         self.snapshot.as_ref().is_some_and(|s| s.contains(hash))
-            || self.manifest.paths.contains_key(hash)
     }
 
     async fn resolve(&self, hash: &PathHash) -> Result<Option<Resolved>, FetchError> {
-        if let Some(snapshot) = &self.snapshot
-            && let Some(r) = snapshot.resolve(hash).await?
-        {
-            return Ok(Some(r));
-        }
-        let Some(entry) = self.manifest.paths.get(hash) else {
+        let Some(s) = &self.snapshot else {
             return Ok(None);
         };
-        let mut map = ChunkMap::default();
-        for chunk in entry_chunks(entry) {
-            let location = self
-                .manifest
-                .chunks
-                .get(&chunk)
-                .ok_or(FetchError::UnknownChunk(chunk))?;
-            map.packs
-                .entry(location.pack)
-                .or_insert_with(|| self.pack_index[&location.pack].clone());
-            map.chunks.insert(chunk, location.clone());
-        }
-        Ok(Some(Resolved {
-            entry: entry.clone(),
-            map,
-        }))
-    }
-
-    fn new(manifest: Manifest, version: u64, snapshot: Option<Arc<Snapshot>>) -> Self {
-        let by_nar_hash = manifest
-            .paths
-            .iter()
-            .map(|(path_hash, entry)| (entry.nar_hash, *path_hash))
-            .collect();
-        let pack_index = pack_indexes(&manifest)
-            .into_iter()
-            .map(|(p, i)| (p, Arc::new(i)))
-            .collect();
-        Self {
-            snapshot,
-            manifest,
-            by_nar_hash,
-            pack_index,
-            version,
-            missing_packs: Mutex::new(BTreeSet::new()),
-        }
+        Ok(s.resolve(hash).await?)
     }
 }
 
-/// Shared, replaceable manifest: the substituter reads it on every request,
-/// the daemon replaces it at startup and after every successful drain.
-///
-/// Cloning is cheap (shared state).
+/// Shared, replaceable view: the substituter reads it on every request,
+/// the daemon replaces it at startup and after every drain.
 #[derive(Clone, Default)]
 pub struct ManifestStore {
     inner: Arc<RwLock<Arc<ManifestView>>>,
@@ -202,65 +146,24 @@ impl ManifestStore {
         Self::default()
     }
 
-    /// Replace the served manifest (version unknown).
-    pub fn set(&self, manifest: Manifest) {
-        self.set_version(manifest, 0);
-    }
-
-    /// Replace the served manifest, recording the SaveMutable index it came
-    /// from. The version is what the pipeline uses for read-your-writes:
-    /// it merges this manifest into every commit base and never reserves an
-    /// index at or below it.
-    pub fn set_version(&self, manifest: Manifest, version: u64) {
-        let mut inner = self.inner.write().expect("manifest lock poisoned");
-        let snapshot = inner.snapshot.clone();
-        *inner = Arc::new(ManifestView::new(manifest, version, snapshot));
-    }
-
     pub fn set_snapshot(&self, snapshot: Arc<Snapshot>) {
-        let mut inner = self.inner.write().expect("manifest lock poisoned");
-        *inner = Arc::new(ManifestView::new(
-            inner.manifest.clone(),
-            inner.version,
-            Some(snapshot),
-        ));
+        *self.inner.write().expect("manifest lock poisoned") = Arc::new(ManifestView {
+            snapshot: Some(snapshot),
+            missing_packs: Mutex::default(),
+        });
     }
 
     pub fn snapshot(&self) -> Option<Arc<Snapshot>> {
         self.view().snapshot.clone()
     }
 
-    /// Replace the served manifest only if `version` is newer than the
-    /// served one. Used by the startup load, which runs concurrently with
-    /// the daemon: a drain may commit (and publish) a newer manifest before
-    /// the initial load finishes, and that newer version must win.
-    pub fn set_version_if_newer(&self, manifest: Manifest, version: u64) {
-        let mut inner = self.inner.write().expect("manifest lock poisoned");
-        if version > inner.version {
-            let snapshot = inner.snapshot.clone();
-            *inner = Arc::new(ManifestView::new(manifest, version, snapshot));
-        }
-    }
-
-    /// The served manifest and its version (clone; manifests are small).
-    pub fn versioned(&self) -> (u64, Manifest) {
-        let view = self.view();
-        (view.version, view.manifest.clone())
-    }
-
     fn view(&self) -> Arc<ManifestView> {
         Arc::clone(&self.inner.read().expect("manifest lock poisoned"))
     }
 
-    /// SaveMutable version of the served manifest (0 = none loaded yet).
-    pub fn version(&self) -> u64 {
-        self.view().version
-    }
-
     /// Number of paths currently servable.
     pub fn path_count(&self) -> usize {
-        let view = self.view();
-        view.manifest.paths.len() + view.snapshot.as_ref().map_or(0, |s| s.path_count())
+        self.view().snapshot.as_ref().map_or(0, |s| s.path_count())
     }
 }
 
@@ -269,7 +172,7 @@ enum FetchError {
     #[error("GHA cache error: {0}")]
     Gha(#[from] GhaError),
 
-    #[error("chunk {0} has no location in the manifest")]
+    #[error("chunk {0} has no known location")]
     UnknownChunk(ChunkHash),
 
     #[error("pack {} is not in the cache (evicted?)", pack_cache_key(.0))]
@@ -565,9 +468,14 @@ fn chunks_in_range<'a>(
 /// handler's lazy negative cache remains the backstop.
 pub async fn verify_packs(backend: &Backend, store: &ManifestStore, max_entries: u64) {
     // One view for the whole comparison: marks must land on the same
-    // manifest generation the listing was compared against.
+    // generation the listing was compared against.
     let view = store.view();
-    if view.pack_index.is_empty() {
+    let packs = view
+        .snapshot
+        .as_ref()
+        .map(|s| s.pack_hashes())
+        .unwrap_or_default();
+    if packs.is_empty() {
         return;
     }
     let listed = match backend.list("pack-", Some(max_entries)).await {
@@ -589,7 +497,7 @@ pub async fn verify_packs(backend: &Backend, store: &ManifestStore, max_entries:
     };
     let present: BTreeSet<&str> = listed.iter().map(|entry| entry.key.as_str()).collect();
     let mut evicted = 0usize;
-    for pack in view.pack_index.keys() {
+    for pack in &packs {
         if !present.contains(pack_cache_key(pack).as_str()) {
             view.mark_pack_missing(*pack);
             evicted += 1;
@@ -597,19 +505,16 @@ pub async fn verify_packs(backend: &Backend, store: &ManifestStore, max_entries:
     }
     if evicted > 0 {
         eprintln!(
-            "hestia substituter: {evicted} of {} packs the manifest references were \
-             evicted from the cache; their paths will be rebuilt or fetched upstream",
-            view.pack_index.len()
+            "hestia substituter: {evicted} of {} referenced packs were evicted from the \
+             cache; their paths will be rebuilt or fetched upstream",
+            packs.len()
         );
     }
 }
 
-/// Reloads the served manifest from the cache backend (the daemon wires
-/// this to a SaveMutable load + ManifestStore::set_version_if_newer). The
-/// NAR handler invokes it when a pack the current view points at is gone:
-/// a concurrent gc repack moves live chunks into new packs and deletes the
-/// old ones, so the committed manifest knows where the data went while the
-/// daemon's view does not.
+/// Reloads the served view from the backend. The NAR handler invokes it
+/// when a pack the current view points at is gone: a concurrent GC repack
+/// moved live chunks into new packs, which only a fresh listing shows.
 pub type ManifestReload =
     Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
@@ -620,8 +525,7 @@ pub type ManifestReload =
 /// idle clock once at request start.
 pub type ActivityHook = Arc<dyn Fn() -> Box<dyn Send> + Send + Sync>;
 
-/// Signals that the startup manifest load (including a
-/// `--wait-manifest-version` wait) has finished. Narinfo requests block on
+/// Signals that the startup load has finished. Narinfo requests block on
 /// it so an early `nix build` cannot race the load and see spurious misses.
 pub type ManifestReady = tokio::sync::watch::Receiver<bool>;
 
@@ -769,7 +673,7 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
     // A needed pack is evicted: miss, so Nix falls through instead of
     // attempting a doomed copy. No access recorded: an unservable path
     // must not join the GC root.
-    if !view.entry_available(&entry) {
+    if !view.available(&path_hash).await {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -817,8 +721,12 @@ async fn nar(
             Ok(path_hash) => path_hash,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         },
-        None => match view.by_nar_hash.get(&nar_hash) {
-            Some(path_hash) => *path_hash,
+        None => match view
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.by_nar_hash(&nar_hash))
+        {
+            Some(path_hash) => path_hash,
             None => return StatusCode::NOT_FOUND.into_response(),
         },
     };
@@ -855,9 +763,7 @@ async fn nar(
                 if !reloaded && state.manifest_reload.is_some() =>
             {
                 reloaded = true;
-                eprintln!(
-                    "hestia substituter: {err}; reloading the manifest (concurrent gc repack?)"
-                );
+                eprintln!("hestia substituter: {err}; reloading (concurrent gc repack?)");
                 (state.manifest_reload.as_ref().expect("checked above"))().await;
                 manifest_view = state.manifest.view();
                 match resolve(manifest_view.clone()).await {
@@ -1200,37 +1106,12 @@ mod tests {
                 executable: false,
                 contents: ChunkList::default(),
             })),
-            last_reachable: 0,
-            last_pushed: 0,
         }
     }
 
-    #[test]
-    fn manifest_store_indexes_nar_hashes() {
-        let store = ManifestStore::new();
-        assert_eq!(store.path_count(), 0);
-
-        let mut manifest = Manifest::new();
-        manifest.paths.insert(test_path_hash(1), test_entry(1));
-        manifest.paths.insert(test_path_hash(2), test_entry(2));
-        store.set(manifest);
-
-        assert_eq!(store.path_count(), 2);
-        let view = store.view();
-        assert_eq!(
-            view.by_nar_hash.get(&Hash32::digest([1])),
-            Some(&test_path_hash(1))
-        );
-        assert_eq!(view.by_nar_hash.get(&Hash32::digest([99])), None);
-    }
-
     #[tokio::test(start_paused = true)]
-    async fn narinfo_waits_for_the_startup_manifest_load() {
-        let mut manifest = Manifest::new();
-        manifest.paths.insert(test_path_hash(1), test_entry(1));
+    async fn narinfo_waits_for_the_startup_load() {
         let store = ManifestStore::new();
-        store.set(manifest);
-
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
         let state = Arc::new(
             Substituter::new(
@@ -1252,7 +1133,7 @@ mod tests {
 
         ready_tx.send(true).unwrap();
         let response = request.await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

@@ -32,23 +32,23 @@
   <text x="390" y="160" class="t">drain (post step, idle, SIGTERM)</text>
   <text x="390" y="178" class="ts">everything built or served this job:</text>
   <rect x="390" y="190" width="260" height="30" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
-  <text x="520" y="209" class="m" text-anchor="middle">chunk &#8594; pack &#8594; commit</text>
+  <text x="520" y="209" class="m" text-anchor="middle">chunk &#8594; pack &#8594; publish</text>
   <text x="390" y="242" class="ts">chunks are cut with FastCDC and</text>
-  <text x="390" y="257" class="ts">zstd-compressed; the branch root is</text>
-  <text x="390" y="272" class="ts">updated to pin this job's paths</text>
+  <text x="390" y="257" class="ts">zstd-compressed; a segment + head</text>
+  <text x="390" y="272" class="ts">name this job's paths under its root</text>
 
   <!-- GHA cache -->
   <rect x="750" y="40" width="270" height="280" rx="10" fill="#f4f6f9" stroke="#cdd6e0"/>
   <text x="770" y="68" class="h1">GitHub Actions cache</text>
   <rect x="770" y="90" width="230" height="30" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
-  <text x="885" y="109" class="m" text-anchor="middle">m#1 &#8230; m#N+1  (manifest)</text>
+  <text x="885" y="109" class="m" text-anchor="middle">seg-&#8230; + g-/h-/c- heads</text>
   <rect x="770" y="128" width="230" height="30" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
   <text x="885" y="147" class="m" text-anchor="middle">pack-&#8230;  (chunk blobs)</text>
   <text x="770" y="196" class="ts">upload = reserve, PUT, finalize;</text>
   <text x="770" y="211" class="ts">a pack that already exists is</text>
   <text x="770" y="226" class="ts">simply skipped</text>
-  <text x="770" y="262" class="ts">keys are write-once; racing manifest</text>
-  <text x="770" y="277" class="ts">commits sort themselves out (SaveMutable)</text>
+  <text x="770" y="262" class="ts">keys are write-once; racing drains</text>
+  <text x="770" y="277" class="ts">each add a head, readers union them</text>
 
   <!-- edges -->
   <path class="edge" d="M 290 143 L 366 143" marker-end="url(#arrow)"/>
@@ -56,5 +56,5 @@
 
   <path class="edge" d="M 670 205 L 746 205" marker-end="url(#arrow)"/>
   <text x="708" y="181" class="lbl" text-anchor="middle">PUT packs,</text>
-  <text x="708" y="195" class="lbl" text-anchor="middle">commit m#N+1</text>
+  <text x="708" y="195" class="lbl" text-anchor="middle">segment + head</text>
 </svg>
