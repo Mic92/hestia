@@ -410,3 +410,77 @@ fn parse_path_info_output(stdout: &[u8]) -> Option<serde_json::Value> {
     // Unknown paths come back as null entries on modern nix.
     (!info.is_null()).then_some(info)
 }
+
+/// Recursively compare two directory trees (types, contents, symlink
+/// targets, executable bits).
+pub fn assert_trees_equal(expected: &Path, actual: &Path) {
+    let expected_meta = std::fs::symlink_metadata(expected)
+        .unwrap_or_else(|err| panic!("missing expected path {}: {err}", expected.display()));
+    let actual_meta = std::fs::symlink_metadata(actual)
+        .unwrap_or_else(|err| panic!("missing actual path {}: {err}", actual.display()));
+
+    if expected_meta.file_type().is_symlink() {
+        assert!(actual_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(expected).unwrap(),
+            std::fs::read_link(actual).unwrap(),
+            "symlink target mismatch at {}",
+            actual.display()
+        );
+    } else if expected_meta.is_dir() {
+        assert!(actual_meta.is_dir(), "{} must be a dir", actual.display());
+        let list = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let entries = list(expected);
+        assert_eq!(entries, list(actual), "dir entries at {}", actual.display());
+        for name in entries {
+            assert_trees_equal(&expected.join(&name), &actual.join(&name));
+        }
+    } else {
+        assert_eq!(
+            std::fs::read(expected).unwrap(),
+            std::fs::read(actual).unwrap(),
+            "file contents mismatch at {}",
+            actual.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                expected_meta.permissions().mode() & 0o111 != 0,
+                actual_meta.permissions().mode() & 0o111 != 0,
+                "executable bit mismatch at {}",
+                actual.display()
+            );
+        }
+    }
+}
+
+/// Run `nix copy` from a substituter URL into a destination store.
+///
+/// Async (tokio::process): the substituter being copied from runs as a task
+/// on this test's runtime, so the test must not block the runtime thread
+/// while waiting for the subprocess.
+pub async fn nix_copy(from_url: &str, to_uri: &str, store_path: &Path) -> std::process::Output {
+    tokio::process::Command::new("nix")
+        .args([
+            "--extra-experimental-features",
+            "nix-command",
+            "copy",
+            "--no-check-sigs",
+            "--from",
+            from_url,
+            "--to",
+            to_uri,
+        ])
+        .arg(store_path)
+        .output()
+        .await
+        .expect("running nix copy failed")
+}

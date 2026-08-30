@@ -122,7 +122,7 @@ struct Header {
 }
 
 /// A chunk by location: row in the segment's pack table, entry in that pack's index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkRef {
     pub pack: u16,
     pub chunk: u16,
