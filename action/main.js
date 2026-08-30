@@ -395,6 +395,10 @@ function startDaemon(hestiaBin, listen, socket, logFile) {
   if (githubToken && !env.GITHUB_TOKEN) {
     env.GITHUB_TOKEN = githubToken;
   }
+  const oci = getInput('oci');
+  if (oci) {
+    env.HESTIA_OCI = oci;
+  }
   const daemon = spawn(hestiaBin, args, {
     detached: true,
     stdio: ['ignore', log, log],
