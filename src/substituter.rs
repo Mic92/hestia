@@ -52,6 +52,8 @@ use crate::manifest::{
 };
 use crate::pipeline::AccessLog;
 use crate::refnorm::RefTable;
+use crate::segment::PackIndex;
+use crate::store::{ChunkMap, Resolved, Snapshot, pack_indexes};
 
 /// Priority advertised in /nix-cache-info. Lower wins: 30 puts hestia ahead
 /// of cache.nixos.org (40), so Nix asks the local cache first and only falls
@@ -81,25 +83,16 @@ const PACK_READ_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
 /// matter how the packs distribute over paths.
 const MAX_CONCURRENT_PACK_FETCHES: usize = 8;
 
-/// One pack's chunk locations sorted by offset. Lets the fetcher answer
-/// "which chunks live in this byte range" (read-ahead) with a range scan;
-/// the manifest itself only indexes chunks by hash.
-struct PackChunkIndex {
-    /// End of the last known chunk; reads are never extended past it.
-    end: u64,
-    /// (offset, compressed size, hash), sorted by offset.
-    chunks: Vec<(u64, u32, ChunkHash)>,
-}
-
-/// One manifest version plus the indexes the substituter needs.
+/// What the substituter serves from: the segmented store first, the
+/// legacy single manifest as fallback.
 #[derive(Default)]
 struct ManifestView {
+    snapshot: Option<Arc<Snapshot>>,
     manifest: Manifest,
     /// NAR hash → manifest path key, for `/nar/{narhash}.nar` requests that
     /// arrive without the `?hash=` parameter.
     by_nar_hash: BTreeMap<Hash32, PathHash>,
-    /// Per-pack chunk layout, for read-ahead.
-    pack_index: HashMap<PackHash, Arc<PackChunkIndex>>,
+    pack_index: HashMap<PackHash, Arc<PackIndex>>,
     /// SaveMutable index this manifest was loaded from / committed as
     /// (0 = unknown or no manifest yet).
     version: u64,
@@ -135,31 +128,57 @@ impl ManifestView {
         })
     }
 
-    fn new(manifest: Manifest, version: u64) -> Self {
+    fn lookup(&self, hash: &PathHash) -> Option<PathEntry> {
+        if let Some(entry) = self.snapshot.as_ref().and_then(|s| s.lookup(hash)) {
+            return Some(entry);
+        }
+        self.manifest.paths.get(hash).cloned()
+    }
+
+    fn contains(&self, hash: &PathHash) -> bool {
+        self.snapshot.as_ref().is_some_and(|s| s.contains(hash))
+            || self.manifest.paths.contains_key(hash)
+    }
+
+    async fn resolve(&self, hash: &PathHash) -> Result<Option<Resolved>, FetchError> {
+        if let Some(snapshot) = &self.snapshot
+            && let Some(r) = snapshot.resolve(hash).await?
+        {
+            return Ok(Some(r));
+        }
+        let Some(entry) = self.manifest.paths.get(hash) else {
+            return Ok(None);
+        };
+        let mut map = ChunkMap::default();
+        for chunk in entry_chunks(entry) {
+            let location = self
+                .manifest
+                .chunks
+                .get(&chunk)
+                .ok_or(FetchError::UnknownChunk(chunk))?;
+            map.packs
+                .entry(location.pack)
+                .or_insert_with(|| self.pack_index[&location.pack].clone());
+            map.chunks.insert(chunk, location.clone());
+        }
+        Ok(Some(Resolved {
+            entry: entry.clone(),
+            map,
+        }))
+    }
+
+    fn new(manifest: Manifest, version: u64, snapshot: Option<Arc<Snapshot>>) -> Self {
         let by_nar_hash = manifest
             .paths
             .iter()
             .map(|(path_hash, entry)| (entry.nar_hash, *path_hash))
             .collect();
-        let mut by_pack: HashMap<PackHash, Vec<(u64, u32, ChunkHash)>> = HashMap::new();
-        for (hash, location) in &manifest.chunks {
-            by_pack.entry(location.pack).or_default().push((
-                location.offset,
-                location.compressed_size,
-                *hash,
-            ));
-        }
-        let pack_index = by_pack
+        let pack_index = pack_indexes(&manifest)
             .into_iter()
-            .map(|(pack, mut chunks)| {
-                chunks.sort_unstable_by_key(|(offset, ..)| *offset);
-                let end = chunks
-                    .last()
-                    .map_or(0, |(offset, size, _)| offset + u64::from(*size));
-                (pack, Arc::new(PackChunkIndex { end, chunks }))
-            })
+            .map(|(p, i)| (p, Arc::new(i)))
             .collect();
         Self {
+            snapshot,
             manifest,
             by_nar_hash,
             pack_index,
@@ -193,8 +212,22 @@ impl ManifestStore {
     /// it merges this manifest into every commit base and never reserves an
     /// index at or below it.
     pub fn set_version(&self, manifest: Manifest, version: u64) {
-        *self.inner.write().expect("manifest lock poisoned") =
-            Arc::new(ManifestView::new(manifest, version));
+        let mut inner = self.inner.write().expect("manifest lock poisoned");
+        let snapshot = inner.snapshot.clone();
+        *inner = Arc::new(ManifestView::new(manifest, version, snapshot));
+    }
+
+    pub fn set_snapshot(&self, snapshot: Arc<Snapshot>) {
+        let mut inner = self.inner.write().expect("manifest lock poisoned");
+        *inner = Arc::new(ManifestView::new(
+            inner.manifest.clone(),
+            inner.version,
+            Some(snapshot),
+        ));
+    }
+
+    pub fn snapshot(&self) -> Option<Arc<Snapshot>> {
+        self.view().snapshot.clone()
     }
 
     /// Replace the served manifest only if `version` is newer than the
@@ -204,7 +237,8 @@ impl ManifestStore {
     pub fn set_version_if_newer(&self, manifest: Manifest, version: u64) {
         let mut inner = self.inner.write().expect("manifest lock poisoned");
         if version > inner.version {
-            *inner = Arc::new(ManifestView::new(manifest, version));
+            let snapshot = inner.snapshot.clone();
+            *inner = Arc::new(ManifestView::new(manifest, version, snapshot));
         }
     }
 
@@ -225,7 +259,8 @@ impl ManifestStore {
 
     /// Number of paths currently servable.
     pub fn path_count(&self) -> usize {
-        self.view().manifest.paths.len()
+        let view = self.view();
+        view.manifest.paths.len() + view.snapshot.as_ref().map_or(0, |s| s.path_count())
     }
 }
 
@@ -242,6 +277,9 @@ enum FetchError {
 
     #[error("chunk extraction failed: {0}")]
     Chunker(#[from] chunker::Error),
+
+    #[error(transparent)]
+    Store(#[from] crate::store::Error),
 }
 
 /// Decompressed chunks kept in memory, evicted least-recently-used first
@@ -332,15 +370,15 @@ impl ChunkFetcher {
     /// Fetch all chunks of `entry`, using cached chunks where possible.
     async fn fetch_path_chunks(
         &self,
-        view: &ManifestView,
         path: PathHash,
-        entry: &PathEntry,
+        resolved: &Resolved,
     ) -> Result<BTreeMap<ChunkHash, Bytes>, FetchError> {
         // Serialize per path so concurrent NAR requests for the same
         // path do the work once.
         let lock = self.path_lock(path);
         let _guard = lock.lock().await;
-        self.fetch_chunks(view, entry_chunks(entry)).await
+        self.fetch_chunks(&resolved.map, entry_chunks(&resolved.entry))
+            .await
     }
 
     /// Fetch a set of chunks, using cached chunks where possible.
@@ -351,7 +389,7 @@ impl ChunkFetcher {
     /// chunk is hash-verified during extraction.
     async fn fetch_chunks(
         &self,
-        view: &ManifestView,
+        source: &ChunkMap,
         needed: BTreeSet<ChunkHash>,
     ) -> Result<BTreeMap<ChunkHash, Bytes>, FetchError> {
         let mut result: BTreeMap<ChunkHash, Bytes> = BTreeMap::new();
@@ -363,8 +401,7 @@ impl ChunkFetcher {
                     result.insert(chunk, data);
                     continue;
                 }
-                let location = view
-                    .manifest
+                let location = source
                     .chunks
                     .get(&chunk)
                     .ok_or(FetchError::UnknownChunk(chunk))?;
@@ -379,10 +416,7 @@ impl ChunkFetcher {
         // while it talks to the GHA cache API. The semaphore is never
         // closed, so acquire only fails after close.
         let fetches = missing.into_iter().map(|(pack, chunks)| {
-            // Present by construction: the index covers every pack the
-            // manifest's chunk table mentions, and the locations above came
-            // from that table.
-            let index = Arc::clone(&view.pack_index[&pack]);
+            let index = Arc::clone(&source.packs[&pack]);
             async move {
                 let _permit = self
                     .fetch_semaphore
@@ -413,7 +447,7 @@ impl ChunkFetcher {
         &self,
         pack: PackHash,
         mut chunks: Vec<(ChunkHash, ChunkLocation)>,
-        index: Arc<PackChunkIndex>,
+        index: Arc<PackIndex>,
     ) -> Result<Vec<(ChunkHash, Bytes)>, FetchError> {
         chunks.sort_by_key(|(_, location)| location.offset);
         let chunk_count = chunks.len();
@@ -421,7 +455,11 @@ impl ChunkFetcher {
             .iter()
             .map(|(_, location)| (location.offset, location.compressed_size))
             .collect();
-        let ranges = plan_pack_reads(&spans, index.end);
+        let pack_end = index
+            .entries
+            .last()
+            .map_or(0, |e| e.offset + u64::from(e.compressed_size));
+        let ranges = plan_pack_reads(&spans, pack_end);
 
         let started = Instant::now();
         let range_count = ranges.len();
@@ -514,17 +552,15 @@ fn plan_pack_reads(spans: &[(u64, u32)], pack_end: u64) -> Vec<std::ops::Range<u
 /// All chunks of a pack that lie fully inside `range`, as
 /// `(offset, size, hash)`.
 fn chunks_in_range<'a>(
-    index: &'a PackChunkIndex,
+    index: &'a PackIndex,
     range: &'a std::ops::Range<u64>,
 ) -> impl Iterator<Item = (u64, u32, ChunkHash)> + 'a {
-    let start = index
-        .chunks
-        .partition_point(|(offset, ..)| *offset < range.start);
-    index.chunks[start..]
+    let start = index.entries.partition_point(|e| e.offset < range.start);
+    index.entries[start..]
         .iter()
-        .take_while(move |(offset, ..)| *offset < range.end)
-        .filter(move |(offset, size, _)| offset + u64::from(*size) <= range.end)
-        .copied()
+        .take_while(move |e| e.offset < range.end)
+        .filter(move |e| e.offset + u64::from(e.compressed_size) <= range.end)
+        .map(|e| (e.offset, e.compressed_size, e.hash))
 }
 
 /// Mark manifest packs missing from one REST listing of `pack-*` entries
@@ -730,15 +766,14 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
     };
 
     let view = state.manifest.view();
-    let Some(entry) = view.manifest.paths.get(&path_hash) else {
-        // Miss: Nix falls through to the next substituter.
+    let Some(entry) = view.lookup(&path_hash) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
     // A needed pack is evicted: miss, so Nix falls through instead of
     // attempting a doomed copy. No access recorded: an unservable path
     // must not join the GC root.
-    if !view.entry_available(entry) {
+    if !view.entry_available(&entry) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -746,7 +781,7 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
     // run's GC root at the next drain.
     state.access_log.record(path_hash);
 
-    let body = narinfo_for_entry(&state.store_dir, entry, hash_str);
+    let body = narinfo_for_entry(&state.store_dir, &entry, hash_str);
     ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], body).into_response()
 }
 
@@ -791,14 +826,19 @@ async fn nar(
             None => return StatusCode::NOT_FOUND.into_response(),
         },
     };
-    let Some(entry) = view.manifest.paths.get(&path_hash) else {
+    let resolve = |view: Arc<ManifestView>| async move {
+        match view.resolve(&path_hash).await {
+            Ok(Some(r)) if r.entry.nar_hash == nar_hash => Some(r),
+            Ok(_) => None,
+            Err(err) => {
+                eprintln!("hestia substituter: cannot resolve {path_hash}: {err}");
+                None
+            }
+        }
+    };
+    let Some(mut resolved) = resolve(view.clone()).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if entry.nar_hash != nar_hash {
-        // The URL's NAR hash does not match the entry: stale URL.
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let mut entry = entry.clone();
     let mut manifest_view = view;
 
     // A NAR download is an access (the GC liveness signal), just like a
@@ -813,11 +853,7 @@ async fn nar(
     // manifest (see [`ManifestReload`]).
     let mut reloaded = false;
     let chunks = loop {
-        match state
-            .fetcher
-            .fetch_path_chunks(&manifest_view, path_hash, &entry)
-            .await
-        {
+        match state.fetcher.fetch_path_chunks(path_hash, &resolved).await {
             Ok(chunks) => break chunks,
             Err(err @ (FetchError::PackUnavailable(_) | FetchError::UnknownChunk(_)))
                 if !reloaded && state.manifest_reload.is_some() =>
@@ -828,9 +864,9 @@ async fn nar(
                 );
                 (state.manifest_reload.as_ref().expect("checked above"))().await;
                 manifest_view = state.manifest.view();
-                match manifest_view.manifest.paths.get(&path_hash) {
-                    Some(fresh) if fresh.nar_hash == nar_hash => entry = fresh.clone(),
-                    _ => return StatusCode::NOT_FOUND.into_response(),
+                match resolve(manifest_view.clone()).await {
+                    Some(fresh) => resolved = fresh,
+                    None => return StatusCode::NOT_FOUND.into_response(),
                 }
             }
             Err(err) => {
@@ -844,7 +880,7 @@ async fn nar(
         }
     };
 
-    let nar = match assemble_verified_nar(&entry, Arc::new(chunks)).await {
+    let nar = match assemble_verified_nar(&resolved.entry, Arc::new(chunks)).await {
         Ok(nar) => nar,
         Err(err) => {
             eprintln!("hestia substituter: cannot serve NAR for {path_hash}: {err}");
@@ -927,12 +963,13 @@ const CLOSURE_EXPORT_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 /// Split a closure into windows of roughly [`CLOSURE_EXPORT_WINDOW_BYTES`]
 /// of NAR data, keeping the closure order (a path bigger than the budget
 /// gets its own window).
-fn export_windows(manifest: &Manifest, order: &[PathHash]) -> Vec<Vec<PathHash>> {
+fn export_windows(order: &[(PathHash, PathEntry)]) -> Vec<Vec<PathHash>> {
     let mut windows = Vec::new();
     let mut window = Vec::new();
     let mut window_bytes = 0u64;
-    for &path_hash in order {
-        let nar_size = manifest.paths[&path_hash].nar_size;
+    for (path_hash, entry) in order {
+        let path_hash = *path_hash;
+        let nar_size = entry.nar_size;
         if !window.is_empty() && window_bytes + nar_size > CLOSURE_EXPORT_WINDOW_BYTES {
             windows.push(std::mem::take(&mut window));
             window_bytes = 0;
@@ -984,17 +1021,17 @@ fn export_frame(store_dir: &StoreDir, entry: &PathEntry, nar: &[u8]) -> Vec<u8> 
 /// before referrers (`nix-store --import` registers paths in stream
 /// order). References pointing outside the manifest (upstream paths) are
 /// skipped. Iterative DFS: drv chains can be deep.
-fn closure_order(manifest: &Manifest, roots: &[PathHash]) -> Vec<PathHash> {
+fn closure_order(view: &ManifestView, roots: &[PathHash]) -> Vec<(PathHash, PathEntry)> {
     let mut order = Vec::new();
     let mut seen = BTreeSet::new();
     for &root in roots {
         let mut stack = vec![(root, false)];
         while let Some((hash, children_done)) = stack.pop() {
-            let Some(entry) = manifest.paths.get(&hash) else {
+            let Some(entry) = view.lookup(&hash) else {
                 continue;
             };
             if children_done {
-                order.push(hash);
+                order.push((hash, entry));
                 continue;
             }
             if !seen.insert(hash) {
@@ -1012,15 +1049,14 @@ fn closure_order(manifest: &Manifest, roots: &[PathHash]) -> Vec<PathHash> {
     order
 }
 
-fn closure_roots(manifest: &Manifest, hashes: &str) -> Option<Vec<PathHash>> {
+fn closure_roots(view: &ManifestView, hashes: &str) -> Option<Vec<PathHash>> {
     let roots: Vec<PathHash> = hashes
         .split(',')
         .filter(|part| !part.is_empty())
         .map(str::parse)
         .collect::<Result<_, _>>()
         .ok()?;
-    (!roots.is_empty() && roots.iter().all(|root| manifest.paths.contains_key(root)))
-        .then_some(roots)
+    (!roots.is_empty() && roots.iter().all(|root| view.contains(root))).then_some(roots)
 }
 
 /// Fetch and frame one window of a closure export.
@@ -1029,10 +1065,18 @@ async fn export_window(
     view: &ManifestView,
     window: &[PathHash],
 ) -> Result<Vec<u8>, String> {
-    let entries: Vec<(PathHash, &PathEntry)> = window
-        .iter()
-        .map(|hash| (*hash, &view.manifest.paths[hash]))
-        .collect();
+    let mut entries = Vec::with_capacity(window.len());
+    let mut source = ChunkMap::default();
+    for hash in window {
+        let r = view
+            .resolve(hash)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("path vanished")?;
+        source.chunks.extend(r.map.chunks);
+        source.packs.extend(r.map.packs);
+        entries.push((*hash, r.entry));
+    }
     let needed: BTreeSet<ChunkHash> = entries
         .iter()
         .flat_map(|(_, entry)| entry_chunks(entry))
@@ -1040,7 +1084,7 @@ async fn export_window(
     let chunks = Arc::new(
         state
             .fetcher
-            .fetch_chunks(view, needed)
+            .fetch_chunks(&source, needed)
             .await
             .map_err(|err| {
                 eprintln!("hestia substituter: closure export chunk fetch failed: {err}");
@@ -1052,13 +1096,13 @@ async fn export_window(
     for (path_hash, entry) in entries {
         // Prefetched paths are accesses (GC liveness), same as narinfo hits.
         state.access_log.record(path_hash);
-        let nar = assemble_verified_nar(entry, Arc::clone(&chunks))
+        let nar = assemble_verified_nar(&entry, Arc::clone(&chunks))
             .await
             .map_err(|err| {
                 eprintln!("hestia substituter: closure export failed at {path_hash}: {err}");
                 err
             })?;
-        out.extend_from_slice(&export_frame(&state.store_dir, entry, &nar));
+        out.extend_from_slice(&export_frame(&state.store_dir, &entry, &nar));
     }
     Ok(out)
 }
@@ -1070,10 +1114,10 @@ async fn closure(State(state): State<Arc<Substituter>>, Path(hashes): Path<Strin
     let view = state.manifest.view();
     // Every requested root must be servable; a partial closure would make
     // the import succeed and the subsequent build fail confusingly.
-    let Some(roots) = closure_roots(&view.manifest, &hashes) else {
+    let Some(roots) = closure_roots(&view, &hashes) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let order = closure_order(&view.manifest, &roots);
+    let order = closure_order(&view, &roots);
 
     // Stream the closure in windows: each window's chunks are fetched as
     // one batch, and the next window downloads while the current one is
@@ -1081,7 +1125,7 @@ async fn closure(State(state): State<Arc<Substituter>>, Path(hashes): Path<Strin
     // which fails the client's import (never a silently truncated but
     // well-formed stream).
     use futures_util::StreamExt as _;
-    let windows = export_windows(&view.manifest, &order);
+    let windows = export_windows(&order);
     let frames = futures_util::stream::iter(windows)
         .map(move |window| {
             let state = state.clone();
@@ -1119,16 +1163,11 @@ async fn closure_external_references(
     state.manifest_ready().await;
 
     let view = state.manifest.view();
-    let roots = closure_roots(&view.manifest, &hashes).ok_or(StatusCode::NOT_FOUND)?;
-    Ok(closure_order(&view.manifest, &roots)
-        .into_iter()
-        .flat_map(|hash| view.manifest.paths[&hash].references.iter())
-        .filter(|reference| {
-            !view
-                .manifest
-                .paths
-                .contains_key(&PathHash::from_store_path(reference))
-        })
+    let roots = closure_roots(&view, &hashes).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(closure_order(&view, &roots)
+        .iter()
+        .flat_map(|(_, entry)| entry.references.iter())
+        .filter(|reference| !view.contains(&PathHash::from_store_path(reference)))
         .map(|reference| format!("{}/{reference}", state.store_dir))
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1222,7 +1261,6 @@ mod tests {
 
     #[test]
     fn export_windows_split_by_nar_bytes() {
-        let mut manifest = Manifest::default();
         let sizes = [
             CLOSURE_EXPORT_WINDOW_BYTES / 2,
             CLOSURE_EXPORT_WINDOW_BYTES / 2, // fills the first window
@@ -1230,18 +1268,17 @@ mod tests {
             1,
             1,
         ];
-        let order: Vec<PathHash> = sizes
+        let entries: Vec<(PathHash, PathEntry)> = sizes
             .iter()
             .enumerate()
             .map(|(seed, &nar_size)| {
-                let hash = test_path_hash(seed as u8);
                 let mut entry = test_entry(seed as u8);
                 entry.nar_size = nar_size;
-                manifest.paths.insert(hash, entry);
-                hash
+                (test_path_hash(seed as u8), entry)
             })
             .collect();
-        let windows = export_windows(&manifest, &order);
+        let order: Vec<PathHash> = entries.iter().map(|(h, _)| *h).collect();
+        let windows = export_windows(&entries);
         assert_eq!(
             windows,
             vec![
@@ -1278,14 +1315,14 @@ mod tests {
 
     #[test]
     fn chunks_in_range_selects_only_fully_contained_chunks() {
-        let index = PackChunkIndex {
-            end: 1000,
-            chunks: vec![
-                (0, 100, ChunkHash::digest([0])),
-                (100, 100, ChunkHash::digest([1])),
-                (300, 100, ChunkHash::digest([2])),
-                (350, 100, ChunkHash::digest([3])), // straddles range end
-            ],
+        let e = |offset, seed: u8| crate::segment::PackIndexEntry {
+            hash: ChunkHash::digest([seed]),
+            offset,
+            compressed_size: 100,
+            uncompressed_size: 0,
+        };
+        let index = PackIndex {
+            entries: vec![e(0, 0), e(100, 1), e(300, 2), e(350, 3)], // last straddles range end
         };
         let selected: Vec<ChunkHash> = chunks_in_range(&index, &(100..400))
             .map(|(.., hash)| hash)
