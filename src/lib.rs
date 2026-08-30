@@ -11,6 +11,7 @@ pub mod gha;
 pub mod heads;
 pub mod hook;
 pub mod manifest;
+mod manifest_decode;
 pub mod matrix;
 pub mod pathinfo;
 pub mod pipeline;
