@@ -16,6 +16,7 @@ pub mod pipeline;
 pub mod prefetch;
 pub mod protocol;
 pub mod refnorm;
+pub mod segment;
 pub mod serve;
 pub mod substituter;
 pub mod upstream;

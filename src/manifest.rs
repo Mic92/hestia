@@ -67,6 +67,38 @@ macro_rules! hash_newtype {
             pub fn to_hex(self) -> String {
                 self.0.iter().map(|b| format!("{b:02x}")).collect()
             }
+
+            /// Lowercase hex only, so names built from it are canonical.
+            pub fn from_hex(s: &str) -> Option<Self> {
+                if s.len() != $len * 2 || !s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+                    return None;
+                }
+                let mut bytes = [0u8; $len];
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+                }
+                Some(Self(bytes))
+            }
+        }
+
+        impl<C> minicbor::Encode<C> for $name {
+            fn encode<W: minicbor::encode::Write>(
+                &self,
+                e: &mut minicbor::Encoder<W>,
+                _: &mut C,
+            ) -> Result<(), minicbor::encode::Error<W::Error>> {
+                e.bytes(&self.0)?.ok()
+            }
+        }
+
+        impl<'b, C> minicbor::Decode<'b, C> for $name {
+            fn decode(d: &mut minicbor::Decoder<'b>, _: &mut C) -> Result<Self, minicbor::decode::Error> {
+                let p = d.position();
+                d.bytes()?
+                    .try_into()
+                    .map(Self)
+                    .map_err(|_| minicbor::decode::Error::message(concat!(stringify!($name), " length")).at(p))
+            }
         }
 
         impl std::fmt::Debug for $name {
@@ -132,6 +164,13 @@ hash_newtype!(
     /// manifest, which stores one hash per chunk.
     Blake3Chunk,
     16,
+    blake3_digest
+);
+
+hash_newtype!(
+    /// BLAKE3 digest naming a segment or head record.
+    SegDigest,
+    32,
     blake3_digest
 );
 
@@ -215,9 +254,13 @@ pub struct ChunkList {
 }
 
 /// One reference occurrence normalized out of a file's content.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, minicbor::Encode, minicbor::Decode,
+)]
 pub struct Rewrite {
+    #[n(0)]
     pub offset: u64,
+    #[n(1)]
     pub ref_index: u32,
 }
 
