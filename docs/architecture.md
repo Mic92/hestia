@@ -59,7 +59,11 @@ small entries whose *names* carry the claim: `h-<epoch>-<root>-<seg>`
 (a drain added a segment), `c-<epoch>-<root>-<id>` (a compaction
 replaced some), `g-<epoch>-<id>` (GC rewrote every root). A reader
 lists the heads, takes the newest GC record as the base and applies
-the drain and compaction heads published since. `docs/spec/segments.qnt`
+the drain and compaction heads published since. Between GC runs a busy
+root would pile up segments, so a drain that sees several pending folds
+them into one and says so with a `c-*` head. Drains elect themselves
+for this at random, with odds scaled so that about one per minute wins
+however many run concurrently. `docs/spec/segments.qnt`
 is the model of these rules.
 
 ### Packs

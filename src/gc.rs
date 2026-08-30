@@ -217,7 +217,7 @@ impl Gc {
             .view
             .heads
             .iter()
-            .filter_map(|h| match HeadName::parse(h)? {
+            .filter_map(|(h, _)| match HeadName::parse(h)? {
                 HeadName::Drain { root, .. } | HeadName::Compaction { root, .. } => Some(root),
                 HeadName::Gc { .. } => None,
             })

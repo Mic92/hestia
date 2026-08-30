@@ -362,7 +362,7 @@ async fn drained_paths_are_substitutable_despite_lookup_lag() {
         server.abort();
         fake.set_stale_lookups(&http, false).await;
         let snapshot = load_snapshot(&fake, &http).await;
-        assert!(snapshot.view.heads.contains(&head));
+        assert!(snapshot.view.heads.iter().any(|(h, _)| *h == head));
         assert!(snapshot.contains(&hash));
     };
     tokio::time::timeout(Duration::from_secs(120), test)

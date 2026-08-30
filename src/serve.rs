@@ -446,7 +446,7 @@ async fn wait_for_head<Fut: Future<Output = ()>>(
         let Some(head) = head else { return };
         if manifest_store
             .snapshot()
-            .is_some_and(|s| s.view.heads.iter().any(|h| h == head))
+            .is_some_and(|s| s.view.heads.iter().any(|(h, _)| h == head))
         {
             return;
         }

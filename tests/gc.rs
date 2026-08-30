@@ -387,3 +387,53 @@ async fn thirty_day_history_converges_to_live_set_storage() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn drain_compaction_folds_pending_segments_and_gc_folds_it() {
+    timed(async {
+        let (fake, sim) = setup().await;
+        let paths: Vec<SimPath> = (0..5u64)
+            .map(|i| SimPath::new(&format!("p{i}"), 10 + i, 50_000))
+            .collect();
+        // The first drain of an unknown root is a c-* itself, the rest h-*.
+        for p in &paths {
+            sim.push(ROOT, &[p], &[p]).await;
+        }
+        let refs: Vec<&SimPath> = paths.iter().collect();
+
+        let snapshot = sim.snapshot().await;
+        assert_eq!(snapshot.view.roots[ROOT].len(), 5);
+        assert_eq!(
+            snapshot.maybe_compact(ROOT, T0, 0.0).await.unwrap(),
+            None,
+            "the root's own c-* is younger than the window"
+        );
+        assert_eq!(
+            snapshot.maybe_compact(ROOT, T0 + 200, 0.9).await.unwrap(),
+            None,
+            "five drains in ~3 windows: a 0.9 coin loses"
+        );
+        let name = snapshot
+            .maybe_compact(ROOT, T0 + 200, 0.0)
+            .await
+            .unwrap()
+            .expect("elected");
+        assert!(name.starts_with("c-"));
+
+        let after = sim.snapshot().await;
+        assert_eq!(after.view.roots[ROOT].len(), 1, "{:?}", after.view);
+        assert_eq!(after.view.heads.len(), 1);
+        sim.assert_readable(&refs).await;
+        assert_eq!(sim.stored_keys("seg-").await.len(), 12, "nothing deleted");
+
+        fake.set_clock(T0 + 3 * HOUR);
+        let stats = sim.run_gc(GcPolicy::default(), T0 + 3 * HOUR).await;
+        assert_eq!((stats.roots, stats.segments_written), (1, 0), "{stats:?}");
+        let after = sim.snapshot().await;
+        assert!(after.view.heads.is_empty());
+        assert_eq!(after.view.roots[ROOT].len(), 1);
+        sim.assert_readable(&refs).await;
+        assert_eq!(sim.stored_keys("seg-").await.len(), 2, "inputs swept");
+    })
+    .await;
+}
