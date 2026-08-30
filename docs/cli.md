@@ -71,6 +71,8 @@ Always exits 0 (a failing post-build-hook would fail the build).
 | `GITHUB_RUN_ID` | serve | Roots written by the same workflow run merge by union (matrix legs); different runs replace each other's root. |
 | `HESTIA_OCI` | serve, gc | `<registry>/<repository>`: store in an OCI registry instead of the Actions cache, see [OCI registries](#oci-registries). |
 | `HESTIA_OCI_USER`, `HESTIA_OCI_PASSWORD` | serve, gc | Registry credentials. On ghcr.io `GITHUB_TOKEN` is used when unset. Without any, access is anonymous and read-only. |
+| `HESTIA_S3` | serve, gc | `s3://<bucket>/<prefix>`: store in an S3-compatible bucket. Credentials from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, region from `AWS_REGION` (default `us-east-1`). Without credentials access is anonymous and read-only. Takes precedence over `HESTIA_OCI`. |
+| `HESTIA_S3_ENDPOINT` | serve, gc | Endpoint URL for non-AWS stores, addressed path-style. Without it `https://s3.<region>.amazonaws.com`, virtual-hosted style. |
 | `HESTIA_LISTEN` | prefetch | Address exported by the action for the running Hestia server. |
 | `OUT_PATHS` | hook | Set by Nix when invoking the post-build-hook. |
 

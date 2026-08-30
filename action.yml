@@ -78,6 +78,20 @@ inputs:
       public packages substitute anonymously).
     required: false
     default: ""
+  s3:
+    description: >
+      `s3://BUCKET/PREFIX` to store in an S3-compatible bucket instead of
+      the Actions cache. Credentials come from `AWS_ACCESS_KEY_ID`,
+      `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN`) in `env`, the
+      region from `AWS_REGION`.
+    required: false
+    default: ""
+  s3-endpoint:
+    description: >
+      Endpoint URL for non-AWS stores (MinIO, R2, Garage, Ceph, ...),
+      addressed path-style.
+    required: false
+    default: ""
   read-only:
     description: >
       Substitute from the cache but never write to it: no post-build-hook,
