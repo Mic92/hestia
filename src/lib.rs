@@ -8,6 +8,7 @@ pub mod cli;
 pub mod drain;
 pub mod gc;
 pub mod gha;
+pub mod heads;
 pub mod hook;
 pub mod manifest;
 pub mod matrix;
