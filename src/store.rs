@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::OnceCell;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, Listed};
 use crate::heads::{self, CompactionRecord, GcRecord, HeadName, View, root_id};
 use crate::manifest::{
     ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Manifest, PackHash,
@@ -73,23 +73,63 @@ async fn fetch(backend: &Backend, key: &str) -> Result<bytes::Bytes, Error> {
         .ok_or_else(|| Error::Missing(key.to_owned()))
 }
 
-/// Bodies of `names` that decode and hash back to their name.
-async fn records<T>(
+/// A `g-*` body that decodes and hashes back to its name.
+async fn gc_record(backend: &Backend, name: &str) -> Result<Option<GcRecord>, Error> {
+    let (Some(body), Some(parsed)) = (backend.get(name, None).await?, HeadName::parse(name)) else {
+        return Ok(None);
+    };
+    Ok(GcRecord::decode(&body)
+        .ok()
+        .filter(|r| r.head_name() == parsed))
+}
+
+async fn compaction_record(
     backend: &Backend,
-    names: Vec<&str>,
-    verify: impl Fn(&[u8], &HeadName) -> Option<T>,
-) -> Result<Vec<(String, T)>, Error> {
-    let mut out = Vec::new();
-    for name in names {
-        let (Some(body), Some(parsed)) = (backend.get(name, None).await?, HeadName::parse(name))
-        else {
-            continue;
-        };
-        if let Some(record) = verify(&body, &parsed) {
-            out.push((name.to_owned(), record));
+    name: &str,
+) -> Result<Option<CompactionRecord>, Error> {
+    let (Some(body), Some(HeadName::Compaction { base_epoch, .. })) =
+        (backend.get(name, None).await?, HeadName::parse(name))
+    else {
+        return Ok(None);
+    };
+    Ok(CompactionRecord::decode(&body)
+        .ok()
+        .filter(|r| r.head_name(base_epoch).to_string() == name))
+}
+
+/// The head listing and what it resolves to.
+pub struct Heads {
+    pub listed: Vec<Listed>,
+    /// Newest GC record whose body matches its name, and when it was written.
+    pub gc: Option<(GcRecord, Listed)>,
+    pub view: View,
+}
+
+impl Heads {
+    pub async fn load(backend: &Backend) -> Result<Heads, Error> {
+        let mut listed = Vec::new();
+        for prefix in ["g-", "h-", "c-"] {
+            listed.extend(backend.list(prefix, None).await?.expect("unbounded"));
         }
+        let names = || listed.iter().map(|l| l.key.as_str());
+        let mut gc = None;
+        for name in heads::newest_gc(names()) {
+            if let Some(record) = gc_record(backend, name).await? {
+                let entry = listed.iter().find(|l| l.key == name).unwrap().clone();
+                gc = Some((record, entry));
+                break;
+            }
+        }
+        let record = gc.as_ref().map(|(r, _)| r);
+        let mut compactions = HashMap::new();
+        for name in heads::compactions_to_fetch(names(), record) {
+            if let Some(c) = compaction_record(backend, name).await? {
+                compactions.insert(name.to_owned(), c);
+            }
+        }
+        let view = View::compute(names(), record, &compactions);
+        Ok(Heads { listed, gc, view })
     }
-    Ok(out)
 }
 
 impl Snapshot {
@@ -98,44 +138,7 @@ impl Snapshot {
         roots: &[String],
         previous: Option<&Snapshot>,
     ) -> Result<Snapshot, Error> {
-        let mut names = Vec::new();
-        for prefix in ["g-", "h-", "c-"] {
-            names.extend(
-                backend
-                    .list(prefix, None)
-                    .await?
-                    .expect("unbounded")
-                    .into_iter()
-                    .map(|l| l.key),
-            );
-        }
-        let names = || names.iter().map(String::as_str);
-        let gc = records(&backend, heads::newest_gc(names()), |body, name| {
-            GcRecord::decode(body)
-                .ok()
-                .filter(|r| r.head_name() == *name)
-        })
-        .await?
-        .into_iter()
-        .next()
-        .map(|(_, r)| r);
-        let compactions: HashMap<_, _> = records(
-            &backend,
-            heads::compactions_to_fetch(names(), gc.as_ref()),
-            |body, name| {
-                let HeadName::Compaction { base_epoch, .. } = name else {
-                    return None;
-                };
-                CompactionRecord::decode(body)
-                    .ok()
-                    .filter(|r| r.head_name(*base_epoch) == *name)
-            },
-        )
-        .await?
-        .into_iter()
-        .collect();
-        let view = View::compute(names(), gc.as_ref(), &compactions);
-
+        let view = Heads::load(&backend).await?.view;
         let loaded: HashMap<SegDigest, Arc<Segment>> = previous
             .into_iter()
             .flat_map(|p| p.segments.iter().map(|s| (s.digest, s.clone())))
@@ -184,6 +187,27 @@ impl Snapshot {
         Ok(next)
     }
 
+    /// Copy a stored entry into `writer`. `false` if no served segment has it.
+    pub async fn copy_entry(
+        &self,
+        hash: &PathHash,
+        writer: &mut SegmentWriter,
+    ) -> Result<bool, Error> {
+        let Some((seg, i)) = self.find(hash) else {
+            return Ok(false);
+        };
+        let mut node = self.tree(seg).await?.node(i)?;
+        node.map_chunks(&mut |c| {
+            let row = &seg.meta.packs[c.pack as usize];
+            ChunkRef {
+                pack: writer.pack(row.hash, row.size, row.chunks),
+                ..c
+            }
+        });
+        writer.push(seg.meta.entry(i, node));
+        Ok(true)
+    }
+
     /// Chunks locatable without a fetch: every pack index loaded so far.
     pub fn known_chunks(&self) -> KnownChunks {
         let mut known = KnownChunks::default();
@@ -195,6 +219,20 @@ impl Snapshot {
 
     pub fn path_count(&self) -> usize {
         self.segments.iter().map(|s| s.meta.len()).sum()
+    }
+
+    pub fn path_hashes(&self) -> BTreeSet<PathHash> {
+        self.segments
+            .iter()
+            .flat_map(|s| (0..s.meta.len()).map(|i| s.meta.hash(i)))
+            .collect()
+    }
+
+    pub fn pack_hashes(&self) -> BTreeSet<PackHash> {
+        self.segments
+            .iter()
+            .flat_map(|s| s.meta.packs.iter().map(|p| p.hash))
+            .collect()
     }
 
     fn find(&self, hash: &PathHash) -> Option<(&Segment, usize)> {
@@ -219,6 +257,16 @@ impl Snapshot {
         ))
     }
 
+    async fn tree<'a>(&self, seg: &'a Segment) -> Result<&'a Tree, Error> {
+        seg.tree
+            .get_or_try_init(|| async {
+                Ok(Tree::open(
+                    &fetch(&self.backend, &tree_key(&seg.digest)).await?,
+                )?)
+            })
+            .await
+    }
+
     async fn pack_index(&self, pack: PackHash) -> Result<Arc<PackIndex>, Error> {
         if let Some(idx) = self.pack_indexes.lock().unwrap().get(&pack) {
             return Ok(idx.clone());
@@ -234,15 +282,7 @@ impl Snapshot {
         let Some((seg, i)) = self.find(hash) else {
             return Ok(None);
         };
-        let tree = seg
-            .tree
-            .get_or_try_init(|| async {
-                Ok::<_, Error>(Tree::open(
-                    &fetch(&self.backend, &tree_key(&seg.digest)).await?,
-                )?)
-            })
-            .await?;
-        let node = tree.node(i)?;
+        let node = self.tree(seg).await?.node(i)?;
 
         let mut rows = BTreeSet::new();
         node.for_each_chunk(&mut |c| _ = rows.insert(c));
@@ -321,20 +361,25 @@ fn to_file_tree(
     })
 }
 
-/// chunk → `(pack, pack size, position in that pack's index)`.
+/// Chunks locatable through a loaded pack index.
 #[derive(Default)]
-pub struct KnownChunks(HashMap<ChunkHash, (PackHash, u64, u16)>);
+pub struct KnownChunks {
+    chunks: HashMap<ChunkHash, (PackHash, u16)>,
+    /// `(size, entries)` per pack.
+    packs: HashMap<PackHash, (u64, u32)>,
+}
 
 impl KnownChunks {
     pub fn add(&mut self, pack: PackHash, index: &PackIndex) {
-        let size = index.size();
+        self.packs
+            .insert(pack, (index.size(), index.entries.len() as u32));
         for (i, e) in index.entries.iter().enumerate() {
-            self.0.entry(e.hash).or_insert((pack, size, i as u16));
+            self.chunks.entry(e.hash).or_insert((pack, i as u16));
         }
     }
 
     pub fn contains(&self, hash: &ChunkHash) -> bool {
-        self.0.contains_key(hash)
+        self.chunks.contains_key(hash)
     }
 }
 
@@ -347,9 +392,10 @@ fn from_file_tree(
         FileSystemObject::Regular(r) => {
             let mut chunks = Vec::with_capacity(r.contents.chunks.len());
             for h in &r.contents.chunks {
-                let &(pack, size, chunk) = known.0.get(h)?;
+                let &(pack, chunk) = known.chunks.get(h)?;
+                let (size, n) = known.packs[&pack];
                 chunks.push(ChunkRef {
-                    pack: writer.pack(pack, size),
+                    pack: writer.pack(pack, size, n),
                     chunk,
                 });
             }

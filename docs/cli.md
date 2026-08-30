@@ -13,6 +13,7 @@ setups, or hacking on hestia).
 | `--idle-exit <SECONDS>` | — | Drain and exit after this much inactivity (fallback for setups without post steps). |
 | `--branch <NAME>` | `$GITHUB_REF_NAME`, else `local` | Branch part of the manifest root key. |
 | `--system <SYSTEM>` | detected | Nix system part of the root key (e.g. `x86_64-linux`). |
+| `--serve-branch <BRANCH>` | `main` | Also serve what these branches' roots hold (repeatable). |
 | `--upstream-cache-filter` | off | Skip paths signed by an upstream cache instead of caching them (saves quota for big closures). |
 | `--upstream-cache-key-name <KEY_NAME>` | `cache.nixos.org-1` | Key names treated as upstream caches by the filter. Repeatable. |
 | `--filter-drv-closures` | off | Apply the upstream filter to registered derivation closures. Requires `--upstream-cache-filter`; use `hestia prefetch` to retain bulk closure fetching. |
@@ -52,11 +53,9 @@ Always exits 0 (a failing post-build-hook would fail the build).
 
 | Flag | Default | Description |
 |---|---|---|
-| `--dry-run` | off | Plan only; delete nothing. |
-| `--grace <DAYS>` | `3` | Unreachable paths are kept this long. |
-| `--push-ttl <DAYS>` | `14` | Recently pushed paths are kept, reachable or not. |
-| `--root-ttl <DAYS>` | `14` | Roots (branch+system pins) expire after this. |
-| `--touch-age <DAYS>` | `4` | Idle packs get an LRU touch after this. |
+| `--dry-run` | off | Plan only; upload and delete nothing. |
+| `--root-ttl <DAYS>` | `14` | Roots without a drain for this long are dropped. |
+| `--touch-age <DAYS>` | `4` | Idle live packs get an LRU touch after this. |
 
 ## Environment variables
 

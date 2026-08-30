@@ -644,10 +644,21 @@ impl PipelineContext {
         }
         stats.new_chunks = packs.iter().map(|(_, pack)| pack.chunks.len()).sum();
 
+        // The segment is this drain's whole claim on the root: pushed,
+        // already stored, and substituted paths. GC keeps what drains since
+        // its last run named and drops the rest of the root.
         let mut writer = SegmentWriter::default();
         for path in &prepared {
             store::push_entry(&mut writer, &path.entry, &known_chunks)
                 .expect("every chunk is either known or in a pack of this drain");
+        }
+        for hash in &root_paths {
+            if writer.contains(hash) || snapshot.copy_entry(hash, &mut writer).await? {
+                continue;
+            }
+            if let Some(entry) = current.paths.get(hash) {
+                store::push_entry(&mut writer, entry, &known_chunks);
+            }
         }
         for pack in writer.pack_hashes() {
             if let Some(index) = legacy_indexes.get(&pack) {
