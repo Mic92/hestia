@@ -9,9 +9,8 @@ fn sha256_digest(data: &[u8]) -> [u8; 32] {
     *harmonia_utils_hash::Sha256::digest(data).digest_bytes()
 }
 
-/// Full BLAKE3 digest of `data`. Used for hestia's internal content
-/// addresses (chunk and pack hashes): ~3x faster than SHA-256 and not
-/// constrained by any Nix format.
+/// BLAKE3 for chunk hashes (the hot path). Whole objects use SHA-256 so
+/// their name doubles as an OCI blob digest.
 fn blake3_digest(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
@@ -86,17 +85,17 @@ macro_rules! hash_newtype {
 }
 
 hash_newtype!(
-    /// A full 32-byte SHA-256 digest. Used for NAR hashes only.
+    /// SHA-256 of a NAR.
     Hash32,
     32,
     sha256_digest
 );
 
 hash_newtype!(
-    /// A full 32-byte BLAKE3 digest, used for pack content addresses.
-    Blake3Pack,
+    /// SHA-256 of a pack blob.
+    PackHash,
     32,
-    blake3_digest
+    sha256_digest
 );
 
 hash_newtype!(
@@ -111,14 +110,13 @@ hash_newtype!(
 );
 
 hash_newtype!(
-    /// BLAKE3 digest naming a segment or head record.
+    /// SHA-256 of a `.meta`, `.tree` or head record.
     SegDigest,
     32,
-    blake3_digest
+    sha256_digest
 );
 
 pub type ChunkHash = Blake3Chunk;
-pub type PackHash = Blake3Pack;
 pub type NarHash = Hash32;
 
 impl Hash32 {
@@ -219,9 +217,8 @@ mod tests {
 
     #[test]
     fn truncated_chunk_digest_is_a_blake3_prefix() {
-        let full = Blake3Pack::digest(b"same input");
         let truncated = ChunkHash::digest(b"same input");
-        assert_eq!(truncated.0[..], full.0[..16]);
+        assert_eq!(truncated.0[..], blake3_digest(b"same input")[..16]);
     }
 
     #[test]

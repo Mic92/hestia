@@ -302,7 +302,7 @@ when the branch is deleted. In practice this means:
 
 ### What hestia itself enforces
 
-Pack blobs are content-addressed (BLAKE3-named, hash-verified on every
+Pack blobs are content-addressed (SHA-256-named, chunks hash-verified on every
 read), and NARs are verified against the recorded SHA-256 NAR hash
 before being served. Anything that doesn't check out is treated as a cache miss and gets
 rebuilt.

@@ -39,10 +39,11 @@ publishes a segment plus a head naming it.
 
 ![segments, heads and packs](segments.svg)
 
-hestia creates four kinds of cache entry, all write-once and named by
-content or by what they claim: pack blobs (`pack-<hash>`) with a
-per-pack chunk index (`idx-<hash>`), segments (`seg-<digest>.meta` and
-`.tree`), and heads (`g-*`, `h-*`, `c-*`).
+hestia creates three kinds of cache entry, all write-once: pack blobs
+(`pack-<sha256>`, chunk frames followed by their index), segments
+(`seg-<sha256>` for the `.meta` part, which names its `tree-<sha256>`),
+and heads (`g-*`, `h-*`, `c-*`). Everything but a head is named by the
+SHA-256 of its bytes, so the same names work as OCI blob digests.
 
 ### Segments and heads
 
@@ -72,10 +73,9 @@ Store paths are not cached one entry each. NARs are split into
 content-defined chunks (FastCDC, 16–256 KiB, 64 KiB average), each
 chunk is zstd-compressed individually, and compressed chunks are
 concatenated into pack blobs of about 64 MiB. The pack key is the
-BLAKE3 of the blob, so identical packs dedup naturally and a finalized
-pack can be trusted to match its name. Chunk and pack hashes use BLAKE3
-(~3x faster than SHA-256 and unconstrained by any Nix format); NAR
-hashes stay SHA-256, since Nix records and verifies those.
+SHA-256 of the blob, so identical packs dedup naturally and a finalized
+pack can be trusted to match its name. Chunk hashes use BLAKE3 (the hot
+path, ~3x faster and unconstrained by any format).
 
 This layout buys three things. Chunking dedups across paths and
 versions: a rebuilt package shares most of its chunks with the previous
