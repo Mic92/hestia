@@ -952,6 +952,7 @@ version = "3.0.1"
 dependencies = [
  "aho-corasick",
  "axum",
+ "base64",
  "blake3",
  "bytes",
  "clap",

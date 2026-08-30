@@ -87,3 +87,5 @@ tokio = { version = "1", features = ["process"] }
 proptest = "1"
 # Blob storage directory for the fake GHA backend
 tempfile = "3"
+# Basic auth check in the fake OCI registry
+base64 = "0.22"
