@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#5b6b7a"/>
+    </marker>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#3b8a5c"/>
+    </marker>
+  </defs>
+  <style>
+    .h1 { font-size: 18px; font-weight: 600; fill: #2b3a49; }
+    .h2 { font-size: 15px; font-weight: 600; fill: #ffffff; }
+    .h3 { font-size: 14px; font-weight: 600; fill: #2b3a49; }
+    .t  { font-size: 13.5px; fill: #3d4c5c; }
+    .ts { font-size: 12.5px; fill: #6b7a89; font-style: italic; }
+    .m  { font-size: 13px; font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; fill: #2b3a49; }
+    .ms { font-size: 12px; font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; fill: #5b6b7a; }
+    .e  { stroke: #5b6b7a; stroke-width: 1.6; fill: none; }
+    .eg { stroke: #3b8a5c; stroke-width: 1.8; fill: none; }
+    .box  { fill: #f4f6f9; stroke: #cdd6e0; }
+    .card { fill: #ffffff; stroke: #cdd6e0; }
+    .ok   { fill: #e8f3ec; stroke: #9cc5aa; }
+    .no   { fill: #fbeee9; stroke: #e0b4a3; }
+  </style>
+
+  <!-- ================= 1 writers ================= -->
+  <text x="24" y="30" class="h1">① Writer attaches a proof</text>
+
+  <rect x="24" y="44" width="270" height="130" rx="8" class="card"/>
+  <rect x="24" y="44" width="270" height="26" rx="8" fill="#3d5a80"/>
+  <text x="36" y="62" class="h2">CI with OIDC</text>
+  <text x="36" y="92" class="t">GitHub, GitLab, Buildkite, Forgejo</text>
+  <text x="36" y="118" class="m">oidc { jwt }</text>
+  <text x="36" y="142" class="ms">claims: repository, ref, workflow</text>
+  <text x="36" y="164" class="ts">no secret to manage</text>
+
+  <rect x="312" y="44" width="270" height="130" rx="8" class="card"/>
+  <rect x="312" y="44" width="270" height="26" rx="8" fill="#7a5c99"/>
+  <text x="324" y="62" class="h2">Static key</text>
+  <text x="324" y="92" class="t">Jenkins, Hydra, laptop, KMS / HSM</text>
+  <text x="324" y="118" class="m">sig { key_id, alg, sig }</text>
+  <text x="324" y="142" class="ms">ed25519 file · P-256 on HSM</text>
+  <text x="324" y="164" class="ts">isolation = who holds the key</text>
+
+  <rect x="600" y="44" width="270" height="130" rx="8" class="card"/>
+  <rect x="600" y="44" width="270" height="26" rx="8" fill="#8a8f96"/>
+  <text x="612" y="62" class="h2">No proof</text>
+  <text x="612" y="92" class="t">registry ACL isolates instead</text>
+  <text x="612" y="118" class="m">none</text>
+  <text x="612" y="142" class="ms">Actions cache scopes, Harbor projects</text>
+  <text x="612" y="164" class="ts">counts only under trust: open</text>
+
+  <rect x="888" y="44" width="288" height="130" rx="8" class="card"/>
+  <rect x="888" y="44" width="288" height="26" rx="8" fill="#3b8a5c"/>
+  <text x="900" y="62" class="h2">GC = trust root</text>
+  <text x="900" y="92" class="t">default-branch job or gc key</text>
+  <text x="900" y="118" class="m">oidc | sig</text>
+  <text x="900" y="142" class="ms">records origin (identity, epoch)</text>
+  <text x="900" y="164" class="ts">re-signs all it folds, daily</text>
+
+
+  <path class="e"  d="M 159 174 L 159 236" marker-end="url(#a)"/>
+  <path class="e"  d="M 447 174 L 447 236" marker-end="url(#a)"/>
+  <path class="e"  d="M 735 174 L 735 236" marker-end="url(#a)"/>
+  <path class="eg" d="M 1032 174 L 1032 236" marker-end="url(#ag)"/>
+  <rect x="200" y="188" width="620" height="26" rx="13" fill="#ffffff" stroke="#cdd6e0"/>
+  <text x="216" y="206" class="t">bound to one record:</text>
+  <text x="356" y="206" class="m">aud = sha256(segment ‖ root ‖ base_epoch)</text>
+  <text x="668" y="206" class="ts">replay elsewhere fails</text>
+
+  <!-- ================= 2 store ================= -->
+  <rect x="24" y="240" width="1152" height="178" rx="10" class="box"/>
+  <text x="40" y="266" class="h1">② Store: proof sits on the object that introduces segments</text>
+
+  <rect x="40" y="282" width="356" height="122" rx="6" class="card"/>
+  <text x="52" y="304" class="h3">drain</text>
+  <text x="52" y="328" class="m">segment manifest</text>
+  <text x="52" y="350" class="ms">layers  .meta  .tree</text>
+  <text x="52" y="370" class="ms">annot.  root, base_epoch, proof</text>
+  <text x="52" y="394" class="ms">tag h-&lt;epoch&gt;-&lt;root&gt;-&lt;seg&gt;  (name only)</text>
+
+  <rect x="412" y="282" width="356" height="122" rx="6" class="card"/>
+  <text x="424" y="304" class="h3">compaction</text>
+  <text x="424" y="328" class="m">c-&lt;epoch&gt;-&lt;root&gt;-&lt;digest&gt;</text>
+  <text x="424" y="350" class="ms">config  { added, replaces, subsumes }</text>
+  <text x="424" y="370" class="ms">annot.  proof</text>
+  <text x="424" y="394" class="ts">digest in the name: a tag cannot be redirected</text>
+
+  <rect x="784" y="282" width="376" height="122" rx="6" class="ok"/>
+  <text x="796" y="304" class="h3">GC head  g-&lt;epoch&gt;-&lt;digest&gt;</text>
+  <text x="796" y="328" class="ms">roots, retired, folded</text>
+  <text x="796" y="350" class="ms">origin  seg ← [(identity, epoch)…]</text>
+  <text x="796" y="370" class="ms">annot.  proof</text>
+  <text x="796" y="394" class="ts">for gc --distrust &lt;identity&gt;</text>
+
+  <path class="e" d="M 600 418 L 600 452" marker-end="url(#a)"/>
+
+  <!-- ================= 3 reader ================= -->
+  <rect x="24" y="456" width="1152" height="280" rx="10" class="box"/>
+  <text x="40" y="482" class="h1">③ Reader and GC: verify → identity → policy → view</text>
+
+  <rect x="40" y="498" width="300" height="222" rx="6" class="card"/>
+  <text x="52" y="522" class="h3">policy = action inputs</text>
+  <text x="52" y="546" class="ms">trust: strict | same-repo | open</text>
+  <text x="52" y="564" class="ms">trust-roots, trust-keys</text>
+  <text x="52" y="582" class="ms">gc-identity  ({repo}@main)</text>
+  <text x="52" y="606" class="ts">from the workflow on this ref</text>
+  <text x="52" y="640" class="h3">pick GC head</text>
+  <text x="52" y="664" class="t">newest g-* verifying as gc-identity</text>
+  <text x="52" y="684" class="t">JWKS per issuer, once per run</text>
+  <text x="52" y="706" class="ts">no bootstrap, rotation is a commit</text>
+
+  <path class="e" d="M 340 609 L 372 609" marker-end="url(#a)"/>
+
+  <rect x="376" y="498" width="380" height="222" rx="6" class="card"/>
+  <text x="388" y="522" class="h3">for each h-* / c-* in the listing</text>
+  <text x="388" y="552" class="m">verify(proof, aud) → identity</text>
+  <text x="400" y="576" class="ms">oidc  sig ∧ issuer ∧ aud  → "o/r@refs/heads/main"</text>
+  <text x="400" y="596" class="ms">sig   known key ∧ sig    → "key:rel"</text>
+  <text x="400" y="616" class="ms">none, forged, replayed   → ⊥</text>
+  <text x="388" y="652" class="m">accept(root, identity)</text>
+  <text x="400" y="676" class="ms">per root: added, replaces, subsumes</text>
+  <text x="400" y="696" class="ms">count only where the pattern matches</text>
+
+  <path class="eg" d="M 756 560 L 788 560" marker-end="url(#ag)"/>
+  <path class="e"  d="M 756 680 L 788 680" marker-end="url(#a)" stroke-dasharray="5 4"/>
+
+  <rect x="792" y="498" width="368" height="100" rx="6" class="ok"/>
+  <text x="804" y="522" class="h3">view per root</text>
+  <text x="804" y="548" class="ms">g.roots ∪ accepted added − accepted replaces</text>
+  <text x="804" y="572" class="t">a writer only ever affects roots its</text>
+  <text x="804" y="590" class="t">identity is listed for</text>
+
+  <rect x="792" y="612" width="368" height="108" rx="6" class="no"/>
+  <text x="804" y="636" class="h3">rejected</text>
+  <text x="804" y="660" class="t">logged with identity and run, not fetched</text>
+  <text x="804" y="684" class="ms">strict     own ref only     (oci default)</text>
+  <text x="804" y="700" class="ms">same-repo  any ref of repo  (gha default)</text>
+  <text x="804" y="716" class="ms">open       everything</text>
+</svg>
