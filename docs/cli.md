@@ -64,7 +64,7 @@ Always exits 0 (a failing post-build-hook would fail the build).
 |---|---|---|
 | `ACTIONS_RUNTIME_TOKEN` | serve, gc | GHA cache API token. Only visible to JS actions; the hestia action exports it. |
 | `ACTIONS_RESULTS_URL` | serve, gc | GHA cache API base URL. Exported by the action. |
-| `GITHUB_TOKEN` | gc | GitHub REST API token (`actions: write`) for listing/deleting cache entries. |
+| `GITHUB_TOKEN` | serve, gc | GitHub REST API token for listing cache entries (`actions: read`), gc also deletes (`actions: write`). |
 | `GITHUB_REPOSITORY` | gc | `owner/repo`, set automatically in workflows. |
 | `GITHUB_API_URL` | gc | REST API base URL (override for GHES). |
 | `GITHUB_REF_NAME` | serve | Default for `--branch`. |

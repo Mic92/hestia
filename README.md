@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read # optional: detect evicted cache entries upfront
+      actions: read # find what earlier jobs cached
     steps:
       - uses: actions/checkout@v6
       - uses: NixOS/nix-installer-action@main
@@ -41,11 +41,10 @@ jobs:
 Everything built in your workflow gets cached; later runs (and PRs) pull
 from the cache instead of rebuilding.
 
-Build jobs need no extra permissions for the cache itself: uploads
-authenticate with the runner-injected `ACTIONS_RUNTIME_TOKEN`, which the
-`permissions:` block does not scope. The optional `actions: read` lets
-the daemon check upfront which cached packs GitHub has evicted, so
-affected paths are rebuilt without a failed download attempt first.
+Uploads authenticate with the runner-injected `ACTIONS_RUNTIME_TOKEN`,
+which the `permissions:` block does not scope. Finding what earlier jobs
+published takes a cache listing, which needs `actions: read` on the
+job token: without it the job still pushes but substitutes nothing.
 
 You will also want a daily GC workflow on the default branch to stay within
 the cache quota; copy [`.github/workflows/gc.yml`](.github/workflows/gc.yml)
@@ -213,7 +212,7 @@ All inputs are optional; the defaults work for the quick start above.
 |---|---|---|
 | `binary` | — | Path to a pre-built hestia binary. Takes precedence over `version`. |
 | `version` | latest release | Release tag to download (e.g. `v1.0.0`). The download is verified against GitHub's build attestations. |
-| `github-token` | `${{ github.token }}` | Token for the attestation API lookup. |
+| `github-token` | `${{ github.token }}` | Token for listing cache entries (`actions: read`) and the attestation API lookup. |
 | `listen` | `127.0.0.1:37515` | Substituter listen address. |
 | `socket` | `/tmp/hestia/hook.sock` | Post-build-hook unix socket path. |
 | `drain-timeout` | `300` | Seconds the post-job step waits for the final upload. |

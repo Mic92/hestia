@@ -26,8 +26,9 @@ inputs:
     default: "latest"
   github-token:
     description: >
-      Token for the attestation API lookup that verifies downloaded release
-      binaries.
+      Token for listing cache entries to find what earlier jobs cached
+      (needs `actions: read`, nothing is substituted without it) and for
+      the attestation API lookup that verifies downloaded release binaries.
     required: false
     default: ${{ github.token }}
   listen:
