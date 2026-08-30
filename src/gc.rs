@@ -278,10 +278,11 @@ impl Gc {
             if lost.contains(source) || used.ratio() >= self.policy.min_liveness {
                 continue;
             }
-            if !self.repack(*source, used, &mut repacker).await? {
+            if self.repack(*source, used, &mut repacker).await? {
+                stats.packs_repacked += 1;
+            } else {
                 lost.insert(*source);
             }
-            stats.packs_repacked += 1;
         }
         repacker.seal(self).await?;
         let touched = |m: &Meta| {

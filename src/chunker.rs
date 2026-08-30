@@ -381,7 +381,7 @@ impl Pack {
         }
     }
 
-    /// Manifest chunk locations pointing into this pack.
+    /// Chunk locations pointing into this pack.
     pub fn locations(&self) -> impl Iterator<Item = (ChunkHash, ChunkLocation)> + '_ {
         self.chunks.iter().map(|(hash, packed)| {
             (
@@ -391,7 +391,6 @@ impl Pack {
                     offset: packed.offset,
                     compressed_size: packed.compressed_size,
                     uncompressed_size: packed.uncompressed_size,
-                    repacks_survived: 0,
                 },
             )
         })

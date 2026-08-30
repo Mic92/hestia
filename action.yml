@@ -47,7 +47,7 @@ inputs:
   drain-timeout:
     description: >
       Maximum number of seconds the post-job step waits for the final upload
-      (chunking, pack upload, manifest commit).
+      (chunking, pack upload, publish).
     required: false
     default: "300"
   upstream-cache-filter:
@@ -83,14 +83,16 @@ inputs:
       stay on upstream caches).
     required: false
     default: "false"
-  wait-manifest-version:
+  wait-head:
     description: >
-      Wait up to 60s at daemon startup until the cache manifest has at least
-      this version. Matrix build jobs pass the eval job's `manifest-version`
-      output so the just-uploaded drv closures are visible despite GHA cache
-      lookup lag.
+      Wait up to 60s at daemon startup until this head is listed. Matrix
+      build jobs pass the eval job's `head` output so the just-uploaded drv
+      closures are visible despite GHA cache listing lag.
     required: false
-    default: "0"
+  wait-manifest-version:
+    description: Deprecated alias of `wait-head`.
+    required: false
+    default: ""
 
 # If both `binary` and `version` are explicitly empty, the action only
 # captures and exports the cache tokens (ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL).

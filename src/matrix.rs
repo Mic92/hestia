@@ -256,23 +256,24 @@ fn prefixed(prefix: &str, attr: &str) -> String {
     }
 }
 
-/// The step outputs: `matrix`, `any-jobs`, `manifest-version`.
-pub fn outputs(rows: &[MatrixRow], manifest_version: u64) -> Vec<(String, String)> {
+/// The step outputs: `matrix`, `any-jobs`, `head` (and its old name).
+pub fn outputs(rows: &[MatrixRow], head: &str) -> Vec<(String, String)> {
     let matrix = serde_json::json!({ "include": rows });
     vec![
         ("matrix".to_string(), matrix.to_string()),
         ("any-jobs".to_string(), (!rows.is_empty()).to_string()),
-        ("manifest-version".to_string(), manifest_version.to_string()),
+        ("head".to_string(), head.to_string()),
+        ("manifest-version".to_string(), head.to_string()),
     ]
 }
 
 /// Register the drv paths with the daemon and drain, returning the
-/// committed manifest version. Never fatal: the matrix still works without
-/// a reachable daemon (`nix build .#$attr` mode), so a warning beats
+/// published head. Never fatal: the matrix still works without a
+/// reachable daemon (`nix build .#$attr` mode), so a warning beats
 /// failing the eval job.
-async fn register_and_drain(args: &MatrixArgs, drv_paths: Vec<String>) -> u64 {
+async fn register_and_drain(args: &MatrixArgs, drv_paths: Vec<String>) -> Option<String> {
     if drv_paths.is_empty() {
-        return 0;
+        return None;
     }
     let count = drv_paths.len();
     let request = Request::Add { paths: drv_paths };
@@ -282,18 +283,18 @@ async fn register_and_drain(args: &MatrixArgs, drv_paths: Vec<String>) -> u64 {
              (matrix is still emitted; drv closures will not be cached)",
             args.socket.display()
         );
-        return 0;
+        return None;
     }
     let drain = protocol::roundtrip(&args.socket, &Request::Drain);
     match tokio::time::timeout(Duration::from_secs(args.drain_timeout), drain).await {
         Ok(Ok(response)) => {
             let stats = response.stats.unwrap_or_default();
             eprintln!("hestia matrix: {}", crate::drain::summarize(&stats));
-            stats.manifest_version
+            stats.head
         }
         Ok(Err(err)) => {
             eprintln!("hestia matrix: drain failed: {err} (matrix is still emitted)");
-            0
+            None
         }
         Err(_) => {
             eprintln!(
@@ -301,7 +302,7 @@ async fn register_and_drain(args: &MatrixArgs, drv_paths: Vec<String>) -> u64 {
                  (matrix is still emitted)",
                 args.drain_timeout
             );
-            0
+            None
         }
     }
 }
@@ -385,14 +386,16 @@ async fn run_inner(args: &MatrixArgs) -> Result<(), Error> {
     let mut drv_paths: Vec<String> = jobs.iter().map(|job| job.drv_path.clone()).collect();
     drv_paths.sort();
     drv_paths.dedup();
-    let manifest_version = register_and_drain(args, drv_paths).await;
+    let head = register_and_drain(args, drv_paths)
+        .await
+        .unwrap_or_default();
 
     eprintln!(
         "hestia matrix: {} job(s) to build ({} evaluated)",
         rows.len(),
         jobs.len()
     );
-    emit_outputs(&outputs(&rows, manifest_version))
+    emit_outputs(&outputs(&rows, &head))
 }
 
 #[cfg(test)]
@@ -572,21 +575,18 @@ mod tests {
     }
 
     #[test]
-    fn outputs_are_matrix_any_jobs_and_manifest_version() {
+    fn outputs_are_matrix_any_jobs_and_head() {
         let rows = build_rows(&[job("a", "x86_64-linux")], &default_runners(), false, "").unwrap();
-        let outputs = outputs(&rows, 7);
+        let outputs = outputs(&rows, "h-abc");
         assert_eq!(outputs[1], ("any-jobs".to_string(), "true".to_string()));
-        assert_eq!(
-            outputs[2],
-            ("manifest-version".to_string(), "7".to_string())
-        );
+        assert_eq!(outputs[2], ("head".to_string(), "h-abc".to_string()));
         let matrix: Value = serde_json::from_str(&outputs[0].1).unwrap();
         assert_eq!(matrix["include"][0]["name"], "a");
         assert_eq!(matrix["include"][0]["drvPath"], rows[0].drv_path);
         assert_eq!(matrix["include"][0]["os"][0], "ubuntu-24.04");
 
-        let empty = super::outputs(&[], 0);
+        let empty = super::outputs(&[], "");
         assert_eq!(empty[1].1, "false");
-        assert_eq!(empty[2].1, "0");
+        assert_eq!(empty[2].1, "");
     }
 }

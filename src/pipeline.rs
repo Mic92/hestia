@@ -1,4 +1,4 @@
-//! The write pipeline: store paths → chunks → packs → manifest commit.
+//! The write pipeline: store paths → chunks → packs → segment + head.
 //!
 //! Runs on drain (action post-step or idle-exit). Steps:
 //!
@@ -6,15 +6,14 @@
 //!    expanded to its runtime closure unless disabled.
 //! 2. Filter: invalid paths, upstream-signed paths (when the upstream
 //!    cache filter is enabled. Derivation closures bypass it unless
-//!    explicitly configured otherwise), paths already in the manifest
-//!    (those get their `last_pushed` clock bumped instead).
+//!    explicitly configured otherwise), paths already stored.
 //! 3. Chunk each new path (FastCDC over NAR events) and verify the chunked
 //!    representation reproduces the NAR hash recorded by Nix.
 //! 4. Pack new chunks, upload each pack with its index.
-//! 5. Publish the new paths as a segment plus head under this root, and
-//!    (until GC reads segments) also commit them to the legacy manifest.
+//! 5. Publish everything this job pushed, found stored or substituted as
+//!    one segment plus head under this root.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,8 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::backend::Backend;
 use crate::chunker::{self, PackBuilder, chunk_path, compress_chunks, nar_hash_from_chunks};
 use crate::gha::Error as GhaError;
-use crate::gha::savemutable::SaveMutable;
-use crate::manifest::{Manifest, PackInfo, PathEntry, PathHash, Root};
+use crate::manifest::{PathEntry, PathHash};
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
 use crate::refnorm::RefTable;
@@ -32,14 +30,6 @@ use crate::store::{self, Snapshot};
 use crate::substituter::ManifestStore;
 use crate::upstream::UpstreamFilter;
 use futures_util::{StreamExt as _, TryStreamExt as _};
-
-/// SaveMutable family prefix for the manifest ("m3" → keys `m3#1`, `m3#2`,
-/// …). Bumped on every chunk-format change, because old chunks never dedup
-/// against new ones: "m" → "m2" for reference normalization, "m2" → "m3"
-/// for the 64/256/1024 KiB FastCDC parameters. A fresh namespace ignores
-/// the old manifest rather than carrying dead entries forward; its
-/// orphaned packs age out through GC and eviction.
-pub const MANIFEST_PREFIX: &str = "m3";
 
 /// Compressed bytes per pack before a new pack is started.
 pub const PACK_TARGET_SIZE: u64 = 64 * 1024 * 1024;
@@ -71,9 +61,6 @@ pub enum Error {
 
     #[error("chunking error: {0}")]
     Chunker(#[from] chunker::Error),
-
-    #[error("manifest error: {0}")]
-    Manifest(#[from] crate::manifest::Error),
 
     #[error("store database error: {0}")]
     PathInfo(#[from] PathInfoError),
@@ -123,7 +110,7 @@ pub fn current_system() -> String {
         os => os,
     };
     // Rust arch names diverge from Nix system spellings on some platforms;
-    // the value defaults the manifest root key, so an unmapped spelling
+    // the value defaults the root key, so an unmapped spelling
     // fragments (or collides) GC roots against jobs passing --system with
     // the Nix spelling.
     let arch = match std::env::consts::ARCH {
@@ -136,7 +123,7 @@ pub fn current_system() -> String {
     format!("{arch}-{os}")
 }
 
-/// Manifest root key for a branch + system pair, e.g. `main-x86_64-linux`.
+/// Root key for a branch + system pair, e.g. `main-x86_64-linux`.
 pub fn root_key(branch: &str, system: &str) -> String {
     format!("{branch}-{system}")
 }
@@ -149,32 +136,10 @@ pub fn now_unix() -> u64 {
         .as_secs()
 }
 
-/// Decode a stored manifest blob, falling back to an empty manifest when
-/// the blob is corrupt (truncated upload, garbage data, eviction race).
-///
-/// A corrupt manifest must never make the daemon fail: every drain and
-/// every substituter lookup goes through it, so failing here would break
-/// caching for the repository until someone deletes the entry by hand.
-/// Starting from an empty manifest instead means cache misses (paths get
-/// rebuilt and re-pushed) and the next commit overwrites the corrupt
-/// version — self-healing, never CI-breaking.
-pub fn decode_manifest_or_empty(data: &[u8]) -> Manifest {
-    match Manifest::decode(data) {
-        Ok(manifest) => manifest,
-        Err(err) => {
-            eprintln!(
-                "hestia: stored manifest is corrupt ({err}); starting from an empty manifest \
-                 (previously cached paths will be rebuilt and re-pushed)"
-            );
-            Manifest::new()
-        }
-    }
-}
-
 /// Upload one pack. `false` when the backend already had it. Pack keys
 /// are content-addressed, so an existing entry holds identical content.
-/// That case touches the existing pack so its LRU clock and GC's recency
-/// guard see this writer's dependency before the manifest commit lands.
+/// That case touches the existing pack so its LRU clock and GC's age
+/// guard see this writer's dependency before the head lands.
 pub async fn upload_pack(backend: &Backend, pack: &chunker::Pack) -> Result<bool, GhaError> {
     let key = pack.cache_key();
     let created = backend.put(&key, pack.data.clone()).await?;
@@ -202,13 +167,8 @@ pub struct PipelineContext {
     /// Apply the upstream filter to derivation closure members instead of
     /// keeping those closures self-contained.
     pub filter_drv_closures: bool,
-    /// Manifest root key, e.g. `main-x86_64-linux`.
+    /// Root key, e.g. `main-x86_64-linux`.
     pub root_key: String,
-    /// Workflow run id (`$GITHUB_RUN_ID`); see [`Root::merge`].
-    pub run_id: Option<String>,
-    /// SaveMutable family prefix (always [`MANIFEST_PREFIX`] in production;
-    /// tests use distinct prefixes to isolate scenarios).
-    pub manifest_prefix: String,
     /// Compressed bytes per pack ([`PACK_TARGET_SIZE`] in production; tests
     /// use small values to exercise pack splitting).
     pub pack_target_size: u64,
@@ -218,20 +178,9 @@ pub struct PipelineContext {
     /// scope (`check_run`, fork `pull_request`) and the first reservation
     /// would fail anyway.
     pub read_only: Arc<AtomicBool>,
-    /// Where committed manifests are published for the substituter.
-    ///
-    /// Read-your-writes: the cache service's lookups are eventually
-    /// consistent, so re-loading the manifest right after a commit can
-    /// return a stale version that misses the paths this very drain just
-    /// pushed. Publishing the committed manifest directly guarantees the
-    /// substituter can serve them immediately.
+    /// Where the published segment is handed to the substituter, so the
+    /// paths this drain pushed are served even while listings lag.
     pub publish: Option<ManifestStore>,
-}
-
-/// One new path, fully prepared for upload.
-struct PreparedPath {
-    hash: PathHash,
-    entry: PathEntry,
 }
 
 /// A path that chunked and passed NAR verification.
@@ -252,39 +201,14 @@ enum Verified {
 }
 
 impl PipelineContext {
-    fn save_mutable(&self) -> SaveMutable<'_> {
-        SaveMutable::new(
-            self.backend.twirp(),
-            self.backend.http(),
-            &self.manifest_prefix,
-        )
-    }
-
-    /// Load the current manifest, or an empty one if none exists yet or
-    /// the stored blob is corrupt (see [`decode_manifest_or_empty`]).
-    pub async fn load_manifest(&self) -> Result<Manifest, Error> {
-        Ok(self.load_manifest_versioned().await?.1)
-    }
-
-    /// Like [`Self::load_manifest`], but also returns the SaveMutable index
-    /// the manifest was loaded from (0 when none exists yet).
-    pub async fn load_manifest_versioned(&self) -> Result<(u64, Manifest), Error> {
-        match self.save_mutable().load().await? {
-            Some(entry) => Ok((entry.index, decode_manifest_or_empty(&entry.data))),
-            None => Ok((0, Manifest::new())),
-        }
-    }
-
     /// Run the write pipeline.
     ///
     /// `paths`: absolute store paths buffered from hooks.
     /// `accessed`: path hashes recorded by the substituter ([`AccessLog`]).
-    /// `now`: unix timestamp for all clocks written by this run.
     pub async fn run(
         &self,
         paths: BTreeSet<String>,
         accessed: BTreeSet<PathHash>,
-        now: u64,
     ) -> Result<DrainStats, Error> {
         let mut stats = DrainStats {
             paths_received: paths.len(),
@@ -300,18 +224,6 @@ impl PipelineContext {
         }
 
         let load_started = std::time::Instant::now();
-        let (loaded_version, loaded) = self.load_manifest_versioned().await?;
-
-        // Read-your-writes: cache lookups may lag behind this daemon's own
-        // commits, so fold in the manifest we are currently serving (it is
-        // at least as new as anything we wrote).
-        let (known_version, known) = match &self.publish {
-            Some(store) => store.versioned(),
-            None => (0, Manifest::new()),
-        };
-        // `current` is the basis for every dedup decision below; the commit
-        // at the end must include all of it (see the merge closure).
-        let current = loaded.merge(known);
         let snapshot = match self.publish.as_ref().and_then(ManifestStore::snapshot) {
             Some(s) => s,
             None => Arc::new(
@@ -323,17 +235,6 @@ impl PipelineContext {
                 .await?,
             ),
         };
-        let mut known_chunks = snapshot.known_chunks();
-        // Legacy packs have no index. A segment referencing one uploads it.
-        let legacy_indexes = store::pack_indexes(&current);
-        for (pack, index) in &legacy_indexes {
-            known_chunks.add(*pack, index);
-        }
-        // Reservation floor: never reserve at or below a version we have
-        // already seen, even when commit-time lookups regress below it
-        // (non-monotonic eventually consistent reads).
-        let floor = known_version.max(loaded_version);
-
         // Blocking sqlite I/O happens off the async runtime.
         let store = self.store.clone();
         let expand_closure = self.expand_closure;
@@ -364,8 +265,6 @@ impl PipelineContext {
         .expect("store database query task panicked")?;
 
         let mut root_paths: BTreeSet<PathHash> = accessed;
-        // Existing entries whose last_pushed clock gets bumped (dedup-skips).
-        let mut bumped: BTreeMap<PathHash, PathEntry> = BTreeMap::new();
         // Paths that need chunking + upload.
         let mut to_push: Vec<(String, PathInfo)> = Vec::new();
 
@@ -393,16 +292,6 @@ impl PipelineContext {
 
             let hash = info.path_hash();
 
-            if let Some(existing) = current.paths.get(&hash) {
-                // Already stored: bump the push clock so push-TTL-based
-                // liveness keeps protecting it.
-                root_paths.insert(hash);
-                let mut entry = existing.clone();
-                entry.last_pushed = now;
-                bumped.insert(hash, entry);
-                stats.skipped_existing += 1;
-                continue;
-            }
             if snapshot.contains(&hash) {
                 root_paths.insert(hash);
                 stats.skipped_existing += 1;
@@ -411,6 +300,14 @@ impl PipelineContext {
 
             to_push.push((path, info));
         }
+        // A rebuild mostly repeats the chunks of the previous build under
+        // the same name, so those pack indexes are worth loading.
+        let names = to_push
+            .iter()
+            .map(|(_, i)| i.store_path.name().as_ref())
+            .collect();
+        snapshot.load_indexes_for(&names).await?;
+        let mut known_chunks = snapshot.known_chunks();
 
         stats.load_ms = load_started.elapsed().as_millis() as u64;
 
@@ -427,7 +324,7 @@ impl PipelineContext {
         let (pack_tx, pack_rx) = tokio::sync::mpsc::channel::<chunker::Pack>(2);
 
         let prepare = async {
-            let mut prepared: Vec<PreparedPath> = Vec::new();
+            let mut prepared: Vec<PathEntry> = Vec::new();
             // Summed as a Duration, converted once: per-path as_millis()
             // truncation would underreport drains of many small paths.
             let mut chunk_time = std::time::Duration::ZERO;
@@ -528,23 +425,18 @@ impl PipelineContext {
                     })
                     .collect();
 
-                prepared.push(PreparedPath {
-                    hash: info.path_hash(),
-                    entry: PathEntry {
-                        // Verbatim, including any self-reference: this list
-                        // becomes the narinfo References line, and stripping
-                        // self would diverge substituted clients' store
-                        // metadata from the builder's.
-                        references: info.references,
-                        store_path: info.store_path,
-                        nar_hash,
-                        nar_size,
-                        ca: info.ca,
-                        deriver: info.deriver,
-                        tree: chunked.tree,
-                        last_reachable: 0,
-                        last_pushed: now,
-                    },
+                prepared.push(PathEntry {
+                    // Verbatim, including any self-reference: this list
+                    // becomes the narinfo References line, and stripping
+                    // self would diverge substituted clients' store
+                    // metadata from the builder's.
+                    references: info.references,
+                    store_path: info.store_path,
+                    nar_hash,
+                    nar_size,
+                    ca: info.ca,
+                    deriver: info.deriver,
+                    tree: chunked.tree,
                 });
 
                 if !new_chunks.is_empty() && chunks_tx.send(new_chunks).await.is_err() {
@@ -624,159 +516,47 @@ impl PipelineContext {
         stats.failed_verification += failed_verification;
         stats.chunk_ms = chunk_time.as_millis() as u64;
         stats.pack_ms = pack_time.as_millis() as u64;
-        // Paths the producer rejected (failed verification or chunking)
-        // must not enter the committed root: it would pin hashes the
-        // manifest cannot serve.
-        root_paths.extend(prepared.iter().map(|path| path.hash));
         // Stage times overlap now: chunk/pack are producer busy times,
         // upload is the wall time of the whole pipelined section.
         stats.upload_ms = upload_started.elapsed().as_millis() as u64;
 
-        let mut delta = Manifest::new();
-        let mut packs: Vec<(u64, chunker::Pack)> = Vec::new();
         for (uploaded, size, pack) in uploads {
             if uploaded {
                 stats.packs_uploaded += 1;
                 stats.bytes_uploaded += size;
             }
+            stats.new_chunks += pack.chunks.len();
             known_chunks.add(pack.hash, &pack.index());
-            packs.push((size, pack));
         }
-        stats.new_chunks = packs.iter().map(|(_, pack)| pack.chunks.len()).sum();
 
         // The segment is this drain's whole claim on the root: pushed,
         // already stored, and substituted paths. GC keeps what drains since
         // its last run named and drops the rest of the root.
         let mut writer = SegmentWriter::default();
-        for path in &prepared {
-            store::push_entry(&mut writer, &path.entry, &known_chunks)
+        for entry in &prepared {
+            store::push_entry(&mut writer, entry, &known_chunks)
                 .expect("every chunk is either known or in a pack of this drain");
         }
+        stats.pushed = prepared.len();
         for hash in &root_paths {
-            if writer.contains(hash) || snapshot.copy_entry(hash, &mut writer).await? {
-                continue;
-            }
-            if let Some(entry) = current.paths.get(hash) {
-                store::push_entry(&mut writer, entry, &known_chunks);
+            if !writer.contains(hash) {
+                snapshot.copy_entry(hash, &mut writer).await?;
             }
         }
-        for pack in writer.pack_hashes() {
-            if let Some(index) = legacy_indexes.get(&pack) {
-                self.backend
-                    .put(&store::pack_index_key(&pack), index.encode().into())
-                    .await
-                    .map_err(store::Error::from)?;
-            }
-        }
-        if !writer.is_empty() {
-            let sealed = writer.seal().map_err(store::Error::from)?;
-            store::publish(&self.backend, &snapshot.view, &self.root_key, &sealed).await?;
-            if let Some(publish) = &self.publish {
-                match snapshot.refresh_with(&sealed).await {
-                    Ok(next) => publish.set_snapshot(Arc::new(next)),
-                    Err(err) => eprintln!("hestia: cannot refresh the served segments: {err}"),
-                }
-            }
-        }
-
-        for (size, pack) in &packs {
-            for (chunk_hash, location) in pack.locations() {
-                delta.chunks.insert(chunk_hash, location);
-            }
-            delta.packs.insert(
-                pack.hash,
-                PackInfo {
-                    size: *size,
-                    created: now,
-                    tier: 0,
-                },
-            );
-        }
-
-        for path in prepared {
-            stats.pushed += 1;
-            delta.paths.insert(path.hash, path.entry);
-        }
-        delta.paths.extend(bumped);
-
-        if delta.paths.is_empty() && root_paths.is_empty() {
-            // Everything was filtered out; nothing worth a manifest version.
+        if writer.is_empty() {
             return Ok(stats);
         }
-
-        delta.roots.insert(
-            self.root_key.clone(),
-            Root {
-                paths: root_paths,
-                updated: now,
-                run_id: self.run_id.clone(),
-            },
-        );
-
-        // Skip commits that would only refresh the root's `updated` clock:
-        // the access log is never cleared and the SIGTERM final drain runs
-        // unconditionally, so otherwise every job that substituted a path
-        // burns a redundant manifest version at teardown. Only skip when
-        // the committed root comes from this very run: a CI job lives far
-        // shorter than the root TTL, so the stale clock cannot expire the
-        // root. Without a run id (local builds) always commit, because the
-        // clock drives root-TTL liveness in GC.
-        let refresh_only = {
-            let mut probe = current.clone().merge(delta.clone());
-            match (
-                probe.roots.get_mut(&self.root_key),
-                current.roots.get(&self.root_key),
-            ) {
-                (Some(probed), Some(committed))
-                    if self.run_id.is_some() && committed.run_id == self.run_id =>
-                {
-                    probed.updated = committed.updated;
-                    probe == current
-                }
-                _ => false,
-            }
-        };
-        if refresh_only {
-            return Ok(stats);
-        }
-
-        // The merge closure keeps the manifest it encoded so the committed
-        // version can be published without re-loading it from the cache.
         let commit_started = std::time::Instant::now();
-        let mut committed: Option<Manifest> = None;
-        let version = self
-            .save_mutable()
-            .save_with_floor(floor, |existing| {
-                // A corrupt base manifest is replaced, not merged with: the
-                // commit must not fail because of it (never crash CI).
-                let base = match existing {
-                    Some(entry) => decode_manifest_or_empty(&entry.data),
-                    None => Manifest::new(),
-                };
-                // `current` covers the gap when `existing` is a stale read:
-                // the commit must contain everything the dedup decisions
-                // above were based on. Merging anything less can drop a
-                // concurrent writer's paths and leave this delta's entries
-                // referencing chunks whose locations are missing (dangling,
-                // unservable, and never healed because later drains see the
-                // path as already stored).
-                let merged = base.merge(current.clone()).merge(delta.clone());
-                let encoded = merged
-                    .encode()
-                    .map_err(|err| GhaError::InvalidResponse(err.to_string()))?;
-                committed = Some(merged);
-                Ok(encoded)
-            })
-            .await?;
+        let sealed = writer.seal().map_err(store::Error::from)?;
+        stats.head =
+            Some(store::publish(&self.backend, &snapshot.view, &self.root_key, &sealed).await?);
         stats.commit_ms = commit_started.elapsed().as_millis() as u64;
-        stats.manifest_version = version;
-
-        // Publish exactly what was committed (includes concurrent writers'
-        // paths, since the merge ran against the latest visible version).
-        if let (Some(store), Some(manifest)) = (&self.publish, committed) {
-            store.set_version(manifest, version);
+        if let Some(publish) = &self.publish {
+            match snapshot.refresh_with(&sealed).await {
+                Ok(next) => publish.set_snapshot(Arc::new(next)),
+                Err(err) => eprintln!("hestia: cannot refresh the served segments: {err}"),
+            }
         }
-
         Ok(stats)
     }
 }

@@ -2,8 +2,7 @@
 //!
 //! Ingests the closures of the system profile generations on this machine
 //! with several FastCDC parameter sets and reports, for each: unique chunk
-//! count, packed (compressed) bytes, encoded manifest size, chunking and
-//! compression time, and the incremental bytes each generation would have
+//! count, packed (compressed) bytes, chunking and compression time, and the incremental bytes each generation would have
 //! uploaded. Used to decide whether the pinned 64 KiB average chunk size
 //! should change.
 //!
@@ -17,13 +16,11 @@
 //!
 //! Requires read access to /nix/store and /nix/var/nix/db/db.sqlite.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use hestia::chunker::{ChunkParams, PackBuilder, chunk_path_with};
-use hestia::manifest::{
-    ChunkHash, ChunkLocation, Manifest, PackHash, PackInfo, PathEntry, PathHash, Root,
-};
+use hestia::manifest::{ChunkHash, PathHash};
 use hestia::pathinfo::{DEFAULT_DB_PATH, Lookup, PathInfo, StoreDatabase};
 use hestia::refnorm::RefTable;
 
@@ -34,9 +31,6 @@ struct Args {
     last: usize,
     avg_kib: Vec<u32>,
     roots: Vec<String>,
-    /// Dump the cumulative manifest after each generation to this directory
-    /// (`manifest-avg<K>-gen<N>.bin`), for offline manifest-format experiments.
-    dump_dir: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -45,7 +39,6 @@ fn parse_args() -> Args {
         last: 5,
         avg_kib: vec![32, 64, 128, 256],
         roots: Vec::new(),
-        dump_dir: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -65,7 +58,6 @@ fn parse_args() -> Args {
             "--roots" => {
                 args.roots = value.split(',').map(|s| s.trim().to_string()).collect();
             }
-            "--dump-dir" => args.dump_dir = Some(value),
             other => {
                 eprintln!("unknown flag {other}");
                 std::process::exit(2);
@@ -103,13 +95,6 @@ fn human_mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before epoch")
-        .as_secs()
-}
-
 struct SweepResult {
     params: ChunkParams,
     paths: usize,
@@ -118,7 +103,6 @@ struct SweepResult {
     unique_chunk_bytes: u64,
     packed_bytes: u64,
     packs: usize,
-    manifest_bytes: usize,
     chunk_time: Duration,
     pack_time: Duration,
     /// (generation number, new packed bytes contributed by that generation)
@@ -129,12 +113,10 @@ async fn sweep(
     params: ChunkParams,
     generations: &[(u64, Vec<PathInfo>)],
     store_dir: &str,
-    dump_dir: Option<&str>,
 ) -> SweepResult {
-    let mut paths: BTreeMap<PathHash, PathEntry> = BTreeMap::new();
-    let mut chunks: BTreeMap<ChunkHash, ChunkLocation> = BTreeMap::new();
-    let mut packs: BTreeMap<PackHash, PackInfo> = BTreeMap::new();
-    let mut roots: BTreeMap<String, Root> = BTreeMap::new();
+    let mut paths: BTreeSet<PathHash> = BTreeSet::new();
+    let mut chunks: BTreeSet<ChunkHash> = BTreeSet::new();
+    let mut packs = 0usize;
 
     let mut builder = PackBuilder::new();
     let mut total_nar_bytes = 0u64;
@@ -144,39 +126,20 @@ async fn sweep(
     let mut pack_time = Duration::ZERO;
     let mut generation_deltas = Vec::new();
 
-    // Locations of chunks in the pack currently being built are only known
-    // once the pack is finished (its hash names it), so finished packs flush
-    // into the chunks map here.
-    let flush_pack = |builder: &mut PackBuilder,
-                      chunks: &mut BTreeMap<ChunkHash, ChunkLocation>,
-                      packs: &mut BTreeMap<PackHash, PackInfo>,
-                      packed_bytes: &mut u64| {
+    let flush_pack = |builder: &mut PackBuilder, packs: &mut usize, packed_bytes: &mut u64| {
         if builder.is_empty() {
             return;
         }
         let pack = std::mem::take(builder).finish();
         *packed_bytes += pack.data.len() as u64;
-        packs.insert(
-            pack.hash,
-            PackInfo {
-                size: pack.data.len() as u64,
-                created: now_unix(),
-                tier: 0,
-            },
-        );
-        for (hash, location) in pack.locations() {
-            chunks.entry(hash).or_insert(location);
-        }
+        *packs += 1;
     };
 
     for (generation, infos) in generations {
         let packed_before = packed_bytes + builder.compressed_size();
-        let mut root_paths: BTreeSet<PathHash> = BTreeSet::new();
 
         for info in infos {
-            let path_hash = info.path_hash();
-            root_paths.insert(path_hash);
-            if paths.contains_key(&path_hash) {
+            if !paths.insert(info.path_hash()) {
                 continue;
             }
             total_nar_bytes += info.nar_size;
@@ -195,87 +158,33 @@ async fn sweep(
 
             let started = Instant::now();
             for chunk in &chunked.chunks {
-                if chunks.contains_key(&chunk.hash) {
+                if !chunks.insert(chunk.hash) {
                     continue;
                 }
-                // PackBuilder skips duplicates within the open pack itself.
-                if builder.add(chunk).expect("compress chunk") {
-                    unique_chunk_bytes += chunk.data.len() as u64;
-                }
+                builder.add(chunk).expect("compress chunk");
+                unique_chunk_bytes += chunk.data.len() as u64;
                 if builder.compressed_size() >= PACK_TARGET_SIZE {
-                    flush_pack(&mut builder, &mut chunks, &mut packs, &mut packed_bytes);
+                    flush_pack(&mut builder, &mut packs, &mut packed_bytes);
                 }
             }
             pack_time += started.elapsed();
-
-            paths.insert(
-                path_hash,
-                PathEntry {
-                    store_path: info.store_path.clone(),
-                    nar_hash: info.nar_hash,
-                    nar_size: info.nar_size,
-                    references: info.references.clone(),
-                    ca: info.ca.clone(),
-                    deriver: info.deriver.clone(),
-                    tree: chunked.tree,
-                    last_reachable: 0,
-                    last_pushed: 0,
-                },
-            );
         }
 
         // Delta this generation would have uploaded: everything packed since
         // the previous generation finished (current builder buffer included).
         let packed_after = packed_bytes + builder.compressed_size();
         generation_deltas.push((*generation, packed_after - packed_before));
-        roots.insert(
-            format!("gen-{generation}"),
-            Root {
-                paths: root_paths,
-                updated: now_unix(),
-                run_id: None,
-            },
-        );
-
-        if let Some(dir) = dump_dir {
-            // Snapshot of the cumulative manifest as of this generation. The
-            // open pack's chunks are not yet located, which slightly
-            // undercounts the last generation's chunk map — fine for
-            // format experiments.
-            let snapshot = Manifest {
-                paths: paths.clone(),
-                chunks: chunks.clone(),
-                packs: packs.clone(),
-                roots: roots.clone(),
-            };
-            std::fs::create_dir_all(dir).expect("create dump dir");
-            let file = format!(
-                "{dir}/manifest-avg{}-gen{generation}.bin",
-                params.avg / 1024
-            );
-            std::fs::write(&file, snapshot.encode().expect("encode snapshot"))
-                .expect("write manifest snapshot");
-        }
     }
-    flush_pack(&mut builder, &mut chunks, &mut packs, &mut packed_bytes);
-
-    let manifest = Manifest {
-        paths,
-        chunks,
-        packs,
-        roots,
-    };
-    let manifest_bytes = manifest.encode().expect("encode manifest").len();
+    flush_pack(&mut builder, &mut packs, &mut packed_bytes);
 
     SweepResult {
         params,
-        paths: manifest.paths.len(),
+        paths: paths.len(),
         total_nar_bytes,
-        unique_chunks: manifest.chunks.len(),
+        unique_chunks: chunks.len(),
         unique_chunk_bytes,
         packed_bytes,
-        packs: manifest.packs.len(),
-        manifest_bytes,
+        packs,
         chunk_time,
         pack_time,
         generation_deltas,
@@ -330,16 +239,8 @@ async fn main() {
         .collect();
 
     println!(
-        "{:>8} {:>8} {:>10} {:>10} {:>10} {:>6} {:>10} {:>9} {:>9}",
-        "avg KiB",
-        "chunks",
-        "uniq MiB",
-        "packed MiB",
-        "manif KiB",
-        "packs",
-        "paths",
-        "chunk s",
-        "zstd s"
+        "{:>8} {:>8} {:>10} {:>10} {:>6} {:>10} {:>9} {:>9}",
+        "avg KiB", "chunks", "uniq MiB", "packed MiB", "packs", "paths", "chunk s", "zstd s"
     );
     for avg_kib in &args.avg_kib {
         let params = ChunkParams {
@@ -347,14 +248,13 @@ async fn main() {
             avg: avg_kib * 1024,
             max: avg_kib * 1024 * 4,
         };
-        let result = sweep(params, &closures, &store_dir, args.dump_dir.as_deref()).await;
+        let result = sweep(params, &closures, &store_dir).await;
         println!(
-            "{:>8} {:>8} {:>10.1} {:>10.1} {:>10.1} {:>6} {:>10} {:>9.1} {:>9.1}",
+            "{:>8} {:>8} {:>10.1} {:>10.1} {:>6} {:>10} {:>9.1} {:>9.1}",
             avg_kib,
             result.unique_chunks,
             human_mib(result.unique_chunk_bytes),
             human_mib(result.packed_bytes),
-            result.manifest_bytes as f64 / 1024.0,
             result.packs,
             result.paths,
             result.chunk_time.as_secs_f64(),

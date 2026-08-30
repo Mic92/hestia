@@ -48,9 +48,8 @@ const MAX_PACK_VERIFY_ENTRIES: u64 = 1000;
 
 use crate::backend::Backend;
 use crate::cli::ServeArgs;
-use crate::gha::savemutable::SaveMutable;
 use crate::pathinfo::StoreDatabase;
-use crate::pipeline::{self, AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
+use crate::pipeline::{self, AccessLog, PipelineContext};
 use crate::protocol::{DrainStats, Request, Response, encode_line};
 use crate::store::Snapshot;
 use crate::substituter::{ManifestStore, Substituter, verify_packs};
@@ -155,7 +154,7 @@ impl DaemonState {
         let accessed = self.access_log.snapshot();
 
         let started = Instant::now();
-        match self.pipeline.run(paths.clone(), accessed, now_unix()).await {
+        match self.pipeline.run(paths.clone(), accessed).await {
             Ok(mut stats) => {
                 stats.elapsed_ms = started.elapsed().as_millis() as u64;
                 if stats.pushed > 0 {
@@ -165,10 +164,6 @@ impl DaemonState {
                     );
                 }
                 self.touch();
-                // The pipeline publishes the committed manifest into the
-                // shared ManifestStore itself; reloading from the cache here
-                // could return a stale version (lookups are eventually
-                // consistent).
                 Ok(stats)
             }
             Err(err) => {
@@ -399,8 +394,8 @@ impl Daemon {
             stats.new_chunks += more.new_chunks;
             stats.packs_uploaded += more.packs_uploaded;
             stats.bytes_uploaded += more.bytes_uploaded;
-            if more.manifest_version > 0 {
-                stats.manifest_version = more.manifest_version;
+            if more.head.is_some() {
+                stats.head = more.head;
             }
         }
 
@@ -420,65 +415,49 @@ impl Daemon {
     }
 }
 
-/// Load the heads of `roots` and the newest legacy manifest into the
-/// served store. A drain may have published a newer manifest while the
-/// load was in flight (or the load may return a stale version: lookups
-/// are eventually consistent). That version must win. Recording the
-/// version makes drains start their reservations above it even when
-/// cache lookups lag.
+/// Load what the heads of `roots` publish into the served store.
 async fn load_published(backend: &Backend, manifest_store: &ManifestStore, roots: &[String]) {
-    let save = SaveMutable::new(backend.twirp(), backend.http(), MANIFEST_PREFIX);
-    match save.load().await {
-        Ok(Some(entry)) => manifest_store
-            .set_version_if_newer(pipeline::decode_manifest_or_empty(&entry.data), entry.index),
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("hestia serve: cannot load the manifest, substituting nothing: {err}");
-        }
-    }
     let previous = manifest_store.snapshot();
     match Snapshot::load(backend.clone(), roots, previous.as_deref()).await {
         Ok(snapshot) => manifest_store.set_snapshot(Arc::new(snapshot)),
         Err(err) => eprintln!(
-            "hestia serve: cannot list heads, serving only the legacy manifest \
-             (grant `actions: read`): {err}"
+            "hestia serve: cannot list heads, substituting nothing (grant `actions: read`): {err}"
         ),
     }
 }
 
-/// How long `--wait-manifest-version` retries the startup manifest load
-/// before giving up, and how long it pauses between attempts.
-const MANIFEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
-const MANIFEST_WAIT_POLL: Duration = Duration::from_secs(2);
+/// How long `--wait-head` retries the startup load before giving up, and
+/// the pause between attempts.
+const HEAD_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const HEAD_WAIT_POLL: Duration = Duration::from_secs(2);
 
-/// Retry `reload` until the served manifest's version reaches
-/// `min_version` or the timeout expires (GHA cache lookups are eventually
-/// consistent: a manifest committed by the eval job moments ago may not be
-/// visible yet when a build job's daemon starts). On timeout the daemon
-/// serves whatever it found; missing paths then surface as cache misses.
-async fn wait_for_manifest_version<Fut: Future<Output = ()>>(
+/// Retry `reload` until the served view includes `head` or the timeout
+/// expires: cache listings lag, so a head an eval job published moments
+/// ago may not be visible yet when a build job's daemon starts. On timeout
+/// the daemon serves what it found and missing paths surface as misses.
+async fn wait_for_head<Fut: Future<Output = ()>>(
     manifest_store: &ManifestStore,
-    min_version: u64,
+    head: Option<&str>,
     reload: impl Fn() -> Fut,
 ) {
-    // tokio's clock, not std::time::Instant: respects paused time in tests.
-    let deadline = tokio::time::Instant::now() + MANIFEST_WAIT_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + HEAD_WAIT_TIMEOUT;
     loop {
         reload().await;
-        if manifest_store.version() >= min_version {
+        let Some(head) = head else { return };
+        if manifest_store
+            .snapshot()
+            .is_some_and(|s| s.view.heads.iter().any(|h| h == head))
+        {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
             eprintln!(
-                "hestia serve: manifest version {} not visible after {}s (have {}); \
-                 serving what was found",
-                min_version,
-                MANIFEST_WAIT_TIMEOUT.as_secs(),
-                manifest_store.version(),
+                "hestia serve: head {head} not visible after {}s; serving what was found",
+                HEAD_WAIT_TIMEOUT.as_secs(),
             );
             return;
         }
-        tokio::time::sleep(MANIFEST_WAIT_POLL).await;
+        tokio::time::sleep(HEAD_WAIT_POLL).await;
     }
 }
 
@@ -614,10 +593,6 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         expand_closure: !args.no_closure,
         filter_drv_closures: args.filter_drv_closures,
         root_key: root_key.clone(),
-        run_id: std::env::var("GITHUB_RUN_ID")
-            .ok()
-            .filter(|id| !id.is_empty()),
-        manifest_prefix: MANIFEST_PREFIX.to_string(),
         pack_target_size: pipeline::PACK_TARGET_SIZE,
         read_only: read_only.clone(),
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.
@@ -658,9 +633,8 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         }
     };
 
-    // Narinfo requests block until the startup manifest load (and the
-    // optional --wait-manifest-version wait) finished; otherwise an early
-    // nix build races the load and sees spurious misses.
+    // Narinfo requests block until the startup load finished. Otherwise an
+    // early nix build races the load and sees spurious misses.
     let (manifest_ready_tx, manifest_ready_rx) = tokio::sync::watch::channel(false);
 
     // The substituter HTTP server shares the manifest and access log with
@@ -690,24 +664,18 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         }
     });
 
-    // Load the manifest committed by previous runs so the substituter can
-    // serve those paths. Loaded concurrently: the listeners are already
-    // bound, so a slow or stalled cache API cannot delay the action's
-    // readiness probe (which gives up after 30s and fails the job). No
-    // manifest yet (first run) or a load failure both mean "serve nothing
-    // until the first drain".
+    // Load what previous runs published so the substituter can serve it.
+    // Loaded concurrently: the listeners are already bound, so a slow or
+    // stalled cache API cannot delay the action's readiness probe (which
+    // gives up after 30s and fails the job). Nothing yet (first run) or a
+    // load failure both mean "serve nothing until the first drain".
     let load_task = {
         let backend = backend.clone();
         let manifest_store = manifest_store.clone();
-        let min_version = args.wait_manifest_version;
+        let wait_head = args.wait_head.clone();
         tokio::spawn(async move {
-            let reload = || {
-                let backend = backend.clone();
-                let manifest_store = manifest_store.clone();
-                let serve_roots = serve_roots.clone();
-                async move { load_published(&backend, &manifest_store, &serve_roots).await }
-            };
-            wait_for_manifest_version(&manifest_store, min_version, reload).await;
+            let reload = || load_published(&backend, &manifest_store, &serve_roots);
+            wait_for_head(&manifest_store, wait_head.as_deref(), reload).await;
             let _ = manifest_ready_tx.send(true);
             verify_packs(&backend, &manifest_store, MAX_PACK_VERIFY_ENTRIES).await;
         })
@@ -715,7 +683,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 
     // Detect a read-only token (check_run, fork pull_request) upfront so a
     // job never chunks a whole closure only to fail at the first
-    // reservation. Spawned like the manifest load so a stalled cache API
+    // reservation. Spawned like the startup load so a stalled cache API
     // cannot delay readiness; it resolves long before the post-step drain.
     // An unreachable cache is inconclusive: stay writable and let the real
     // drain surface any genuine failure.
@@ -796,48 +764,32 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::Manifest;
 
     #[tokio::test(start_paused = true)]
-    async fn manifest_wait_retries_until_the_version_appears() {
-        let store = ManifestStore::new();
-        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let reload_store = store.clone();
-        let reload_attempts = attempts.clone();
-        wait_for_manifest_version(&store, 3, || {
-            let store = reload_store.clone();
-            let attempts = reload_attempts.clone();
-            async move {
-                // The version becomes visible on the third attempt.
-                if attempts.fetch_add(1, Ordering::SeqCst) + 1 >= 3 {
-                    store.set_version_if_newer(Manifest::new(), 3);
-                }
-            }
-        })
-        .await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
-        assert_eq!(store.version(), 3);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn manifest_wait_gives_up_after_the_timeout() {
+    async fn head_wait_gives_up_after_the_timeout() {
         let store = ManifestStore::new();
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let reload_attempts = attempts.clone();
-        wait_for_manifest_version(&store, 5, || {
+        wait_for_head(&store, Some("h-x"), || {
             let attempts = reload_attempts.clone();
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
             }
         })
         .await;
-        assert_eq!(store.version(), 0, "nothing was published");
-        let expected = 1 + MANIFEST_WAIT_TIMEOUT.as_secs() / MANIFEST_WAIT_POLL.as_secs();
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            expected,
-            "initial load + one per poll"
-        );
+        let expected = 1 + HEAD_WAIT_TIMEOUT.as_secs() / HEAD_WAIT_POLL.as_secs();
+        assert_eq!(attempts.load(Ordering::SeqCst), expected);
+
+        attempts.store(0, Ordering::SeqCst);
+        let reload_attempts = attempts.clone();
+        wait_for_head(&store, None, || {
+            let attempts = reload_attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "no head: load once");
     }
 
     #[test]

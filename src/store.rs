@@ -9,12 +9,10 @@ use tokio::sync::OnceCell;
 use crate::backend::{Backend, Listed};
 use crate::heads::{self, CompactionRecord, GcRecord, HeadName, View, root_id};
 use crate::manifest::{
-    ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Manifest, PackHash,
+    ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Hash32, PackHash,
     PathEntry, PathHash, Regular, SegDigest, Symlink,
 };
-use crate::segment::{
-    self, ChunkRef, Chunks, Meta, Node, PackIndex, PackIndexEntry, Sealed, SegmentWriter, Tree,
-};
+use crate::segment::{self, ChunkRef, Chunks, Meta, Node, PackIndex, Sealed, SegmentWriter, Tree};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -149,15 +147,21 @@ impl Snapshot {
             .filter_map(|r| view.roots.get(r))
             .flat_map(|d| d.iter().rev())
         {
-            let segment = match loaded.get(digest) {
-                Some(s) => s.clone(),
-                None => Arc::new(Segment {
+            if let Some(s) = loaded.get(digest) {
+                segments.push(s.clone());
+                continue;
+            }
+            // Evicted or corrupt: its paths miss and get pushed again.
+            let meta =
+                async { Ok::<_, Error>(Meta::open(&fetch(&backend, &meta_key(digest)).await?)?) };
+            match meta.await {
+                Ok(meta) => segments.push(Arc::new(Segment {
                     digest: *digest,
-                    meta: Meta::open(&fetch(&backend, &meta_key(digest)).await?)?,
+                    meta,
                     tree: OnceCell::new(),
-                }),
-            };
-            segments.push(segment);
+                })),
+                Err(err) => eprintln!("hestia: skipping segment {digest}: {err}"),
+            }
         }
         let pack_indexes = previous
             .map(|p| p.pack_indexes.lock().unwrap().clone())
@@ -208,6 +212,28 @@ impl Snapshot {
         Ok(true)
     }
 
+    /// Load the pack indexes behind stored entries with these names.
+    pub async fn load_indexes_for(&self, names: &BTreeSet<&str>) -> Result<(), Error> {
+        for seg in &self.segments {
+            let hits: Vec<usize> = (0..seg.meta.len())
+                .filter(|&i| names.contains(seg.meta.name(i)))
+                .collect();
+            if hits.is_empty() {
+                continue;
+            }
+            let tree = self.tree(seg).await?;
+            let mut packs = BTreeSet::new();
+            for i in hits {
+                tree.node(i)?
+                    .for_each_chunk(&mut |c| _ = packs.insert(c.pack));
+            }
+            for p in packs {
+                self.pack_index(seg.meta.packs[p as usize].hash).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Chunks locatable without a fetch: every pack index loaded so far.
     pub fn known_chunks(&self) -> KnownChunks {
         let mut known = KnownChunks::default();
@@ -233,6 +259,25 @@ impl Snapshot {
             .iter()
             .flat_map(|s| s.meta.packs.iter().map(|p| p.hash))
             .collect()
+    }
+
+    pub fn by_nar_hash(&self, nar_hash: &Hash32) -> Option<PathHash> {
+        self.segments.iter().find_map(|s| {
+            (0..s.meta.len())
+                .find_map(|i| (s.meta.body(i).nar_hash == *nar_hash).then(|| s.meta.hash(i)))
+        })
+    }
+
+    /// Packs holding chunks of `hash` (empty if unknown).
+    pub async fn packs_of(&self, hash: &PathHash) -> Result<BTreeSet<PackHash>, Error> {
+        let mut packs = BTreeSet::new();
+        if let Some((seg, i)) = self.find(hash) {
+            self.tree(seg)
+                .await?
+                .node(i)?
+                .for_each_chunk(&mut |c| _ = packs.insert(seg.meta.packs[c.pack as usize].hash));
+        }
+        Ok(packs)
     }
 
     fn find(&self, hash: &PathHash) -> Option<(&Segment, usize)> {
@@ -306,7 +351,6 @@ impl Snapshot {
                 offset: e.offset,
                 compressed_size: e.compressed_size,
                 uncompressed_size: e.uncompressed_size,
-                repacks_survived: 0,
             });
         }
         let tree = to_file_tree(&node, &mut |c| {
@@ -328,8 +372,6 @@ fn path_entry(e: segment::Entry, tree: FileTree<ChunkList>) -> PathEntry {
         ca: e.ca,
         deriver: e.deriver,
         tree,
-        last_reachable: 0,
-        last_pushed: 0,
     }
 }
 
@@ -473,24 +515,4 @@ pub async fn publish(
     };
     backend.put(&name, body.into()).await?;
     Ok(name)
-}
-
-/// Per-pack indexes of a legacy manifest, chunks in offset order.
-pub fn pack_indexes(manifest: &Manifest) -> BTreeMap<PackHash, PackIndex> {
-    let mut out: BTreeMap<PackHash, PackIndex> = BTreeMap::new();
-    for (hash, loc) in &manifest.chunks {
-        out.entry(loc.pack)
-            .or_default()
-            .entries
-            .push(PackIndexEntry {
-                hash: *hash,
-                offset: loc.offset,
-                compressed_size: loc.compressed_size,
-                uncompressed_size: loc.uncompressed_size,
-            });
-    }
-    for index in out.values_mut() {
-        index.entries.sort_by_key(|e| e.offset);
-    }
-    out
 }

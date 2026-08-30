@@ -11,14 +11,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use hestia::manifest::PathHash;
-use hestia::pathinfo::StoreDatabase;
-use hestia::pipeline::{AccessLog, PipelineContext, now_unix};
+use hestia::pipeline::PipelineContext;
 use hestia::upstream::UpstreamFilter;
 
 use support::common::{
-    TEST_ROOT_KEY, assert_all_chunks_locatable, committed_manifest, path_hash_of,
-    pipeline_context as context, to_path_set,
+    assert_all_chunks_locatable, load_snapshot, path_hash_of, pipeline_context as context,
+    to_path_set,
 };
 use support::fake_gha::FakeGha;
 use support::store::ScratchStore;
@@ -59,9 +57,8 @@ async fn pushes_paths_end_to_end() {
     let http = reqwest::Client::new();
     let ctx = context(&fake, &http, store.database());
 
-    let now = now_unix();
     let stats = ctx
-        .run(to_path_set(&[&fixture, &top, &dep]), BTreeSet::new(), now)
+        .run(to_path_set(&[&fixture, &top, &dep]), BTreeSet::new())
         .await
         .expect("pipeline run failed");
 
@@ -75,26 +72,21 @@ async fn pushes_paths_end_to_end() {
     assert_eq!(stats.packs_uploaded, 1);
     assert!(stats.new_chunks > 0);
     assert!(stats.bytes_uploaded > 0);
-    assert_eq!(stats.manifest_version, 1);
+    assert!(stats.head.is_some());
 
-    // The committed manifest is correct.
-    let (version, manifest) = committed_manifest(&fake, &http)
-        .await
-        .expect("manifest committed");
-    assert_eq!(version, 1);
-    assert_eq!(manifest.paths.len(), 3);
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert_eq!(snapshot.path_count(), 3);
 
     // The fixture entry's NAR hash/size match nix's record (this is what
     // narinfo responses serve).
-    let fixture_entry = &manifest.paths[&path_hash_of(&fixture)];
+    let fixture_entry = snapshot.lookup(&path_hash_of(&fixture)).unwrap();
     assert_eq!(fixture_entry.nar_hash, expected_hash, "nar_hash mismatch");
     assert_eq!(fixture_entry.nar_size, expected_size, "nar_size mismatch");
     assert!(fixture_entry.ca.is_some(), "added paths are CA");
-    assert_eq!(fixture_entry.last_pushed, now);
 
     // top's entry records its reference to dep (full basename, so the
     // substituter can put it on the narinfo References line).
-    let top_entry = &manifest.paths[&path_hash_of(&top)];
+    let top_entry = snapshot.lookup(&path_hash_of(&top)).unwrap();
     assert_eq!(
         top_entry.store_path.to_string(),
         fixture_name(&top),
@@ -108,14 +100,7 @@ async fn pushes_paths_end_to_end() {
     assert_eq!(reference_names, vec![fixture_name(&dep)]);
 
     // All chunks of all paths are locatable in uploaded packs.
-    assert_all_chunks_locatable(&manifest);
-
-    // The root for this branch+system pins all three paths.
-    let root = manifest.roots.get(TEST_ROOT_KEY).expect("root must exist");
-    for path in [&fixture, &top, &dep] {
-        assert!(root.paths.contains(&path_hash_of(path)));
-    }
-    assert_eq!(root.updated, now);
+    assert_all_chunks_locatable(&snapshot).await;
 
     // Exactly one pack blob landed in the (fake) GHA cache.
     assert_eq!(pack_count(&fake, &http).await, 1);
@@ -134,28 +119,21 @@ async fn closure_expansion_pushes_dependencies() {
     let http = reqwest::Client::new();
     let ctx = context(&fake, &http, store.database());
 
-    let now = now_unix();
     let stats = ctx
-        .run(to_path_set(&[&top]), BTreeSet::new(), now)
+        .run(to_path_set(&[&top]), BTreeSet::new())
         .await
         .expect("pipeline run failed");
 
     assert_eq!(stats.paths_received, 1, "only top was hooked");
     assert_eq!(stats.pushed, 2, "top and its dependency must be pushed");
 
-    let (_, manifest) = committed_manifest(&fake, &http)
-        .await
-        .expect("manifest committed");
-    assert!(manifest.paths.contains_key(&path_hash_of(&top)));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&top)));
     assert!(
-        manifest.paths.contains_key(&path_hash_of(&dep)),
+        snapshot.contains(&path_hash_of(&dep)),
         "dependency must be cached even though it was never hooked"
     );
-    assert_all_chunks_locatable(&manifest);
-
-    let root = &manifest.roots[TEST_ROOT_KEY];
-    assert!(root.paths.contains(&path_hash_of(&top)));
-    assert!(root.paths.contains(&path_hash_of(&dep)));
+    assert_all_chunks_locatable(&snapshot).await;
 }
 
 #[tokio::test]
@@ -187,25 +165,23 @@ async fn registered_drv_is_pushed_with_its_input_closure() {
     let ctx = context(&fake, &http, store.database());
 
     let stats = ctx
-        .run(to_path_set(&[&drv]), BTreeSet::new(), now_unix())
+        .run(to_path_set(&[&drv]), BTreeSet::new())
         .await
         .expect("pipeline run failed");
 
     assert_eq!(stats.paths_received, 1);
     assert_eq!(stats.pushed as usize, 1 + references.len());
 
-    let (_, manifest) = committed_manifest(&fake, &http)
-        .await
-        .expect("manifest committed");
-    assert!(manifest.paths.contains_key(&path_hash_of(&drv)));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&drv)));
     for reference in &references {
         let path = store.store_dir_path().join(reference.to_string());
         assert!(
-            manifest.paths.contains_key(&path_hash_of(&path)),
+            snapshot.contains(&path_hash_of(&path)),
             "input {reference} must be cached"
         );
     }
-    assert_all_chunks_locatable(&manifest);
+    assert_all_chunks_locatable(&snapshot).await;
 }
 
 #[tokio::test]
@@ -223,18 +199,16 @@ async fn no_closure_pushes_only_hooked_paths() {
     };
 
     let stats = ctx
-        .run(to_path_set(&[&top]), BTreeSet::new(), now_unix())
+        .run(to_path_set(&[&top]), BTreeSet::new())
         .await
         .expect("pipeline run failed");
 
     assert_eq!(stats.pushed, 1, "only the hooked path must be pushed");
 
-    let (_, manifest) = committed_manifest(&fake, &http)
-        .await
-        .expect("manifest committed");
-    assert!(manifest.paths.contains_key(&path_hash_of(&top)));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&top)));
     assert!(
-        !manifest.paths.contains_key(&path_hash_of(&dep)),
+        !snapshot.contains(&path_hash_of(&dep)),
         "dependency must not be pushed with --no-closure"
     );
 }
@@ -256,17 +230,15 @@ async fn disabled_upstream_filter_caches_signed_paths() {
     };
 
     let stats = ctx
-        .run(to_path_set(&[&signed]), BTreeSet::new(), now_unix())
+        .run(to_path_set(&[&signed]), BTreeSet::new())
         .await
         .expect("pipeline run failed");
 
     assert_eq!(stats.skipped_upstream, 0);
     assert_eq!(stats.pushed, 1, "signed path must be cached");
 
-    let (_, manifest) = committed_manifest(&fake, &http)
-        .await
-        .expect("manifest committed");
-    assert!(manifest.paths.contains_key(&path_hash_of(&signed)));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&signed)));
 }
 
 #[tokio::test]
@@ -281,19 +253,17 @@ async fn second_run_dedups_and_uploads_nothing() {
     let ctx = context(&fake, &http, store.database());
     let path_set = to_path_set(&[&fixture]);
 
-    let first_now = now_unix();
     let first = ctx
-        .run(path_set.clone(), BTreeSet::new(), first_now)
+        .run(path_set.clone(), BTreeSet::new())
         .await
         .expect("first run failed");
     assert_eq!(first.pushed, 1);
     assert_eq!(first.packs_uploaded, 1);
 
-    // Second run with the same path: dedup-skip, no uploads, but the
-    // manifest gets a new version with a bumped last_pushed clock.
-    let second_now = first_now + 100;
+    // Second run with the same path: dedup-skip, no uploads, but a head
+    // that names the path again so GC keeps it.
     let second = ctx
-        .run(path_set, BTreeSet::new(), second_now)
+        .run(path_set, BTreeSet::new())
         .await
         .expect("second run failed");
     assert_eq!(second.pushed, 0);
@@ -301,18 +271,14 @@ async fn second_run_dedups_and_uploads_nothing() {
     assert_eq!(second.packs_uploaded, 0);
     assert_eq!(second.new_chunks, 0);
     assert_eq!(second.bytes_uploaded, 0);
-    assert_eq!(second.manifest_version, 2);
+    assert!(second.head.is_some());
 
     // Still exactly one pack in the cache.
     assert_eq!(pack_count(&fake, &http).await, 1);
 
-    // The path entry survived with its push clock bumped, and stays in
-    // the root (dedup-skipped paths remain pinned).
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    let hash = path_hash_of(&fixture);
-    assert_eq!(manifest.paths.len(), 1);
-    assert_eq!(manifest.paths[&hash].last_pushed, second_now);
-    assert!(manifest.roots[TEST_ROOT_KEY].paths.contains(&hash));
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert_eq!(snapshot.path_count(), 1);
+    assert!(snapshot.contains(&path_hash_of(&fixture)));
 }
 
 #[tokio::test]
@@ -332,28 +298,21 @@ async fn upstream_signed_path_is_skipped() {
     let ctx = context(&fake, &http, store.database());
 
     let stats = ctx
-        .run(to_path_set(&[&signed, &local]), BTreeSet::new(), now_unix())
+        .run(to_path_set(&[&signed, &local]), BTreeSet::new())
         .await
         .expect("pipeline run failed");
 
     assert_eq!(stats.skipped_upstream, 1);
     assert_eq!(stats.pushed, 1);
-    assert_eq!(stats.manifest_version, 1);
+    assert!(stats.head.is_some());
 
-    // Only the local path made it into the manifest and the root.
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert!(manifest.paths.contains_key(&path_hash_of(&local)));
-    assert!(!manifest.paths.contains_key(&path_hash_of(&signed)));
-    let root = &manifest.roots[TEST_ROOT_KEY];
-    assert!(root.paths.contains(&path_hash_of(&local)));
-    assert!(
-        !root.paths.contains(&path_hash_of(&signed)),
-        "upstream paths must not be pinned by our roots"
-    );
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&local)));
+    assert!(!snapshot.contains(&path_hash_of(&signed)));
 }
 
 #[tokio::test]
-async fn only_upstream_paths_means_nothing_is_committed() {
+async fn only_upstream_paths_means_nothing_is_published() {
     let Some(store) = ScratchStore::create() else {
         return;
     };
@@ -365,14 +324,14 @@ async fn only_upstream_paths_means_nothing_is_committed() {
     let ctx = context(&fake, &http, store.database());
 
     let stats = ctx
-        .run(to_path_set(&[&signed]), BTreeSet::new(), now_unix())
+        .run(to_path_set(&[&signed]), BTreeSet::new())
         .await
         .expect("pipeline run failed");
 
     assert_eq!(stats.skipped_upstream, 1);
     assert_eq!(stats.pushed, 0);
-    assert_eq!(stats.manifest_version, 0, "nothing should be committed");
-    assert!(committed_manifest(&fake, &http).await.is_none());
+    assert!(stats.head.is_none(), "nothing should be published");
+    assert_eq!(load_snapshot(&fake, &http).await.path_count(), 0);
     assert_eq!(pack_count(&fake, &http).await, 0);
 }
 
@@ -383,7 +342,7 @@ async fn invalid_and_malformed_paths_are_skipped_without_failing_the_drain() {
     };
     let fixture = store.add_fixture("good", 23);
     let database = store.database();
-    let unknown = format!(
+    let missing = format!(
         "{}/00000000000000000000000000000000-does-not-exist",
         database.store_dir()
     );
@@ -395,57 +354,21 @@ async fn invalid_and_malformed_paths_are_skipped_without_failing_the_drain() {
     // One real path mixed with one unknown and one malformed path: the bad
     // ones are skipped, the good one still gets pushed.
     let mut paths = to_path_set(&[&fixture]);
-    paths.insert(unknown);
+    paths.insert(missing);
     paths.insert("/not/a/store/path".to_string());
 
     let stats = ctx
-        .run(paths, BTreeSet::new(), now_unix())
+        .run(paths, BTreeSet::new())
         .await
         .expect("pipeline must not fail because of bad input paths");
 
     assert_eq!(stats.paths_received, 3);
     assert_eq!(stats.skipped_invalid, 2);
     assert_eq!(stats.pushed, 1);
-    assert_eq!(stats.manifest_version, 1);
+    assert!(stats.head.is_some());
 
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert_eq!(manifest.paths.len(), 1);
-}
-
-#[tokio::test]
-async fn accessed_paths_join_the_root_without_store_queries() {
-    // The AccessLog interface (substituter integration): accessed
-    // paths must end up in the root even though they are never queried,
-    // chunked, or uploaded. Needs no Nix store at all.
-    let fake = FakeGha::start().await;
-    let http = reqwest::Client::new();
-    let ctx = context(
-        &fake,
-        &http,
-        // Never opened: no buffered paths means no queries.
-        StoreDatabase::new("/nonexistent/db.sqlite"),
-    );
-
-    let access_log = AccessLog::new();
-    let accessed_hash: PathHash = "76yk8b7ny30zl1wsq2vd66j9vrcgrkah".parse().unwrap();
-    access_log.record(accessed_hash);
-
-    let now = now_unix();
-    let stats = ctx
-        .run(BTreeSet::new(), access_log.snapshot(), now)
-        .await
-        .expect("pipeline run failed");
-
-    assert_eq!(stats.pushed, 0);
-    assert_eq!(stats.packs_uploaded, 0);
-    assert_eq!(stats.manifest_version, 1, "root-only update still commits");
-
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    let root = &manifest.roots[TEST_ROOT_KEY];
-    assert!(root.paths.contains(&accessed_hash));
-    assert_eq!(root.updated, now);
-    assert!(manifest.paths.is_empty());
-    assert!(manifest.packs.is_empty());
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert_eq!(snapshot.path_count(), 1);
 }
 
 #[tokio::test]
@@ -473,73 +396,31 @@ async fn unchunkable_path_is_skipped_without_failing_the_drain() {
     let ctx = context(&fake, &http, store.database());
 
     let stats = ctx
-        .run(to_path_set(&[&good, &bad]), BTreeSet::new(), now_unix())
+        .run(to_path_set(&[&good, &bad]), BTreeSet::new())
         .await
         .expect("a per-path chunking failure must not fail the drain");
 
     assert_eq!(stats.failed_chunking, 1);
     assert_eq!(stats.pushed, 1);
-    assert_eq!(stats.manifest_version, 1);
+    assert!(stats.head.is_some());
 
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert!(manifest.paths.contains_key(&path_hash_of(&good)));
-    assert!(!manifest.paths.contains_key(&path_hash_of(&bad)));
-
-    // The rejected path must not be pinned by the root either: a root
-    // member without a PathEntry is a dangling hash the cache can never
-    // serve.
-    let root = &manifest.roots[TEST_ROOT_KEY];
-    assert!(root.paths.contains(&path_hash_of(&good)));
-    assert!(
-        !root.paths.contains(&path_hash_of(&bad)),
-        "rejected paths must not join the committed root"
-    );
-}
-
-#[tokio::test]
-async fn redundant_root_refresh_does_not_commit() {
-    // The SIGTERM final drain re-runs with the same access-log snapshot a
-    // previous drain already committed. When nothing changed but the
-    // root's `updated` clock, no new manifest version must be burned.
-    let fake = FakeGha::start().await;
-    let http = reqwest::Client::new();
-    let ctx = context(&fake, &http, StoreDatabase::new("/nonexistent/db.sqlite"));
-
-    let accessed_hash: PathHash = "76yk8b7ny30zl1wsq2vd66j9vrcgrkah".parse().unwrap();
-    let accessed = BTreeSet::from([accessed_hash]);
-
-    let now = now_unix();
-    let first = ctx
-        .run(BTreeSet::new(), accessed.clone(), now)
-        .await
-        .expect("first drain failed");
-    assert_eq!(first.manifest_version, 1);
-
-    // Same snapshot a few seconds later: pure clock refresh, no commit.
-    let second = ctx
-        .run(BTreeSet::new(), accessed, now + 5)
-        .await
-        .expect("second drain failed");
-    assert_eq!(
-        second.manifest_version, 0,
-        "a drain that would only bump the root clock must not commit"
-    );
-
-    let (version, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert_eq!(version, 1, "no second manifest version");
-    assert_eq!(manifest.roots[TEST_ROOT_KEY].updated, now);
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&good)));
+    assert!(!snapshot.contains(&path_hash_of(&bad)));
 }
 
 #[tokio::test]
 async fn identical_content_across_paths_shares_chunks() {
-    // Chunk-level dedup across store paths: two different paths with the
-    // same blob content must not store the blob twice.
+    // Chunk-level dedup across drains: a rebuild of a path (same name,
+    // mostly the same content) must not store the shared chunks again.
     let Some(store) = ScratchStore::create() else {
         return;
     };
-    // Same seed -> same blob content, but different names -> different paths.
-    let path_a = store.add_fixture("twin-a", 37);
-    let path_b = store.add_fixture("twin-b", 37);
+    let path_a = store.add_fixture("twin", 37);
+    let rebuilt = tempfile::tempdir().unwrap();
+    let source = store.write_fixture(rebuilt.path(), "twin", 37);
+    std::fs::write(source.join("extra"), b"changed").unwrap();
+    let path_b = store.add_path(&source);
     assert_ne!(path_a, path_b, "paths must differ");
 
     let fake = FakeGha::start().await;
@@ -548,11 +429,11 @@ async fn identical_content_across_paths_shares_chunks() {
 
     // Push A first, then B: B's blob chunks must all dedup against A's.
     let first = ctx
-        .run(to_path_set(&[&path_a]), BTreeSet::new(), now_unix())
+        .run(to_path_set(&[&path_a]), BTreeSet::new())
         .await
         .unwrap();
     let second = ctx
-        .run(to_path_set(&[&path_b]), BTreeSet::new(), now_unix())
+        .run(to_path_set(&[&path_b]), BTreeSet::new())
         .await
         .unwrap();
 
@@ -560,15 +441,15 @@ async fn identical_content_across_paths_shares_chunks() {
     assert_eq!(second.pushed, 1);
     assert!(
         second.new_chunks < first.new_chunks,
-        "second path must reuse the first path's blob chunks \
+        "the rebuild must reuse the first build's blob chunks \
          (first: {} chunks, second: {} chunks)",
         first.new_chunks,
         second.new_chunks
     );
 
-    let (_, manifest) = committed_manifest(&fake, &http).await.unwrap();
-    assert_eq!(manifest.paths.len(), 2);
-    assert_all_chunks_locatable(&manifest);
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert_eq!(snapshot.path_count(), 2);
+    assert_all_chunks_locatable(&snapshot).await;
 }
 
 #[tokio::test]
@@ -588,7 +469,7 @@ async fn small_pack_target_splits_a_drain_into_multiple_packs() {
     };
 
     let stats = ctx
-        .run(to_path_set(&[&fixture]), BTreeSet::new(), now_unix())
+        .run(to_path_set(&[&fixture]), BTreeSet::new())
         .await
         .expect("pipeline run failed");
 
@@ -601,15 +482,13 @@ async fn small_pack_target_splits_a_drain_into_multiple_packs() {
     assert_eq!(stats.packs_uploaded, pack_count(&fake, &http).await);
 
     // Every chunk must remain locatable across the pack split.
-    let (_, manifest) = committed_manifest(&fake, &http)
-        .await
-        .expect("manifest committed");
-    assert_eq!(manifest.packs.len(), stats.packs_uploaded);
-    assert_all_chunks_locatable(&manifest);
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert_eq!(snapshot.pack_hashes().len(), stats.packs_uploaded);
+    assert_all_chunks_locatable(&snapshot).await;
 }
 
 /// A read-only runtime token skips the write pipeline entirely: nothing is
-/// reserved, nothing is uploaded, and no manifest is committed. The drain
+/// reserved, uploaded or published. The drain
 /// still succeeds so the post-step never marks the job failed.
 #[tokio::test]
 async fn read_only_token_skips_the_write_pipeline() {
@@ -627,16 +506,16 @@ async fn read_only_token_skips_the_write_pipeline() {
     };
 
     let stats = ctx
-        .run(to_path_set(&[&fixture]), BTreeSet::new(), now_unix())
+        .run(to_path_set(&[&fixture]), BTreeSet::new())
         .await
         .expect("read-only drain must succeed");
 
     assert_eq!(stats.paths_received, 1);
     assert_eq!(stats.pushed, 0);
     assert_eq!(stats.packs_uploaded, 0);
-    assert_eq!(stats.manifest_version, 0);
+    assert!(stats.head.is_none());
     assert_eq!(pack_count(&fake, &http).await, 0);
-    assert!(committed_manifest(&fake, &http).await.is_none());
+    assert_eq!(load_snapshot(&fake, &http).await.path_count(), 0);
 }
 
 /// The startup probe reports a read-only token against a backend that

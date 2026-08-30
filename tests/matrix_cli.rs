@@ -35,9 +35,9 @@ fn write_fake_nix_eval_jobs(dir: &Path, json_lines: &str) -> std::path::PathBuf 
 }
 
 /// Serve the daemon protocol for one connection per request: Add responds
-/// ok, Drain responds with `manifest_version`. Returns the received
+/// ok, Drain responds with `head`. Returns the received
 /// requests.
-async fn fake_daemon(listener: UnixListener, manifest_version: u64) -> Vec<Request> {
+async fn fake_daemon(listener: UnixListener, head: &'static str) -> Vec<Request> {
     let mut requests = Vec::new();
     // hestia matrix opens one connection per roundtrip: Add, then Drain.
     for _ in 0..2 {
@@ -49,7 +49,7 @@ async fn fake_daemon(listener: UnixListener, manifest_version: u64) -> Vec<Reque
         let response = match &request {
             Request::Add { paths } => Response::ok().with_buffered(paths.len()),
             Request::Drain => Response::ok().with_stats(DrainStats {
-                manifest_version,
+                head: Some(head.to_string()),
                 ..DrainStats::default()
             }),
             Request::Status => Response::ok().with_buffered(0),
@@ -76,7 +76,7 @@ async fn matrix_registers_drvs_and_emits_outputs() {
     let script = write_fake_nix_eval_jobs(dir.path(), FIXTURE);
     let socket = dir.path().join("hook.sock");
     let github_output = dir.path().join("github-output");
-    let daemon = tokio::spawn(fake_daemon(UnixListener::bind(&socket).unwrap(), 42));
+    let daemon = tokio::spawn(fake_daemon(UnixListener::bind(&socket).unwrap(), "h-42"));
 
     let output = Command::new(HESTIA_BIN)
         .arg("matrix")
@@ -127,7 +127,7 @@ async fn matrix_registers_drvs_and_emits_outputs() {
     // and the drain's manifest version.
     let outputs = std::fs::read_to_string(&github_output).unwrap();
     assert!(outputs.contains("any-jobs=true"), "{outputs}");
-    assert!(outputs.contains("manifest-version=42"), "{outputs}");
+    assert!(outputs.contains("head=h-42"), "{outputs}");
     let matrix_line = outputs
         .lines()
         .find_map(|line| line.strip_prefix("matrix="))
@@ -160,7 +160,7 @@ async fn missing_daemon_still_emits_the_matrix() {
     assert!(stderr.contains("cannot register"), "{stderr}");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("manifest-version=0"), "{stdout}");
+    assert!(stdout.contains("head=\n"), "{stdout}");
     assert!(stdout.contains("any-jobs=true"), "{stdout}");
     assert!(
         stdout.contains(r#""drvPath":"/nix/store/aaa-a.drv""#),
@@ -193,7 +193,7 @@ async fn real_nix_eval_jobs_produces_the_matrix() {
 
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("hook.sock");
-    let daemon = tokio::spawn(fake_daemon(UnixListener::bind(&socket).unwrap(), 3));
+    let daemon = tokio::spawn(fake_daemon(UnixListener::bind(&socket).unwrap(), "h-3"));
 
     let output = Command::new(HESTIA_BIN)
         .arg("matrix")
@@ -247,7 +247,7 @@ async fn real_nix_eval_jobs_produces_the_matrix() {
         2,
         "group builds both members: {group}"
     );
-    assert!(stdout.contains("manifest-version=3"), "{stdout}");
+    assert!(stdout.contains("head=h-3"), "{stdout}");
 }
 
 #[tokio::test]
