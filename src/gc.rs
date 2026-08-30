@@ -9,8 +9,6 @@ use std::process::ExitCode;
 use crate::backend::{self, Backend, Listed};
 use crate::chunker::{PackBuilder, coalesce_adjacent, extract_chunk, pack_cache_key};
 use crate::cli::GcArgs;
-use crate::gha::rest::RestClient;
-use crate::gha::twirp::TwirpClient;
 use crate::heads::{GcRecord, HeadName, RootId, RootRow, root_id};
 use crate::manifest::{ChunkHash, PackHash, SegDigest};
 use crate::pipeline::{now_unix, upload_pack};
@@ -439,13 +437,7 @@ impl Gc {
 
 pub async fn run(args: &GcArgs) -> ExitCode {
     let http = reqwest::Client::new();
-    let backend = match TwirpClient::from_env(http.clone()).and_then(|t| {
-        Ok(Backend::new(
-            t,
-            Some(RestClient::from_env(http.clone())?),
-            http,
-        ))
-    }) {
+    let backend = match Backend::from_env(http.clone()) {
         Ok(b) => b,
         Err(err) => {
             eprintln!(

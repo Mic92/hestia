@@ -1,6 +1,5 @@
-//! Blob storage by string key over the GitHub Actions cache. Reads go
-//! through signed URLs (cached until they expire). Listing and deletes
-//! use the REST API and need `GITHUB_TOKEN`.
+//! The GitHub Actions cache. Reads go through signed URLs (cached until
+//! they expire). Listing and deletes use the REST API and need `GITHUB_TOKEN`.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -9,31 +8,24 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-pub use crate::gha::Error;
+use super::{Error, Listed};
 use crate::gha::blob;
 use crate::gha::rest::{ENV_GITHUB_TOKEN, RestClient};
 use crate::gha::twirp::{DownloadUrl, Reservation, TwirpClient};
 
 const URL_TTL: Duration = Duration::from_secs(10 * 60);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Listed {
-    pub key: String,
-    pub created: Option<u64>,
-    pub last_accessed: Option<u64>,
-}
-
 #[derive(Clone)]
-pub struct Backend {
+pub struct Gha {
     twirp: TwirpClient,
     rest: Option<RestClient>,
     http: reqwest::Client,
     urls: Arc<Mutex<HashMap<String, (String, Instant)>>>,
 }
 
-impl Backend {
+impl Gha {
     pub fn new(twirp: TwirpClient, rest: Option<RestClient>, http: reqwest::Client) -> Self {
-        Backend {
+        Gha {
             twirp,
             rest,
             http,
@@ -45,14 +37,6 @@ impl Backend {
         let twirp = TwirpClient::from_env(http.clone())?;
         let rest = RestClient::from_env(http.clone()).ok();
         Ok(Self::new(twirp, rest, http))
-    }
-
-    pub fn twirp(&self) -> &TwirpClient {
-        &self.twirp
-    }
-
-    pub fn http(&self) -> &reqwest::Client {
-        &self.http
     }
 
     fn rest(&self) -> Result<&RestClient, Error> {

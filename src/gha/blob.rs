@@ -54,7 +54,7 @@ pub fn is_transient(error: &Error) -> bool {
     }
 }
 
-async fn status_error(url: &str, response: reqwest::Response) -> Error {
+pub async fn status_error(url: &str, response: reqwest::Response) -> Error {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
     Error::Status {

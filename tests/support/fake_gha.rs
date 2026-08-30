@@ -45,6 +45,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use hestia::backend::Backend;
+use hestia::backend::gha::Gha;
 use hestia::gha::rest::{RestClient, format_timestamp};
 use hestia::gha::twirp::{
     CreateCacheEntryRequest, FinalizeCacheEntryUploadRequest, GetCacheEntryDownloadUrlRequest,
@@ -703,7 +704,11 @@ impl FakeGha {
 
     /// Backend over this fake with REST access.
     pub fn backend(&self, http: &reqwest::Client) -> Backend {
-        Backend::new(self.twirp(http), Some(self.rest(http)), http.clone())
+        Backend::Gha(Gha::new(
+            self.twirp(http),
+            Some(self.rest(http)),
+            http.clone(),
+        ))
     }
 
     /// REST client pointed at this fake. The fake never rate-limits, so
