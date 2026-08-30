@@ -387,9 +387,8 @@ function serveFlags() {
 function startDaemon(hestiaBin, listen, socket, logFile) {
   const log = fs.openSync(logFile, 'a');
   const args = ['serve', '--listen', listen, '--socket', socket, ...serveFlags()];
-  // GITHUB_TOKEN enables the daemon's upfront pack verification (needs
-  // actions:read; without it the REST listing 403s and the daemon falls
-  // back to lazy eviction detection). Spawn-env only: not exported to
+  // GITHUB_TOKEN lets the daemon list heads and verify packs (needs
+  // actions:read, without it the daemon substitutes nothing). Spawn-env only: not exported to
   // later job steps.
   const env = { ...process.env }; // carries ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL
   const githubToken = getInput('github-token');
