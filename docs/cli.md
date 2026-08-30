@@ -69,6 +69,22 @@ Always exits 0 (a failing post-build-hook would fail the build).
 | `GITHUB_API_URL` | gc | REST API base URL (override for GHES). |
 | `GITHUB_REF_NAME` | serve | Default for `--branch`. |
 | `GITHUB_RUN_ID` | serve | Roots written by the same workflow run merge by union (matrix legs); different runs replace each other's root. |
-| `HESTIA_OCI` | serve, gc | `<registry>/<repository>` (e.g. `ghcr.io/owner/repo/hestia`): store in that OCI registry instead of the Actions cache. Credentials from `HESTIA_OCI_USER`/`HESTIA_OCI_PASSWORD`, else `GITHUB_TOKEN` on ghcr.io, else anonymous (read-only). gc deletes through GitHub's packages API on ghcr.io (`GITHUB_TOKEN` with `packages: write`) and by manifest digest elsewhere, where the registry's own garbage collection reclaims the blobs and a retention rule for old untagged manifests catches drains that crashed before publishing. |
+| `HESTIA_OCI` | serve, gc | `<registry>/<repository>`: store in an OCI registry instead of the Actions cache, see [OCI registries](#oci-registries). |
+| `HESTIA_OCI_USER`, `HESTIA_OCI_PASSWORD` | serve, gc | Registry credentials. On ghcr.io `GITHUB_TOKEN` is used when unset. Without any, access is anonymous and read-only. |
 | `HESTIA_LISTEN` | prefetch | Address exported by the action for the running Hestia server. |
 | `OUT_PATHS` | hook | Set by Nix when invoking the post-build-hook. |
+
+## OCI registries
+
+With `HESTIA_OCI=<registry>/<repository>` (action input `oci`) packs and
+segments are blobs and heads are tags in that repository. Any registry
+that speaks the OCI distribution API can hold the store. They differ in
+how GC can delete:
+
+| Registry | Delete | Notes |
+|---|---|---|
+| ghcr.io | GitHub packages API by version id, `GITHUB_TOKEN` with `packages: write` | The OCI delete is refused, so gc keeps a version ledger under the `x-ledger` tag. No pull limits from Actions runners. Public packages substitute anonymously. |
+| distribution, Harbor, Quay, GitLab, zot, Gitea, ACR, Artifact Registry | `DELETE /v2/…/manifests/<digest>` | The registry's own garbage collection reclaims blob storage afterwards (self-hosted `distribution` needs `delete.enabled` and a `garbage-collect` cron). Blobs cannot be enumerated, so a drain that crashed before publishing leaves untagged manifests behind: set a retention rule for old untagged manifests. |
+| AWS ECR | not supported yet (needs `BatchDeleteImage`) | Push and pull work. |
+| Docker Hub | tags only, untagged manifests are reaped by Hub | Push and pull work, but the pull rate limit (100 to 200 requests per 6 h per IP, shared by all GitHub-hosted runners) makes it unsuitable as a CI cache. |
+
