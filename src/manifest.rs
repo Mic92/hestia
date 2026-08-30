@@ -21,7 +21,7 @@ pub enum Error {
     Encode(#[from] ciborium::ser::Error<std::io::Error>),
 
     #[error("failed to decode manifest: {0}")]
-    Decode(#[from] ciborium::de::Error<std::io::Error>),
+    Decode(#[from] minicbor::decode::Error),
 
     #[error("compression failed: {0}")]
     Compression(#[from] std::io::Error),
@@ -545,7 +545,7 @@ impl Manifest {
 
 /// A CBOR byte string (`Vec<u8>` would serialize as an array of integers).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct Blob(Vec<u8>);
+pub(crate) struct Blob(pub(crate) Vec<u8>);
 
 impl Serialize for Blob {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -580,11 +580,11 @@ impl<'de> Deserialize<'de> for Blob {
 
 /// File contents on the wire: indices into the chunk table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct WireChunkList {
+pub(crate) struct WireChunkList {
     #[serde(default)]
-    chunks: Vec<u64>,
+    pub(crate) chunks: Vec<u64>,
     #[serde(default)]
-    rewrites: Vec<Rewrite>,
+    pub(crate) rewrites: Vec<Rewrite>,
 }
 
 /// Columnar wire representation.
@@ -593,30 +593,30 @@ struct WireChunkList {
 /// its table index. Location rows are parallel arrays sorted by
 /// (pack index, offset), with offsets delta-encoded within each pack.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct WireManifest {
+pub(crate) struct WireManifest {
     #[serde(default)]
-    chunk_hashes: Blob,
+    pub(crate) chunk_hashes: Blob,
     #[serde(default)]
-    pack_hashes: Blob,
+    pub(crate) pack_hashes: Blob,
     #[serde(default)]
-    location_chunks: Vec<u64>,
+    pub(crate) location_chunks: Vec<u64>,
     #[serde(default)]
-    location_packs: Vec<u64>,
+    pub(crate) location_packs: Vec<u64>,
     #[serde(default)]
-    location_offsets: Vec<u64>,
+    pub(crate) location_offsets: Vec<u64>,
     #[serde(default)]
-    location_compressed_sizes: Vec<u32>,
+    pub(crate) location_compressed_sizes: Vec<u32>,
     #[serde(default)]
-    location_uncompressed_sizes: Vec<u32>,
+    pub(crate) location_uncompressed_sizes: Vec<u32>,
     #[serde(default)]
-    location_repacks_survived: Vec<u32>,
+    pub(crate) location_repacks_survived: Vec<u32>,
     /// Pack metadata keyed by pack table index.
     #[serde(default)]
-    pack_infos: BTreeMap<u64, PackInfo>,
+    pub(crate) pack_infos: BTreeMap<u64, PackInfo>,
     #[serde(default)]
-    paths: BTreeMap<PathHash, PathEntry<WireChunkList>>,
+    pub(crate) paths: BTreeMap<PathHash, PathEntry<WireChunkList>>,
     #[serde(default)]
-    roots: BTreeMap<String, Root>,
+    pub(crate) roots: BTreeMap<String, Root>,
 }
 
 /// Rebuild a tree with its file contents transformed by `f`.
@@ -692,7 +692,7 @@ impl Manifest {
                  (corrupt or malicious data)"
             )));
         }
-        Self::from_wire(ciborium::from_reader(cbor.as_slice())?)
+        Self::from_wire(crate::manifest_decode::wire_manifest(&cbor)?)
     }
 
     fn to_wire(&self) -> Result<WireManifest, Error> {
