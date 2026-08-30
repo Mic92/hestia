@@ -266,8 +266,9 @@ pub struct View {
     pub epoch: u64,
     /// Live segments per root, GC's segment first, then in name order.
     pub roots: BTreeMap<String, Vec<SegDigest>>,
-    /// Writer heads that contributed: `subsumes` for a compaction, `folded` for GC.
-    pub heads: Vec<String>,
+    /// Writer heads that contributed and the segment each added:
+    /// `subsumes`/`replaces` for a compaction, `folded` for GC.
+    pub heads: Vec<(String, SegDigest)>,
 }
 
 impl View {
@@ -324,7 +325,7 @@ impl View {
             if let Some(c) = compactions.get(*n) {
                 replaced.extend(c.replaces.iter().map(|s| (name, *s)));
             }
-            used.push((*n).to_owned());
+            used.push(((*n).to_owned(), seg));
         }
         for (name, segs) in &mut roots {
             let mut seen = BTreeSet::new();
@@ -539,7 +540,7 @@ mod tests {
         assert_eq!(v.epoch, 5);
         assert_eq!(segs(&v, "main"), BTreeSet::from([d(12), d(30)]));
         assert_eq!(v.roots["dev"], vec![d(20), d(21)]);
-        let used: BTreeSet<&str> = v.heads.iter().map(String::as_str).collect();
+        let used: BTreeSet<&str> = v.heads.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             used,
             BTreeSet::from([h_prev.as_str(), h_dev.as_str(), cn.as_str()])

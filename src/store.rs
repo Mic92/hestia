@@ -58,6 +58,7 @@ pub struct Resolved {
 pub struct Snapshot {
     backend: Backend,
     roots: Vec<String>,
+    listed: Vec<Listed>,
     pub view: View,
     /// In lookup priority: served roots in order, newest segment first.
     segments: Vec<Arc<Segment>>,
@@ -136,7 +137,7 @@ impl Snapshot {
         roots: &[String],
         previous: Option<&Snapshot>,
     ) -> Result<Snapshot, Error> {
-        let view = Heads::load(&backend).await?.view;
+        let Heads { listed, view, .. } = Heads::load(&backend).await?;
         let loaded: HashMap<SegDigest, Arc<Segment>> = previous
             .into_iter()
             .flat_map(|p| p.segments.iter().map(|s| (s.digest, s.clone())))
@@ -169,6 +170,7 @@ impl Snapshot {
         Ok(Snapshot {
             backend,
             roots: roots.to_vec(),
+            listed,
             view,
             segments,
             pack_indexes: Mutex::new(pack_indexes),
@@ -189,6 +191,66 @@ impl Snapshot {
             next.segments.insert(0, Arc::new(segment));
         }
         Ok(next)
+    }
+
+    /// Fold `root`'s pending segments into one `c-*` when this drain
+    /// elects itself: enough are pending, no compaction for the root is in
+    /// flight, and `coin` (uniform in 0..1) beats odds that let about one
+    /// of the drains expected within the window win. Frees nothing, only
+    /// shortens the next reader's load.
+    pub async fn maybe_compact(
+        &self,
+        root: &str,
+        now: u64,
+        coin: f64,
+    ) -> Result<Option<String>, Error> {
+        let Some(live) = self.view.roots.get(root) else {
+            return Ok(None);
+        };
+        let id = root_id(root);
+        let created = |key: &str| {
+            self.listed
+                .iter()
+                .find(|l| l.key == key)
+                .and_then(|l| l.created)
+                .unwrap_or(now)
+        };
+        let in_flight = self.listed.iter().any(|l| {
+            matches!(HeadName::parse(&l.key), Some(HeadName::Compaction { root, .. }) if root == id)
+                && created(&l.key) + COMPACT_WINDOW > now
+        });
+        // Head and segment stay paired so `subsumes` never names a head
+        // whose segment `replaces` lacks.
+        let pending: Vec<(&str, &Arc<Segment>)> = self
+            .view
+            .heads
+            .iter()
+            .filter(|(_, d)| live.contains(d))
+            .filter_map(|(n, d)| Some((n.as_str(), self.segments.iter().find(|s| s.digest == *d)?)))
+            .collect();
+        if in_flight || pending.len() < COMPACT_MIN {
+            return Ok(None);
+        }
+        let oldest = pending.iter().map(|(n, _)| created(n)).min().unwrap_or(now);
+        let expected =
+            pending.len() as f64 * COMPACT_WINDOW as f64 / now.saturating_sub(oldest).max(1) as f64;
+        if coin * expected.max(1.0) >= 1.0 {
+            return Ok(None);
+        }
+        let mut inputs = Vec::new();
+        for (_, seg) in &pending {
+            inputs.push((&seg.meta, self.tree(seg).await?));
+        }
+        let (sealed, _) = segment::merge(&inputs, segment::in_place)?;
+        let record = CompactionRecord {
+            root: root.to_owned(),
+            added: put_segment(&self.backend, &sealed).await?,
+            replaces: pending.iter().map(|(_, s)| s.digest).collect(),
+            subsumes: pending.iter().map(|(n, _)| (*n).to_owned()).collect(),
+        };
+        let name = record.head_name(self.view.epoch).to_string();
+        self.backend.put(&name, record.encode().into()).await?;
+        Ok(Some(name))
     }
 
     /// Copy a stored entry into `writer`. `false` if no served segment has it.
@@ -479,6 +541,22 @@ pub fn push_entry(
     Some(())
 }
 
+/// Pending segments per root before a drain considers compacting them,
+/// and how long a published `c-*` holds off the next attempt.
+const COMPACT_MIN: usize = 4;
+const COMPACT_WINDOW: u64 = 60;
+
+async fn put_segment(backend: &Backend, sealed: &Sealed) -> Result<SegDigest, Error> {
+    let digest = sealed.digest();
+    backend
+        .put(&meta_key(&digest), sealed.meta.clone().into())
+        .await?;
+    backend
+        .put(&tree_key(&digest), sealed.tree.clone().into())
+        .await?;
+    Ok(digest)
+}
+
 /// Upload a sealed segment and a head for it under `root`. A root the
 /// view cannot name yet gets a `c-*` (which carries the name), else `h-*`.
 pub async fn publish(
@@ -487,13 +565,7 @@ pub async fn publish(
     root: &str,
     sealed: &Sealed,
 ) -> Result<String, Error> {
-    let digest = sealed.digest();
-    backend
-        .put(&meta_key(&digest), sealed.meta.clone().into())
-        .await?;
-    backend
-        .put(&tree_key(&digest), sealed.tree.clone().into())
-        .await?;
+    let digest = put_segment(backend, sealed).await?;
     let (name, body) = if view.roots.contains_key(root) {
         (
             HeadName::Drain {

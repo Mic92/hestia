@@ -551,11 +551,27 @@ impl PipelineContext {
         stats.head =
             Some(store::publish(&self.backend, &snapshot.view, &self.root_key, &sealed).await?);
         stats.commit_ms = commit_started.elapsed().as_millis() as u64;
-        if let Some(publish) = &self.publish {
-            match snapshot.refresh_with(&sealed).await {
-                Ok(next) => publish.set_snapshot(Arc::new(next)),
-                Err(err) => eprintln!("hestia: cannot refresh the served segments: {err}"),
+        let next = match snapshot.refresh_with(&sealed).await {
+            Ok(next) => next,
+            Err(err) => {
+                eprintln!("hestia: cannot refresh the served segments: {err}");
+                return Ok(stats);
             }
+        };
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        match next
+            .maybe_compact(&self.root_key, now_unix(), f64::from(nanos) / 1e9)
+            .await
+        {
+            Ok(Some(name)) => eprintln!("hestia: compacted {} into {name}", self.root_key),
+            Ok(None) => {}
+            Err(err) => eprintln!("hestia: compaction skipped: {err}"),
+        }
+        if let Some(publish) = &self.publish {
+            publish.set_snapshot(Arc::new(next));
         }
         Ok(stats)
     }
