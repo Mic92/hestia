@@ -70,6 +70,14 @@ inputs:
       fetching.
     required: false
     default: "false"
+  oci:
+    description: >
+      `<registry>/<repository>` (e.g. `ghcr.io/OWNER/REPO/hestia`) to
+      store in an OCI registry instead of the Actions cache. On ghcr.io
+      `github-token` is the credential (needs `packages: write` to upload,
+      public packages substitute anonymously).
+    required: false
+    default: ""
   read-only:
     description: >
       Substitute from the cache but never write to it: no post-build-hook,
