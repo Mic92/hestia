@@ -12,12 +12,7 @@ categories = [
   "command-line-utilities",
 ]
 
-[workspace]
-members = ["hestia-core"]
-
 [dependencies]
-hestia-core = { path = "hestia-core" }
-
 # CLI / runtime
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = [
@@ -34,8 +29,9 @@ tokio = { version = "1", features = [
 # Accept-loop errno classification (unix sockets are unix-only anyway)
 libc = "0.2"
 
-# Serialization
+# Serialization (manifest = CBOR + zstd)
 serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
 zstd = "0.13"
 
 # HTTP client (Twirp, GitHub REST, Azure blob) and substituter server
@@ -46,7 +42,11 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 axum = "0.8"
 
+# Content-defined chunking
+fastcdc = "4"
+
 # Internal content addresses (chunk + pack hashes); faster than SHA-256
+aho-corasick = "1"
 blake3 = "1"
 
 # Stream combinators for NAR event/byte streams
@@ -56,7 +56,10 @@ futures-util = "0.3"
 thiserror = "2"
 
 # Blob payloads (cheap clones for upload retries)
-bytes = "1"
+bytes = "1.9"
+
+# Copy-on-write mappings for normalizing large files without a full copy
+memmap2 = "0.9"
 
 # JSON bodies for the Twirp / REST / Azure APIs
 serde_json = "1"
@@ -67,9 +70,13 @@ serde_json = "1"
 #                                    database reads (harmonia-store-db),
 #                                    which works without a running daemon
 #   harmonia-utils-base-encoding -> nothing needs raw base32 yet
+harmonia-file-core = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
 harmonia-store-nar-info = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
 harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
 harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
+harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
 harmonia-utils-io = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
 harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
 

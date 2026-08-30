@@ -3,16 +3,19 @@
 //! The library half of the crate holds everything that integration tests
 //! need to reach; the `hestia` binary in `main.rs` is a thin CLI on top.
 
-pub use hestia_core::{chunker, manifest, pathinfo, protocol, refnorm};
-
+pub mod chunker;
 pub mod cli;
 pub mod drain;
 pub mod gc;
 pub mod gha;
 pub mod hook;
+pub mod manifest;
 pub mod matrix;
+pub mod pathinfo;
 pub mod pipeline;
 pub mod prefetch;
+pub mod protocol;
+pub mod refnorm;
 pub mod serve;
 pub mod substituter;
 pub mod upstream;
