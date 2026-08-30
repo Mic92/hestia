@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
+use hestia::backend::Backend;
 use hestia::chunker::{flatten_tree, pack_cache_key};
 use hestia::gc::{GcPolicy, RepackOutput, SECS_PER_DAY, SECS_PER_HOUR, TIER_STABLE};
 use hestia::gha::Error as GhaError;
@@ -743,9 +744,11 @@ async fn gc_never_deletes_packs_of_another_cache_version_namespace() {
         // A salted perf run (HESTIA_CACHE_VERSION_SALT) lives in its own
         // Twirp version namespace but shares the prefix-based REST listing
         // with production.
+        let salted_twirp = fake.twirp(&http).with_version_salt("perf-run");
         let salted = SimCache {
+            backend: Backend::new(salted_twirp.clone(), Some(fake.rest(&http)), http.clone()),
             http: http.clone(),
-            twirp: fake.twirp(&http).with_version_salt("perf-run"),
+            twirp: salted_twirp,
             rest: fake.rest(&http),
         };
 

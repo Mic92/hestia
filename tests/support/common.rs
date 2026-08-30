@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 
 use bytes::Bytes;
 
+use hestia::backend::Backend;
 use hestia::gha::blob;
 use hestia::gha::savemutable::SaveMutable;
 use hestia::gha::twirp::{Reservation, TwirpClient};
@@ -30,19 +31,14 @@ pub fn pipeline_context(
     http: &reqwest::Client,
     store: StoreDatabase,
 ) -> PipelineContext {
-    pipeline_context_with(fake.twirp(http), http, store)
+    pipeline_context_with(fake.backend(http), store)
 }
 
-/// Same, with an explicit Twirp client for tests that put a proxy between
-/// the pipeline and the fake backend.
-pub fn pipeline_context_with(
-    twirp: TwirpClient,
-    http: &reqwest::Client,
-    store: StoreDatabase,
-) -> PipelineContext {
+/// Same, with an explicit backend for tests that put a proxy between
+/// the pipeline and the fake.
+pub fn pipeline_context_with(backend: Backend, store: StoreDatabase) -> PipelineContext {
     PipelineContext {
-        twirp,
-        http: http.clone(),
+        backend,
         store,
         upstream: UpstreamFilter::default(),
         expand_closure: true,

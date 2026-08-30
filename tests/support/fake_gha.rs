@@ -44,6 +44,7 @@ use axum::routing::{get, post, put};
 use serde::Deserialize;
 use serde_json::json;
 
+use hestia::backend::Backend;
 use hestia::gha::rest::{RestClient, format_timestamp};
 use hestia::gha::twirp::{
     CreateCacheEntryRequest, FinalizeCacheEntryUploadRequest, GetCacheEntryDownloadUrlRequest,
@@ -698,6 +699,11 @@ impl FakeGha {
     /// Twirp client pointed at this fake.
     pub fn twirp(&self, http: &reqwest::Client) -> TwirpClient {
         TwirpClient::new(http.clone(), &self.base_url, "fake-runtime-token")
+    }
+
+    /// Backend over this fake with REST access.
+    pub fn backend(&self, http: &reqwest::Client) -> Backend {
+        Backend::new(self.twirp(http), Some(self.rest(http)), http.clone())
     }
 
     /// REST client pointed at this fake. The fake never rate-limits, so

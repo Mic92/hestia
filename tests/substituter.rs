@@ -64,8 +64,7 @@ impl RunningSubstituter {
             store.database().store_dir().clone(),
             manifest_store.clone(),
             access_log.clone(),
-            fake.twirp(http),
-            http.clone(),
+            fake.backend(http),
         );
         let router = substituter.into_router();
 
@@ -735,7 +734,7 @@ async fn eager_pack_verification_marks_evicted_packs_upfront() {
 
         // One pack listed, zero threshold: verification must bail out
         // without marking anything.
-        verify_packs(&fake.rest(&http), &substituter.manifest, 0).await;
+        verify_packs(&fake.backend(&http), &substituter.manifest, 0).await;
         assert_eq!(
             substituter.narinfo(&http, &fixture).await.status(),
             200,
@@ -746,7 +745,7 @@ async fn eager_pack_verification_marks_evicted_packs_upfront() {
         fake.evict(&http, &pack_cache_key(&pack_hash)).await;
 
         // The listing reveals the eviction before Nix ever asks.
-        verify_packs(&fake.rest(&http), &substituter.manifest, 1000).await;
+        verify_packs(&fake.backend(&http), &substituter.manifest, 1000).await;
         assert_eq!(
             substituter.narinfo(&http, &fixture).await.status(),
             404,
@@ -1122,8 +1121,7 @@ async fn concurrent_gc_repack_triggers_manifest_reload() {
             store.database().store_dir().clone(),
             manifest_store.clone(),
             AccessLog::new(),
-            twirp.clone(),
-            http.clone(),
+            fake.backend(&http),
         )
         .with_manifest_reload(std::sync::Arc::new(move || {
             let twirp = reload_twirp.clone();

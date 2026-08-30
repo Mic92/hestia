@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
+use hestia::backend::Backend;
 use hestia::chunker::{Chunk, PackBuilder, chunk_data, nar_hash_from_chunks};
 use hestia::gc::{GcContext, GcPolicy};
 use hestia::gha::Error as GhaError;
@@ -122,6 +123,7 @@ pub struct SimCache {
     pub http: reqwest::Client,
     pub twirp: TwirpClient,
     pub rest: RestClient,
+    pub backend: Backend,
 }
 
 impl SimCache {
@@ -130,6 +132,7 @@ impl SimCache {
             http: http.clone(),
             twirp: fake.twirp(http),
             rest: fake.rest(http),
+            backend: fake.backend(http),
         }
     }
 
@@ -140,9 +143,7 @@ impl SimCache {
     /// A GC context sharing this cache's clients.
     pub fn gc(&self, policy: GcPolicy) -> GcContext {
         GcContext {
-            twirp: self.twirp.clone(),
-            rest: self.rest.clone(),
-            http: self.http.clone(),
+            backend: self.backend.clone(),
             manifest_prefix: MANIFEST_PREFIX.to_string(),
             policy,
         }
@@ -211,7 +212,7 @@ impl SimCache {
 
         if !builder.is_empty() {
             let pack = builder.finish();
-            upload_pack(&self.twirp, &self.http, &pack)
+            upload_pack(&self.backend, &pack)
                 .await
                 .expect("pack upload");
             for (chunk, location) in pack.locations() {
@@ -303,7 +304,7 @@ impl SimCache {
             builder.add(chunk).expect("pack add");
         }
         let pack = builder.finish();
-        upload_pack(&self.twirp, &self.http, &pack)
+        upload_pack(&self.backend, &pack)
             .await
             .expect("orphan pack upload");
         pack.cache_key()
@@ -448,8 +449,7 @@ impl SimCache {
             StoreDir::default(),
             manifest_store,
             AccessLog::new(),
-            self.twirp.clone(),
-            self.http.clone(),
+            self.backend.clone(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
