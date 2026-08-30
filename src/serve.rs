@@ -46,8 +46,9 @@ use tokio::net::{UnixListener, UnixStream};
 /// 64 MiB pack target keeps real repositories well below this.
 const MAX_PACK_VERIFY_ENTRIES: u64 = 1000;
 
+use crate::backend::Backend;
 use crate::cli::ServeArgs;
-use crate::gha::twirp::TwirpClient;
+use crate::gha::savemutable::SaveMutable;
 use crate::pathinfo::StoreDatabase;
 use crate::pipeline::{self, AccessLog, MANIFEST_PREFIX, PipelineContext, now_unix};
 use crate::protocol::{DrainStats, Request, Response, encode_line};
@@ -424,12 +425,8 @@ impl Daemon {
 /// stale version: lookups are eventually consistent); that version must
 /// win. Recording the version makes drains start their reservations above
 /// it even when cache lookups lag.
-async fn load_published_manifest(
-    twirp: &TwirpClient,
-    http: &reqwest::Client,
-    manifest_store: &ManifestStore,
-) {
-    let save = crate::gha::savemutable::SaveMutable::new(twirp, http, MANIFEST_PREFIX);
+async fn load_published_manifest(backend: &Backend, manifest_store: &ManifestStore) {
+    let save = SaveMutable::new(backend.twirp(), backend.http(), MANIFEST_PREFIX);
     match save.load().await {
         Ok(Some(entry)) => manifest_store
             .set_version_if_newer(pipeline::decode_manifest_or_empty(&entry.data), entry.index),
@@ -552,8 +549,8 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("building the HTTP client failed");
-    let twirp = match TwirpClient::from_env(http.clone()) {
-        Ok(twirp) => twirp,
+    let backend = match Backend::from_env(http.clone()) {
+        Ok(backend) => backend,
         Err(err) => {
             eprintln!(
                 "hestia serve: {err}\n\
@@ -595,8 +592,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     let store_dir = store.store_dir().clone();
     let root_key = pipeline::root_key(&branch, &system);
     let pipeline = PipelineContext {
-        twirp: twirp.clone(),
-        http: http.clone(),
+        backend: backend.clone(),
         store,
         upstream,
         expand_closure: !args.no_closure,
@@ -657,21 +653,18 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         store_dir,
         manifest_store.clone(),
         daemon.access_log(),
-        twirp.clone(),
-        http.clone(),
+        backend.clone(),
     )
     .with_activity_hook(daemon.activity_hook())
     .with_manifest_ready(manifest_ready_rx)
     .with_manifest_reload({
-        let twirp = twirp.clone();
-        let http = http.clone();
+        let backend = backend.clone();
         let manifest_store = manifest_store.clone();
         Arc::new(move || {
-            let twirp = twirp.clone();
-            let http = http.clone();
+            let backend = backend.clone();
             let manifest_store = manifest_store.clone();
             Box::pin(async move {
-                load_published_manifest(&twirp, &http, &manifest_store).await;
+                load_published_manifest(&backend, &manifest_store).await;
             })
         })
     });
@@ -688,25 +681,18 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     // manifest yet (first run) or a load failure both mean "serve nothing
     // until the first drain".
     let load_task = {
-        let twirp = twirp.clone();
-        let http = http.clone();
+        let backend = backend.clone();
         let manifest_store = manifest_store.clone();
         let min_version = args.wait_manifest_version;
         tokio::spawn(async move {
             let reload = || {
-                let twirp = twirp.clone();
-                let http = http.clone();
+                let backend = backend.clone();
                 let manifest_store = manifest_store.clone();
-                async move { load_published_manifest(&twirp, &http, &manifest_store).await }
+                async move { load_published_manifest(&backend, &manifest_store).await }
             };
             wait_for_manifest_version(&manifest_store, min_version, reload).await;
             let _ = manifest_ready_tx.send(true);
-            // Only with a GITHUB_TOKEN (optional: build jobs need no
-            // permissions); without one the NAR handler's lazy negative
-            // cache still catches evictions, one failed request later.
-            if let Ok(rest) = crate::gha::rest::RestClient::from_env(http.clone()) {
-                verify_packs(&rest, &manifest_store, MAX_PACK_VERIFY_ENTRIES).await;
-            }
+            verify_packs(&backend, &manifest_store, MAX_PACK_VERIFY_ENTRIES).await;
         })
     };
 
@@ -719,10 +705,10 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     if args.read_only {
         eprintln!("hestia serve: read-only mode; nothing will be written to the cache");
     } else {
-        let twirp = twirp.clone();
+        let backend = backend.clone();
         let read_only = read_only.clone();
         tokio::spawn(async move {
-            match twirp.probe_writable().await {
+            match backend.probe_writable().await {
                 Ok(false) => {
                     read_only.store(true, Ordering::Relaxed);
                     eprintln!(

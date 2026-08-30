@@ -709,8 +709,7 @@ async fn substituter_serves_paths_pushed_by_daemon_drains() {
             store.database().store_dir().clone(),
             daemon.manifest_store.clone(),
             daemon.access_log.clone(),
-            fake.twirp(&http),
-            http.clone(),
+            fake.backend(&http),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());

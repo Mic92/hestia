@@ -19,6 +19,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::response::IntoResponse;
 
+use hestia::backend::Backend;
 use hestia::gha::twirp::TwirpClient;
 use hestia::pipeline::now_unix;
 
@@ -161,7 +162,7 @@ async fn commit_includes_everything_the_dedup_decisions_were_based_on() {
 
         // Set up two manifest versions directly against the fake (these
         // represent commits by other, concurrent CI jobs).
-        let direct = context(fake.twirp(&http), &http, store.database());
+        let direct = context(fake.backend(&http), store.database());
         let stats = direct
             .run(to_path_set(&[&solo]), BTreeSet::new(), now_unix())
             .await
@@ -178,8 +179,11 @@ async fn commit_includes_everything_the_dedup_decisions_were_based_on() {
         // shared blob chunks), but the commit-time load only returns m#1.
         let proxy = LookupRegressionProxy::start(&fake, &http).await;
         let lagging = context(
-            TwirpClient::new(http.clone(), &proxy.base_url, "fake-runtime-token"),
-            &http,
+            Backend::new(
+                TwirpClient::new(http.clone(), &proxy.base_url, "fake-runtime-token"),
+                None,
+                http.clone(),
+            ),
             store.database(),
         );
         let stats = lagging

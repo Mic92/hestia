@@ -120,9 +120,7 @@ async fn quota_exhaustion_fails_gracefully_and_gc_cleans_orphaned_packs() {
     // clock is in small tick units; pretend an hour+ passed since upload.
     fake.exhaust_quota_after(&http, u64::MAX).await;
     let gc = GcContext {
-        twirp: fake.twirp(&http),
-        rest: fake.rest(&http),
-        http: http.clone(),
+        backend: fake.backend(&http),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         policy: GcPolicy::default(),
     };
@@ -247,9 +245,7 @@ async fn gc_refuses_to_act_on_a_corrupt_manifest() {
     store_entry(&twirp, &http, &pack_key, b"some pack contents").await;
 
     let gc = GcContext {
-        twirp: fake.twirp(&http),
-        rest: fake.rest(&http),
-        http: http.clone(),
+        backend: fake.backend(&http),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         policy: GcPolicy::default(),
     };
@@ -508,8 +504,7 @@ async fn drained_paths_are_substitutable_despite_lookup_lag() {
             store.database().store_dir().clone(),
             manifest_store.clone(),
             access_log.clone(),
-            fake.twirp(&http),
-            http.clone(),
+            fake.backend(&http),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());

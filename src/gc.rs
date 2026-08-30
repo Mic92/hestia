@@ -39,15 +39,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
 
+use crate::backend::{Backend, Listed};
 use crate::chunker::{
     self, PackBuilder, coalesce_adjacent, extract_chunk, flatten_tree, pack_cache_key,
 };
 use crate::cli::GcArgs;
 use crate::drain::human_bytes;
-use crate::gha::rest::{CacheEntry, RestClient};
+use crate::gha::Error as GhaError;
+use crate::gha::rest::RestClient;
 use crate::gha::savemutable::{MutableEntry, SaveMutable};
-use crate::gha::twirp::{DownloadUrl, TwirpClient};
-use crate::gha::{Error as GhaError, blob};
+use crate::gha::twirp::TwirpClient;
 use crate::manifest::{
     Blake3Pack, ChunkHash, ChunkLocation, FileSystemObject, Manifest, PackHash, PackInfo, PathHash,
 };
@@ -165,12 +166,12 @@ pub struct PackObservation {
 }
 
 impl PackObservation {
-    fn from_entry(entry: &CacheEntry) -> Self {
+    fn from_entry(entry: Listed) -> Self {
         Self {
             pack: parse_pack_key(&entry.key),
-            key: entry.key.clone(),
-            created: entry.created_unix().unwrap_or(0),
-            last_accessed: entry.last_accessed_unix().unwrap_or(0),
+            created: entry.created.unwrap_or(0),
+            last_accessed: entry.last_accessed.unwrap_or(0),
+            key: entry.key,
         }
     }
 }
@@ -754,9 +755,7 @@ impl GcReport {
 
 /// Everything `hestia gc` needs to talk to the world.
 pub struct GcContext {
-    pub twirp: TwirpClient,
-    pub rest: RestClient,
-    pub http: reqwest::Client,
+    pub backend: Backend,
     /// SaveMutable family prefix (always [`MANIFEST_PREFIX`] in production;
     /// tests use distinct prefixes).
     pub manifest_prefix: String,
@@ -765,7 +764,11 @@ pub struct GcContext {
 
 impl GcContext {
     fn save_mutable(&self) -> SaveMutable<'_> {
-        SaveMutable::new(&self.twirp, &self.http, &self.manifest_prefix)
+        SaveMutable::new(
+            self.backend.twirp(),
+            self.backend.http(),
+            &self.manifest_prefix,
+        )
     }
 
     /// Load the current manifest, or an empty one if none exists yet.
@@ -789,13 +792,7 @@ impl GcContext {
             Some(entry) => Ok(Some(entry)),
             None => {
                 let prefix = format!("{}#", self.manifest_prefix);
-                let versions = self
-                    .rest
-                    .list_caches(&prefix)
-                    .await?
-                    .iter()
-                    .filter(|entry| entry.version == self.twirp.version())
-                    .count();
+                let versions = self.list(&prefix).await?.len();
                 if versions > 0 {
                     return Err(Error::ManifestLookupInconsistent(versions));
                 }
@@ -804,18 +801,20 @@ impl GcContext {
         }
     }
 
-    /// REST-list all `pack-*` cache entries in GC's own cache version
-    /// namespace. The listing is prefix-based and version-blind, so it
-    /// also returns same-key entries of other namespaces (salted runs,
-    /// foreign workflows): not ours to delete as orphans, and they must
-    /// not mask an eviction of our own entry during reconcile.
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
+        Ok(self
+            .backend
+            .list(prefix, None)
+            .await?
+            .expect("unbounded listing"))
+    }
+
+    /// All `pack-*` entries in GC's own namespace.
     pub async fn observe_packs(&self) -> Result<Vec<PackObservation>, Error> {
         Ok(self
-            .rest
-            .list_caches("pack-")
+            .list("pack-")
             .await?
-            .iter()
-            .filter(|entry| entry.version == self.twirp.version())
+            .into_iter()
             .map(PackObservation::from_entry)
             .collect())
     }
@@ -827,19 +826,10 @@ impl GcContext {
     /// unknown references is unsafe.
     pub async fn protected_packs(&self) -> Result<BTreeSet<PackHash>, Error> {
         let prefix = format!("{}#", self.manifest_prefix);
-        let entries = self.rest.list_caches(&prefix).await?;
         let mut protected: BTreeSet<PackHash> = BTreeSet::new();
-        for entry in entries
-            .iter()
-            .filter(|entry| entry.version == self.twirp.version())
-        {
-            match self.twirp.get_download_url(&entry.key, &[]).await? {
-                DownloadUrl::Hit { url, .. } => {
-                    let data = blob::get(&self.http, &url, None).await?;
-                    let manifest = Manifest::decode(&data)?;
-                    protected.extend(manifest.packs.keys().copied());
-                }
-                DownloadUrl::Miss => {}
+        for entry in self.list(&prefix).await? {
+            if let Some(data) = self.backend.get(&entry.key, None).await? {
+                protected.extend(Manifest::decode(&data)?.packs.keys().copied());
             }
         }
         Ok(protected)
@@ -854,37 +844,13 @@ impl GcContext {
         Ok((manifest, observations, plan))
     }
 
-    /// Get a signed download URL for a pack, or `None` if it vanished.
-    async fn pack_url(&self, pack: &PackHash) -> Result<Option<String>, Error> {
-        match self
-            .twirp
-            .get_download_url(&pack_cache_key(pack), &[])
-            .await?
-        {
-            DownloadUrl::Hit { url, .. } => Ok(Some(url)),
-            DownloadUrl::Miss => Ok(None),
-        }
-    }
-
-    /// Range-read a slice of a pack, refreshing the signed URL on expiry.
+    /// Range-read a slice of a pack. `None` if it vanished.
     async fn read_pack_range(
         &self,
         pack: &PackHash,
-        url: &str,
         range: std::ops::Range<u64>,
-    ) -> Result<bytes::Bytes, Error> {
-        let pack = *pack;
-        let refresh = async move || match self
-            .twirp
-            .get_download_url(&pack_cache_key(&pack), &[])
-            .await?
-        {
-            DownloadUrl::Hit { url, .. } => Ok(url),
-            DownloadUrl::Miss => Err(GhaError::InvalidResponse(format!(
-                "pack {pack} disappeared while repacking"
-            ))),
-        };
-        Ok(blob::get_with_refresh(&self.http, url, Some(range), refresh).await?)
+    ) -> Result<Option<bytes::Bytes>, Error> {
+        Ok(self.backend.get(&pack_cache_key(pack), Some(range)).await?)
     }
 
     /// Execute step 1 of 6: run all repack jobs (download, verify, upload).
@@ -908,15 +874,7 @@ impl GcContext {
             let mut survived: BTreeMap<ChunkHash, u32> = BTreeMap::new();
             let mut sources_read: BTreeSet<PackHash> = BTreeSet::new();
 
-            for (source, copies) in by_pack {
-                let Some(url) = self.pack_url(&source).await? else {
-                    eprintln!(
-                        "hestia gc: source pack {source} disappeared since planning; \
-                         skipping its chunks (healed next run)"
-                    );
-                    continue;
-                };
-
+            'sources: for (source, copies) in by_pack {
                 // Coalesce adjacent frames into single Range requests.
                 let runs =
                     coalesce_adjacent(copies, |copy| (copy.from.offset, copy.from.compressed_size));
@@ -925,7 +883,13 @@ impl GcContext {
                     let start = run[0].from.offset;
                     let last = &run[run.len() - 1].from;
                     let end = last.offset + u64::from(last.compressed_size);
-                    let data = self.read_pack_range(&source, &url, start..end).await?;
+                    let Some(data) = self.read_pack_range(&source, start..end).await? else {
+                        eprintln!(
+                            "hestia gc: source pack {source} disappeared since planning; \
+                             skipping its chunks (healed next run)"
+                        );
+                        continue 'sources;
+                    };
                     output.downloaded += data.len() as u64;
 
                     // The cache is lossy and its contents are untrusted: a
@@ -986,7 +950,7 @@ impl GcContext {
     ) -> Result<(), Error> {
         let pack = builder.finish();
         // A CAS no-op (pack already exists) is touched inside upload_pack.
-        if upload_pack(&self.twirp, &self.http, &pack).await? {
+        if upload_pack(&self.backend, &pack).await? {
             output.uploaded += pack.data.len() as u64;
         }
         output.packs.insert(
@@ -1014,28 +978,12 @@ impl GcContext {
     pub async fn execute_touches(&self, plan: &GcPlan) -> Result<usize, Error> {
         let mut touched = 0;
         for pack in &plan.touch_packs {
-            // A missing pack was evicted since planning; the next run
-            // reconciles it.
-            let Some(url) = self.pack_url(pack).await? else {
-                continue;
-            };
-            let pack = *pack;
-            let refresh = async move || match self
-                .twirp
-                .get_download_url(&pack_cache_key(&pack), &[])
-                .await?
-            {
-                DownloadUrl::Hit { url, .. } => Ok(url),
-                DownloadUrl::Miss => Err(GhaError::InvalidResponse(format!(
-                    "pack {pack} disappeared while touching"
-                ))),
-            };
-            // Downloads through the Twirp/Azure path bump last_accessed_at
-            // (verified against the real service). A touch is a pure LRU
-            // optimization that self-heals next run; a failure must not
-            // abort the run and strand the commit and deletes behind it.
-            match blob::get_with_refresh(&self.http, &url, Some(0..1), refresh).await {
-                Ok(_) => touched += 1,
+            // A touch is a pure LRU optimization that self-heals next run. A
+            // failure must not strand the commit and deletes behind it. A
+            // missing pack was evicted since planning. The next run reconciles it.
+            match self.backend.touch(&pack_cache_key(pack)).await {
+                Ok(true) => touched += 1,
+                Ok(false) => {}
                 Err(err) => eprintln!("hestia gc: touch of pack {pack} failed ({err}); skipping"),
             }
         }
@@ -1131,12 +1079,7 @@ impl GcContext {
     pub async fn delete_packs(&self, packs: &[PackHash]) -> Result<usize, Error> {
         let mut deleted = 0;
         for pack in packs {
-            if !self
-                .rest
-                .delete_by_key(&pack_cache_key(pack))
-                .await?
-                .is_empty()
-            {
+            if self.backend.delete(&pack_cache_key(pack)).await? {
                 deleted += 1;
             }
         }
@@ -1149,7 +1092,7 @@ impl GcContext {
     pub async fn delete_orphans(&self, keys: &BTreeSet<String>) -> Result<usize, Error> {
         let mut deleted = 0;
         for key in keys {
-            if !self.rest.delete_by_key(key).await?.is_empty() {
+            if self.backend.delete(key).await? {
                 deleted += 1;
             }
         }
@@ -1161,13 +1104,9 @@ impl GcContext {
     /// dead entry behind forever.
     pub async fn cleanup_manifests(&self, now: u64) -> Result<usize, Error> {
         let prefix = format!("{}#", self.manifest_prefix);
-        let entries = self.rest.list_caches(&prefix).await?;
-        let indexed: Vec<(u64, &CacheEntry)> = entries
+        let entries = self.list(&prefix).await?;
+        let indexed: Vec<(u64, &Listed)> = entries
             .iter()
-            // Another namespace's m#N sequence restarts at 1; letting its
-            // (possibly higher) indices into `newest` would make GC delete
-            // this namespace's live manifest head.
-            .filter(|entry| entry.version == self.twirp.version())
             .filter_map(|entry| Some((parse_manifest_index(&prefix, &entry.key)?, entry)))
             .collect();
         let Some(newest) = indexed.iter().map(|(index, _)| *index).max() else {
@@ -1180,13 +1119,13 @@ impl GcContext {
             // that no in-flight reader still holds their download URL.
             // An unparsable timestamp means the age is unknown: skip the
             // entry rather than judging it infinitely old.
-            let Some(created) = entry.created_unix() else {
+            let Some(created) = entry.created else {
                 continue;
             };
             let age = now.saturating_sub(created);
             if index < newest
                 && age > self.policy.min_age
-                && !self.rest.delete_by_key(&entry.key).await?.is_empty()
+                && self.backend.delete(&entry.key).await?
             {
                 deleted += 1;
             }
@@ -1249,9 +1188,12 @@ impl GcContext {
 
 pub async fn run(args: &GcArgs) -> ExitCode {
     let http = reqwest::Client::new();
-    let twirp = match TwirpClient::from_env(http.clone()) {
-        Ok(twirp) => twirp,
-        Err(err) => {
+    let backend = match (
+        TwirpClient::from_env(http.clone()),
+        RestClient::from_env(http.clone()),
+    ) {
+        (Ok(twirp), Ok(rest)) => Backend::new(twirp, Some(rest), http),
+        (Err(err), _) => {
             eprintln!(
                 "hestia gc: {err}\n\
                  hint: the GHA cache tokens are only visible to shell steps when the \
@@ -1259,10 +1201,7 @@ pub async fn run(args: &GcArgs) -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
-    };
-    let rest = match RestClient::from_env(http.clone()) {
-        Ok(rest) => rest,
-        Err(err) => {
+        (_, Err(err)) => {
             eprintln!(
                 "hestia gc: {err}\n\
                  hint: GC needs GITHUB_TOKEN with `actions: write` permission and \
@@ -1273,9 +1212,7 @@ pub async fn run(args: &GcArgs) -> ExitCode {
     };
 
     let context = GcContext {
-        twirp,
-        rest,
-        http,
+        backend,
         manifest_prefix: MANIFEST_PREFIX.to_string(),
         policy: GcPolicy {
             path_grace: args.grace * SECS_PER_DAY,

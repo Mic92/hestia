@@ -21,11 +21,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::backend::Backend;
 use crate::chunker::{self, PackBuilder, chunk_path, compress_chunks, nar_hash_from_chunks};
 use crate::gha::Error as GhaError;
-use crate::gha::blob;
 use crate::gha::savemutable::SaveMutable;
-use crate::gha::twirp::{DownloadUrl, Reservation, TwirpClient};
 use crate::manifest::{Manifest, PackInfo, PathEntry, PathHash, Root};
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
@@ -169,46 +168,22 @@ pub fn decode_manifest_or_empty(data: &[u8]) -> Manifest {
     }
 }
 
-/// Upload one pack blob (Twirp reserve → Azure PUT → finalize); shared by
-/// the write pipeline and GC repack. Returns
-/// `false` when the cache already has it: pack keys are content-addressed,
-/// so an existing entry is guaranteed to hold identical content.
-///
-/// The no-op case touches the existing pack (1-byte Range read): the
-/// caller now depends on an entry it never transferred, and the touch
-/// resets the LRU clock and makes the dependency visible to GC's recency
-/// guard — without it, a concurrent GC could delete the pack before this
-/// writer commits the manifest referencing it (see docs/gc.als).
-pub async fn upload_pack(
-    twirp: &TwirpClient,
-    http: &reqwest::Client,
-    pack: &chunker::Pack,
-) -> Result<bool, GhaError> {
+/// Upload one pack. `false` when the backend already had it. Pack keys
+/// are content-addressed, so an existing entry holds identical content.
+/// That case touches the existing pack so its LRU clock and GC's recency
+/// guard see this writer's dependency before the manifest commit lands.
+pub async fn upload_pack(backend: &Backend, pack: &chunker::Pack) -> Result<bool, GhaError> {
     let key = pack.cache_key();
-
-    match twirp.create_cache_entry(&key).await? {
-        Reservation::AlreadyExists => {
-            // A Miss means the entry vanished between reserve and lookup
-            // (evicted); nothing to touch — the commit still goes through
-            // and the next GC heals the path.
-            if let DownloadUrl::Hit { url, .. } = twirp.get_download_url(&key, &[]).await? {
-                blob::get(http, &url, Some(0..1)).await?;
-            }
-            Ok(false)
-        }
-        Reservation::Created { upload_url } => {
-            twirp
-                .upload_and_finalize(http, &key, upload_url, pack.data.clone())
-                .await?;
-            Ok(true)
-        }
+    let created = backend.put(&key, pack.data.clone()).await?;
+    if !created {
+        backend.touch(&key).await?;
     }
+    Ok(created)
 }
 
 /// Everything the pipeline needs to talk to the world.
 pub struct PipelineContext {
-    pub twirp: TwirpClient,
-    pub http: reqwest::Client,
+    pub backend: Backend,
     pub store: StoreDatabase,
     pub upstream: UpstreamFilter,
     /// Expand hooked paths to their runtime closure before pushing.
@@ -269,7 +244,11 @@ enum Verified {
 
 impl PipelineContext {
     fn save_mutable(&self) -> SaveMutable<'_> {
-        SaveMutable::new(&self.twirp, &self.http, &self.manifest_prefix)
+        SaveMutable::new(
+            self.backend.twirp(),
+            self.backend.http(),
+            &self.manifest_prefix,
+        )
     }
 
     /// Load the current manifest, or an empty one if none exists yet or
@@ -594,7 +573,7 @@ impl PipelineContext {
             });
             pack_stream
                 .map(|mut pack| async move {
-                    let uploaded = upload_pack(&self.twirp, &self.http, &pack).await?;
+                    let uploaded = upload_pack(&self.backend, &pack).await?;
                     // Only metadata is read after upload; dropping the blob
                     // here keeps peak memory bounded by the in-flight packs
                     // instead of growing with the drain's total compressed

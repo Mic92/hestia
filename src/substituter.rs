@@ -28,7 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::Semaphore;
 
@@ -44,10 +44,9 @@ use harmonia_store_nar_info::{build_narinfo, format_narinfo_txt};
 use harmonia_store_path::StoreDir;
 use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
 
+use crate::backend::Backend;
 use crate::chunker::{self, extract_chunk, flatten_tree, nar_from_chunks, pack_cache_key};
-use crate::gha::rest::RestClient;
-use crate::gha::twirp::{DownloadUrl, TwirpClient};
-use crate::gha::{Error as GhaError, blob};
+use crate::gha::Error as GhaError;
 use crate::manifest::{
     ChunkHash, ChunkLocation, FileSystemObject, Hash32, Manifest, PackHash, PathEntry, PathHash,
 };
@@ -58,11 +57,6 @@ use crate::refnorm::RefTable;
 /// of cache.nixos.org (40), so Nix asks the local cache first and only falls
 /// through to upstream on a miss.
 const PRIORITY: u32 = 30;
-
-/// How long a signed pack download URL is reused before asking Twirp for a
-/// fresh one. Real SAS URLs live much longer; the 403-refresh path is the
-/// backstop for when this estimate is wrong.
-const PACK_URL_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Upper bound for decompressed chunks kept in memory across NAR requests.
 /// Oldest chunks are dropped first.
@@ -86,11 +80,6 @@ const PACK_READ_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
 /// Azure Range requests), so this bounds the total API concurrency no
 /// matter how the packs distribute over paths.
 const MAX_CONCURRENT_PACK_FETCHES: usize = 8;
-
-/// How many times a pack Range read is retried after a transient failure
-/// (connection drop, timeout, 5xx) before the whole NAR request gives up
-/// and returns 404.
-const TRANSIENT_READ_RETRIES: u32 = 2;
 
 /// One pack's chunk locations sorted by offset. Lets the fetcher answer
 /// "which chunks live in this byte range" (read-ahead) with a range scan;
@@ -296,12 +285,9 @@ impl ChunkCache {
     }
 }
 
-/// Fetches chunks from pack blobs in the GHA cache.
+/// Fetches chunks from pack blobs.
 struct ChunkFetcher {
-    twirp: TwirpClient,
-    http: reqwest::Client,
-    /// Signed download URLs per pack, with issue time (TTL-based reuse).
-    url_cache: Mutex<HashMap<PackHash, (String, Instant)>>,
+    backend: Backend,
     /// Decompressed chunks (filled by NAR requests).
     chunk_cache: Mutex<ChunkCache>,
     /// Per-path serialization: concurrent NAR requests for the same path
@@ -315,11 +301,9 @@ struct ChunkFetcher {
 }
 
 impl ChunkFetcher {
-    fn new(twirp: TwirpClient, http: reqwest::Client) -> Self {
+    fn new(backend: Backend) -> Self {
         Self {
-            twirp,
-            http,
-            url_cache: Mutex::new(HashMap::new()),
+            backend,
             chunk_cache: Mutex::new(ChunkCache::default()),
             path_locks: Mutex::new(HashMap::new()),
             fetch_semaphore: Semaphore::new(MAX_CONCURRENT_PACK_FETCHES),
@@ -334,67 +318,15 @@ impl ChunkFetcher {
         Arc::clone(locks.entry(path).or_default())
     }
 
-    /// Get a signed download URL for a pack, reusing a cached one if it is
-    /// fresh enough. `force` bypasses the cache (after a 403).
-    async fn pack_url(&self, pack: PackHash, force: bool) -> Result<String, FetchError> {
-        if !force {
-            let cache = self.url_cache.lock().expect("url cache poisoned");
-            if let Some((url, issued)) = cache.get(&pack)
-                && issued.elapsed() < PACK_URL_TTL
-            {
-                return Ok(url.clone());
-            }
-        }
-        let key = pack_cache_key(&pack);
-        match self.twirp.get_download_url(&key, &[]).await? {
-            DownloadUrl::Hit { url, .. } => {
-                let mut cache = self.url_cache.lock().expect("url cache poisoned");
-                // Expired entries are only ever bypassed, never overwritten
-                // unless the same pack is fetched again — prune them here so
-                // URLs of packs GC has repacked away do not accumulate for
-                // the process lifetime.
-                cache.retain(|_, (_, issued)| issued.elapsed() < PACK_URL_TTL);
-                cache.insert(pack, (url.clone(), Instant::now()));
-                Ok(url)
-            }
-            DownloadUrl::Miss => Err(FetchError::PackUnavailable(pack)),
-        }
-    }
-
-    /// Range-read one byte range of a pack.
-    ///
-    /// Two failure modes are recovered from, everything else propagates
-    /// (and ultimately turns the NAR request into a 404):
-    ///
-    /// * expired signed URL (401/403) → refresh via Twirp, once;
-    /// * transient network/server failure (connection drop, timeout, 5xx)
-    ///   → retry the same URL up to [`TRANSIENT_READ_RETRIES`] times.
     async fn read_pack_range(
         &self,
         pack: PackHash,
         range: std::ops::Range<u64>,
     ) -> Result<Bytes, FetchError> {
-        let mut url = self.pack_url(pack, false).await?;
-        let mut refreshed = false;
-        let mut transient_left = TRANSIENT_READ_RETRIES;
-        loop {
-            match blob::get(&self.http, &url, Some(range.clone())).await {
-                Err(GhaError::Status { status, .. })
-                    if (status == 403 || status == 401) && !refreshed =>
-                {
-                    refreshed = true;
-                    url = self.pack_url(pack, true).await?;
-                }
-                Err(err) if blob::is_transient(&err) && transient_left > 0 => {
-                    transient_left -= 1;
-                    eprintln!(
-                        "hestia substituter: transient error reading pack {}, retrying: {err}",
-                        pack_cache_key(&pack)
-                    );
-                }
-                result => return Ok(result?),
-            }
-        }
+        self.backend
+            .get(&pack_cache_key(&pack), Some(range))
+            .await?
+            .ok_or(FetchError::PackUnavailable(pack))
     }
 
     /// Fetch all chunks of `entry`, using cached chunks where possible.
@@ -599,14 +531,14 @@ fn chunks_in_range<'a>(
 /// as evicted. Bails out above `max_entries`: a partial listing can prove
 /// presence but never absence. Errors are logged, not fatal: the NAR
 /// handler's lazy negative cache remains the backstop.
-pub async fn verify_packs(rest: &RestClient, store: &ManifestStore, max_entries: u64) {
+pub async fn verify_packs(backend: &Backend, store: &ManifestStore, max_entries: u64) {
     // One view for the whole comparison: marks must land on the same
     // manifest generation the listing was compared against.
     let view = store.view();
     if view.pack_index.is_empty() {
         return;
     }
-    let listed = match rest.list_caches_bounded("pack-", max_entries).await {
+    let listed = match backend.list("pack-", Some(max_entries)).await {
         Ok(Some(entries)) => entries,
         Ok(None) => {
             eprintln!(
@@ -615,6 +547,9 @@ pub async fn verify_packs(rest: &RestClient, store: &ManifestStore, max_entries:
             );
             return;
         }
+        // Listing needs GITHUB_TOKEN, which build jobs may not grant. The NAR
+        // handler's lazy negative cache still catches evictions.
+        Err(GhaError::MissingEnv(_)) => return,
         Err(err) => {
             eprintln!("hestia substituter: upfront pack verification failed: {err}");
             return;
@@ -674,14 +609,13 @@ impl Substituter {
         store_dir: StoreDir,
         manifest: ManifestStore,
         access_log: AccessLog,
-        twirp: TwirpClient,
-        http: reqwest::Client,
+        backend: Backend,
     ) -> Self {
         Self {
             store_dir,
             manifest,
             access_log,
-            fetcher: ChunkFetcher::new(twirp, http),
+            fetcher: ChunkFetcher::new(backend),
             activity_hook: None,
             manifest_reload: None,
             manifest_ready: None,
@@ -1207,6 +1141,12 @@ mod tests {
     use super::*;
     use crate::manifest::{ChunkList, FileTree, Regular};
 
+    fn unused_backend() -> Backend {
+        let http = reqwest::Client::new();
+        let twirp = crate::gha::twirp::TwirpClient::new(http.clone(), "http://unused", "token");
+        Backend::new(twirp, None, http)
+    }
+
     fn test_path_hash(seed: u8) -> PathHash {
         PathHash(crate::manifest::StorePathHash::new([seed; 20]))
     }
@@ -1262,8 +1202,7 @@ mod tests {
                 StoreDir::default(),
                 store,
                 AccessLog::new(),
-                TwirpClient::new(reqwest::Client::new(), "http://unused", "token"),
-                reqwest::Client::new(),
+                unused_backend(),
             )
             .with_manifest_ready(ready_rx),
         );
@@ -1273,7 +1212,7 @@ mod tests {
             Path(format!("{}.narinfo", test_path_hash(1))),
         ));
         // The gate is closed: the request must still be pending.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert!(!request.is_finished(), "narinfo answered before the load");
 
         ready_tx.send(true).unwrap();
@@ -1359,10 +1298,7 @@ mod tests {
 
     #[test]
     fn unused_path_locks_are_pruned() {
-        let fetcher = ChunkFetcher::new(
-            TwirpClient::new(reqwest::Client::new(), "http://unused", "token"),
-            reqwest::Client::new(),
-        );
+        let fetcher = ChunkFetcher::new(unused_backend());
         let held = fetcher.path_lock(test_path_hash(1));
         drop(fetcher.path_lock(test_path_hash(2)));
         // The next call prunes everything no request holds.
