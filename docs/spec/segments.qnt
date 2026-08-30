@@ -4,7 +4,8 @@
 // GC compaction + sweep, head listing lag, repack, GC crash,
 // cache eviction (gha). Store is gha, OCI or S3: named immutable objects and a
 // listing that may lag. One root. Packs are atomic. Ids stand in for hashes.
-// The only clock is the GC epoch.
+// The only clock is the GC epoch. The wall-clock time in head names only
+// tunes when a drain elects to compact, which is a free choice here.
 //
 //   quint run    docs/spec/segments.qnt --main segments_main  --invariant safety --max-steps 50 --max-samples 20000
 //   quint verify docs/spec/segments.qnt --main segments_main  --invariant safety --max-steps 30 --backend tlc

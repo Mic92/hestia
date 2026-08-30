@@ -15,7 +15,6 @@ use bytes::Bytes;
 use hestia::backend::Backend;
 use hestia::chunker::{Chunk, PackBuilder, chunk_data, nar_hash_from_chunks};
 use hestia::gc::{Gc, GcPolicy, GcStats};
-use hestia::gha::rest::RestClient;
 use hestia::manifest::{
     ChunkHash, ChunkList, Directory, FileSystemObject, FileTree, Hash32, PathEntry, PathHash,
     Regular, StorePath, StorePathHash,
@@ -101,10 +100,9 @@ impl SimPath {
     }
 }
 
-/// Drives pushes and GC against one fake GHA backend.
+/// Drives pushes and GC against one fake backend.
 pub struct SimCache {
     pub http: reqwest::Client,
-    pub rest: RestClient,
     pub backend: Backend,
     /// The fake's clock, so head names age with `set_clock`.
     pub clock: Clock,
@@ -112,11 +110,14 @@ pub struct SimCache {
 
 impl SimCache {
     pub fn new(fake: &FakeGha, http: &reqwest::Client) -> Self {
+        Self::with(fake.backend(http), fake.clock())
+    }
+
+    pub fn with(backend: Backend, clock: Clock) -> Self {
         Self {
-            http: http.clone(),
-            rest: fake.rest(http),
-            backend: fake.backend(http),
-            clock: fake.clock(),
+            http: reqwest::Client::new(),
+            backend,
+            clock,
         }
     }
 
@@ -232,23 +233,20 @@ impl SimCache {
         pack.cache_key()
     }
 
-    pub async fn stored_pack_bytes(&self) -> u64 {
-        self.rest
-            .list_caches("pack-")
-            .await
-            .expect("pack listing")
-            .iter()
-            .map(|entry| entry.size_in_bytes)
-            .sum()
-    }
-
     pub async fn stored_keys(&self, prefix: &str) -> BTreeSet<String> {
-        self.rest
-            .list_caches(prefix)
-            .await
-            .expect("listing")
-            .iter()
-            .map(|entry| entry.key.clone())
+        let listed = match self.backend.list(prefix, None).await.expect("listing") {
+            Some(heads) => heads,
+            None => self
+                .backend
+                .list_objects()
+                .await
+                .expect("objects")
+                .expect("listable"),
+        };
+        listed
+            .into_iter()
+            .map(|l| l.key)
+            .filter(|k| k.starts_with(prefix))
             .collect()
     }
 
@@ -381,16 +379,6 @@ impl Drop for RunningSubstituter {
     fn drop(&mut self) {
         self.task.abort();
     }
-}
-
-/// `last_accessed_at` of a cache key as unix seconds, `None` if absent.
-pub async fn last_accessed(rest: &RestClient, key: &str) -> Option<u64> {
-    rest.list_caches(key)
-        .await
-        .expect("cache listing")
-        .iter()
-        .find(|entry| entry.key == key)
-        .and_then(hestia::gha::rest::CacheEntry::last_accessed_unix)
 }
 
 /// 1-byte blob reads recorded by the fake (GC touches use `bytes=0-0`).

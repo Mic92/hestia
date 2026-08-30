@@ -8,6 +8,7 @@ use bytes::Bytes;
 pub use crate::gha::Error;
 
 pub mod gha;
+pub mod ghcr;
 pub mod oci;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +73,21 @@ impl Backend {
         }
     }
 
+    /// GC only: all `pack-`/`seg-`/`tree-` objects, `None` where the
+    /// backend cannot enumerate them.
+    pub async fn list_objects(&self) -> Result<Option<Vec<Listed>>, Error> {
+        match self {
+            Backend::Gha(b) => {
+                let mut out = Vec::new();
+                for prefix in ["pack-", "seg-", "tree-"] {
+                    out.extend(b.list(prefix, None).await?.expect("unbounded"));
+                }
+                Ok(Some(out))
+            }
+            Backend::Oci(b) => b.list_objects().await,
+        }
+    }
+
     pub async fn delete(&self, key: &str) -> Result<bool, Error> {
         match self {
             Backend::Gha(b) => b.delete(key).await,
@@ -83,6 +99,14 @@ impl Backend {
         match self {
             Backend::Gha(b) => b.probe_writable().await,
             Backend::Oci(b) => b.probe_writable().await,
+        }
+    }
+
+    /// Persist backend bookkeeping (the GHCR ledger) at the end of a GC run.
+    pub async fn flush(&self) -> Result<(), Error> {
+        match self {
+            Backend::Gha(_) => Ok(()),
+            Backend::Oci(b) => b.flush().await,
         }
     }
 }
