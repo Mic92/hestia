@@ -32,6 +32,7 @@ libc = "0.2"
 # Serialization (manifest = CBOR + zstd)
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
+minicbor = { version = "0.25", features = ["derive", "std"] }
 zstd = "0.13"
 
 # HTTP client (Twirp, GitHub REST, Azure blob) and substituter server
@@ -85,7 +86,5 @@ harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", 
 tokio = { version = "1", features = ["process"] }
 # Property-based tests for manifest merge laws
 proptest = "1"
-# examples/manifest_bench.rs
-minicbor = { version = "0.25", features = ["derive", "std"] }
 # Blob storage directory for the fake GHA backend
 tempfile = "3"
