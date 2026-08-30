@@ -691,6 +691,12 @@ impl FakeGha {
         self.inner.lock().unwrap().clock = unix_seconds;
     }
 
+    /// Reads the clock without advancing it.
+    pub fn clock(&self) -> hestia::pipeline::Clock {
+        let inner = self.inner.clone();
+        Arc::new(move || inner.lock().unwrap().clock)
+    }
+
     /// Refuse every reservation with a write-denied response, modelling a
     /// read-only runtime token (check_run, fork pull_request).
     pub fn deny_writes(&self) {

@@ -56,9 +56,9 @@ modified, so there is no merge conflict to resolve: concurrent drains
 simply publish one segment each.
 
 Which segments make up a root is decided by heads, empty-bodied or
-small entries whose *names* carry the claim: `h-<epoch>-<root>-<seg>`
-(a drain added a segment), `c-<epoch>-<root>-<id>` (a compaction
-replaced some), `g-<epoch>-<id>` (GC rewrote every root). A reader
+small entries whose *names* carry the claim: `h-<epoch>-<root>-<time>-<seg>`
+(a drain added a segment), `c-<epoch>-<root>-<time>-<id>` (a compaction
+replaced some), `g-<epoch>-<time>-<id>` (GC rewrote every root). A reader
 lists the heads, takes the newest GC record as the base and applies
 the drain and compaction heads published since. Between GC runs a busy
 root would pile up segments, so a drain that sees several pending folds

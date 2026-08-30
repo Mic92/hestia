@@ -175,16 +175,12 @@ impl Gc {
     pub async fn run(&self, now: u64) -> Result<GcStats, Error> {
         let mut stats = GcStats::default();
         let heads = Heads::load(&self.backend).await?;
-        if let Some(age) = heads
-            .gc
-            .as_ref()
-            .and_then(|(_, l)| l.created)
-            .map(|c| now.saturating_sub(c))
+        let prev = heads.gc.as_ref();
+        if let Some(age) = prev.map(|g| now.saturating_sub(g.time))
             && age < self.policy.min_interval
         {
             return Err(Error::TooSoon(age));
         }
-        let prev = heads.gc.as_ref().map(|(r, _)| r);
         stats.epoch = prev.map_or(0, |g| g.epoch) + 1;
 
         let mut objects = self.list("pack-").await?;
@@ -314,6 +310,7 @@ impl Gc {
             retired: retired.iter().copied().collect(),
             folded: heads.listed.iter().map(|l| l.key.clone()).collect(),
             orphan_cursor: None,
+            time: now,
         };
         self.put(&record.head_name().to_string(), record.encode())
             .await?;

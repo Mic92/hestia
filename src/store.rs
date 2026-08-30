@@ -110,8 +110,8 @@ async fn compaction_record(
 /// The head listing and what it resolves to.
 pub struct Heads {
     pub listed: Vec<Listed>,
-    /// Newest GC record whose body matches its name, and when it was written.
-    pub gc: Option<(GcRecord, Listed)>,
+    /// Newest GC record whose body matches its name.
+    pub gc: Option<GcRecord>,
     pub view: View,
 }
 
@@ -125,19 +125,17 @@ impl Heads {
         let mut gc = None;
         for name in heads::newest_gc(names()) {
             if let Some(record) = gc_record(backend, name).await? {
-                let entry = listed.iter().find(|l| l.key == name).unwrap().clone();
-                gc = Some((record, entry));
+                gc = Some(record);
                 break;
             }
         }
-        let record = gc.as_ref().map(|(r, _)| r);
         let mut compactions = HashMap::new();
-        for name in heads::compactions_to_fetch(names(), record) {
+        for name in heads::compactions_to_fetch(names(), gc.as_ref()) {
             if let Some(c) = compaction_record(backend, name).await? {
                 compactions.insert(name.to_owned(), c);
             }
         }
-        let view = View::compute(names(), record, &compactions);
+        let view = View::compute(names(), gc.as_ref(), &compactions);
         Ok(Heads { listed, gc, view })
     }
 }
@@ -219,16 +217,10 @@ impl Snapshot {
             return Ok(None);
         };
         let id = root_id(root);
-        let created = |key: &str| {
-            self.listed
-                .iter()
-                .find(|l| l.key == key)
-                .and_then(|l| l.created)
-                .unwrap_or(now)
-        };
+        let created = |key: &str| HeadName::parse(key).map_or(now, |h| h.time());
         let in_flight = self.listed.iter().any(|l| {
-            matches!(HeadName::parse(&l.key), Some(HeadName::Compaction { root, .. }) if root == id)
-                && created(&l.key) + COMPACT_WINDOW > now
+            matches!(HeadName::parse(&l.key), Some(HeadName::Compaction { root, time, .. })
+                if root == id && time + COMPACT_WINDOW > now)
         });
         // Head and segment stay paired so `subsumes` never names a head
         // whose segment `replaces` lacks.
@@ -258,6 +250,7 @@ impl Snapshot {
             added: put_segment(&self.backend, &sealed).await?,
             replaces: pending.iter().map(|(_, s)| s.digest).collect(),
             subsumes: pending.iter().map(|(n, _)| (*n).to_owned()).collect(),
+            time: now,
         };
         let name = record.head_name(self.view.epoch).to_string();
         self.backend.put(&name, record.encode().into()).await?;
@@ -576,6 +569,7 @@ pub async fn publish(
     view: &View,
     root: &str,
     sealed: &Sealed,
+    now: u64,
 ) -> Result<String, Error> {
     let digest = put_segment(backend, sealed).await?;
     let (name, body) = if view.roots.contains_key(root) {
@@ -583,6 +577,7 @@ pub async fn publish(
             HeadName::Drain {
                 base_epoch: view.epoch,
                 root: root_id(root),
+                time: now,
                 seg: digest,
             }
             .to_string(),
@@ -594,6 +589,7 @@ pub async fn publish(
             added: digest,
             replaces: vec![],
             subsumes: vec![],
+            time: now,
         };
         (record.head_name(view.epoch).to_string(), record.encode())
     };

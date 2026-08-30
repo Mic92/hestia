@@ -290,7 +290,7 @@ async fn drain_racing_gc_is_kept() {
             .await
             .unwrap();
         let sealed = writer.seal().unwrap();
-        hestia::store::publish(&sim.backend, &stale_view.view, ROOT, &sealed)
+        hestia::store::publish(&sim.backend, &stale_view.view, ROOT, &sealed, T0 + DAY)
             .await
             .unwrap();
 

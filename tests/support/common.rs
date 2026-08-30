@@ -13,7 +13,7 @@ use hestia::gha::blob;
 use hestia::gha::twirp::{Reservation, TwirpClient};
 use hestia::manifest::PathHash;
 use hestia::pathinfo::StoreDatabase;
-use hestia::pipeline::{PACK_TARGET_SIZE, PipelineContext};
+use hestia::pipeline::{PACK_TARGET_SIZE, PipelineContext, system_clock};
 use hestia::store::Snapshot;
 use hestia::upstream::UpstreamFilter;
 
@@ -31,7 +31,10 @@ pub fn pipeline_context(
     http: &reqwest::Client,
     store: StoreDatabase,
 ) -> PipelineContext {
-    pipeline_context_with(fake.backend(http), store)
+    PipelineContext {
+        clock: fake.clock(),
+        ..pipeline_context_with(fake.backend(http), store)
+    }
 }
 
 /// Same, with an explicit backend for tests that put a proxy between
@@ -47,6 +50,7 @@ pub fn pipeline_context_with(backend: Backend, store: StoreDatabase) -> Pipeline
         pack_target_size: PACK_TARGET_SIZE,
         read_only: Arc::new(AtomicBool::new(false)),
         publish: None,
+        clock: system_clock(),
     }
 }
 

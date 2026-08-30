@@ -1,13 +1,14 @@
 //! Head names, head records, and the view rule.
 //!
 //! ```text
-//! g-<epoch>-<d>                   GC head, body = GcRecord, <d> = sha256(body)
-//! h-<base_epoch>-<root>-<seg>     drain head, no body
-//! c-<base_epoch>-<root>-<d>       compaction head, body = CompactionRecord
+//! g-<epoch>-<time>-<d>                GC head, body = GcRecord, <d> = sha256(body)
+//! h-<base_epoch>-<root>-<time>-<seg>  drain head, no body
+//! c-<base_epoch>-<root>-<time>-<d>    compaction head, body = CompactionRecord
 //! ```
 //!
 //! All fields are fixed-width lowercase hex so listings sort by epoch and
-//! names fit OCI tag and cache-key alphabets. `<root>` is a 64-bit hash of
+//! names fit OCI tag and cache-key alphabets. `<time>` is the writer's
+//! unix clock, so a head's age needs no backend metadata. `<root>` is a 64-bit hash of
 //! the root name. The name itself is found in the GC record's root table
 //! or in a `c-*` body, so a brand-new root's first publish must be a `c-*`.
 
@@ -42,16 +43,19 @@ pub fn root_id(name: &str) -> RootId {
 pub enum HeadName {
     Gc {
         epoch: u64,
+        time: u64,
         digest: SegDigest,
     },
     Drain {
         base_epoch: u64,
         root: RootId,
+        time: u64,
         seg: SegDigest,
     },
     Compaction {
         base_epoch: u64,
         root: RootId,
+        time: u64,
         digest: SegDigest,
     },
 }
@@ -65,39 +69,56 @@ impl HeadName {
     pub fn parse(s: &str) -> Option<HeadName> {
         let parts: Vec<&str> = s.split('-').collect();
         Some(match parts.as_slice() {
-            ["g", e, d] => HeadName::Gc {
+            ["g", e, t, d] => HeadName::Gc {
                 epoch: hex_u64(e)?,
+                time: hex_u64(t)?,
                 digest: SegDigest::from_hex(d)?,
             },
-            ["h", e, r, d] => HeadName::Drain {
+            ["h", e, r, t, d] => HeadName::Drain {
                 base_epoch: hex_u64(e)?,
                 root: hex_u64(r)?,
+                time: hex_u64(t)?,
                 seg: SegDigest::from_hex(d)?,
             },
-            ["c", e, r, d] => HeadName::Compaction {
+            ["c", e, r, t, d] => HeadName::Compaction {
                 base_epoch: hex_u64(e)?,
                 root: hex_u64(r)?,
+                time: hex_u64(t)?,
                 digest: SegDigest::from_hex(d)?,
             },
             _ => return None,
         })
+    }
+
+    pub fn time(&self) -> u64 {
+        match self {
+            HeadName::Gc { time, .. }
+            | HeadName::Drain { time, .. }
+            | HeadName::Compaction { time, .. } => *time,
+        }
     }
 }
 
 impl fmt::Display for HeadName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HeadName::Gc { epoch, digest } => write!(f, "g-{epoch:016x}-{digest}"),
+            HeadName::Gc {
+                epoch,
+                time,
+                digest,
+            } => write!(f, "g-{epoch:016x}-{time:016x}-{digest}"),
             HeadName::Drain {
                 base_epoch,
                 root,
+                time,
                 seg,
-            } => write!(f, "h-{base_epoch:016x}-{root:016x}-{seg}"),
+            } => write!(f, "h-{base_epoch:016x}-{root:016x}-{time:016x}-{seg}"),
             HeadName::Compaction {
                 base_epoch,
                 root,
+                time,
                 digest,
-            } => write!(f, "c-{base_epoch:016x}-{root:016x}-{digest}"),
+            } => write!(f, "c-{base_epoch:016x}-{root:016x}-{time:016x}-{digest}"),
         }
     }
 }
@@ -144,6 +165,9 @@ pub struct GcRecord {
     pub folded: Vec<String>,
     #[n(5)]
     pub orphan_cursor: Option<String>,
+    /// Unix time written.
+    #[n(6)]
+    pub time: u64,
 }
 
 /// Body of `c-*`.
@@ -157,6 +181,8 @@ pub struct CompactionRecord {
     pub replaces: Vec<SegDigest>,
     #[n(3)]
     pub subsumes: Vec<String>,
+    #[n(4)]
+    pub time: u64,
 }
 
 const MAX_RECORD_BYTES: usize = 64 << 20;
@@ -182,6 +208,7 @@ impl GcRecord {
     pub fn head_name(&self) -> HeadName {
         HeadName::Gc {
             epoch: self.epoch,
+            time: self.time,
             digest: SegDigest::digest(self.encode()),
         }
     }
@@ -198,6 +225,7 @@ impl CompactionRecord {
         HeadName::Compaction {
             base_epoch,
             root: root_id(&self.root),
+            time: self.time,
             digest: SegDigest::digest(self.encode()),
         }
     }
@@ -374,6 +402,7 @@ mod tests {
         HeadName::Drain {
             base_epoch: base,
             root: root_id(root),
+            time: 0,
             seg: d(seg),
         }
         .to_string()
@@ -385,6 +414,7 @@ mod tests {
             added: d(added),
             replaces: replaces.iter().map(|b| d(*b)).collect(),
             subsumes: subsumes.iter().map(|s| s.to_string()).collect(),
+            time: 0,
         }
     }
 
@@ -397,16 +427,19 @@ mod tests {
         for h in [
             HeadName::Gc {
                 epoch: 3,
+                time: 0,
                 digest: d(1),
             },
             HeadName::Drain {
                 base_epoch: u64::MAX,
                 root: 7,
+                time: 0,
                 seg: d(2),
             },
             HeadName::Compaction {
                 base_epoch: 0,
                 root: root_id("main-x86_64-linux"),
+                time: 0,
                 digest: d(3),
             },
         ] {
@@ -419,6 +452,7 @@ mod tests {
         }
         let ok = HeadName::Gc {
             epoch: 1,
+            time: 0,
             digest: d(0xab),
         }
         .to_string();
@@ -426,7 +460,7 @@ mod tests {
             "",
             "g-1-00",
             "x-0000000000000000-",
-            "h-0000000000000000-0000000000000000",
+            "h-0000000000000000-0000000000000000-0000000000000000",
             &(ok.clone() + "-x"),
             &ok.to_uppercase(),
         ] {
@@ -436,11 +470,13 @@ mod tests {
         assert!(
             HeadName::Gc {
                 epoch: 9,
+                time: 0,
                 digest: d(0xff)
             }
             .to_string()
                 < HeadName::Gc {
                     epoch: 10,
+                    time: 0,
                     digest: d(0)
                 }
                 .to_string()
@@ -455,6 +491,7 @@ mod tests {
             g.head_name(),
             HeadName::Gc {
                 epoch: 4,
+                time: 0,
                 digest: SegDigest::digest(g.encode())
             }
         );
@@ -512,6 +549,7 @@ mod tests {
         let cn_lie = HeadName::Compaction {
             base_epoch: 5,
             root: root_id("main"),
+            time: 0,
             digest: d(99),
         }
         .to_string();
@@ -552,6 +590,7 @@ mod tests {
         let c_folded = HeadName::Compaction {
             base_epoch: 5,
             root: 0,
+            time: 0,
             digest: d(7),
         }
         .to_string();
@@ -560,18 +599,21 @@ mod tests {
         let (n4, n5) = (g4.head_name().to_string(), g5.head_name().to_string());
         let n5_clobbered = HeadName::Gc {
             epoch: 5,
+            time: 0,
             digest: d(0),
         }
         .to_string();
         let c_ok = HeadName::Compaction {
             base_epoch: 4,
             root: 0,
+            time: 0,
             digest: d(1),
         }
         .to_string();
         let c_old = HeadName::Compaction {
             base_epoch: 3,
             root: 0,
+            time: 0,
             digest: d(2),
         }
         .to_string();
