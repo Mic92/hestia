@@ -69,6 +69,6 @@ Always exits 0 (a failing post-build-hook would fail the build).
 | `GITHUB_API_URL` | gc | REST API base URL (override for GHES). |
 | `GITHUB_REF_NAME` | serve | Default for `--branch`. |
 | `GITHUB_RUN_ID` | serve | Roots written by the same workflow run merge by union (matrix legs); different runs replace each other's root. |
-| `HESTIA_OCI` | serve, gc | `<registry>/<repository>` (e.g. `ghcr.io/owner/repo/hestia`): store in that OCI registry instead of the Actions cache. Credentials from `HESTIA_OCI_USER`/`HESTIA_OCI_PASSWORD`, else `GITHUB_TOKEN` on ghcr.io, else anonymous (read-only). gc cannot delete there yet. |
+| `HESTIA_OCI` | serve, gc | `<registry>/<repository>` (e.g. `ghcr.io/owner/repo/hestia`): store in that OCI registry instead of the Actions cache. Credentials from `HESTIA_OCI_USER`/`HESTIA_OCI_PASSWORD`, else `GITHUB_TOKEN` on ghcr.io, else anonymous (read-only). gc deletes through GitHub's packages API on ghcr.io (`GITHUB_TOKEN` with `packages: write`) and by manifest digest elsewhere, where the registry's own garbage collection reclaims the blobs and a retention rule for old untagged manifests catches drains that crashed before publishing. |
 | `HESTIA_LISTEN` | prefetch | Address exported by the action for the running Hestia server. |
 | `OUT_PATHS` | hook | Set by Nix when invoking the post-build-hook. |

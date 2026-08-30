@@ -168,18 +168,6 @@ impl Gc {
         Ok(self.backend.delete(key).await?)
     }
 
-    /// Stored content objects, `None` where the backend cannot enumerate them.
-    async fn list_objects(&self) -> Result<Option<Vec<Listed>>, Error> {
-        let mut out = Vec::new();
-        for prefix in ["pack-", "seg-", "tree-"] {
-            match self.backend.list(prefix, None).await? {
-                Some(l) => out.extend(l),
-                None => return Ok(None),
-            }
-        }
-        Ok(Some(out))
-    }
-
     pub async fn run(&self, now: u64) -> Result<GcStats, Error> {
         let mut stats = GcStats::default();
         let heads = Heads::load(&self.backend).await?;
@@ -191,7 +179,7 @@ impl Gc {
         }
         stats.epoch = prev.map_or(0, |g| g.epoch) + 1;
 
-        let objects = self.list_objects().await?;
+        let objects = self.backend.list_objects().await?;
         let stored_packs: Option<HashMap<PackHash, &Listed>> = objects.as_ref().map(|o| {
             o.iter()
                 .filter_map(|l| Some((PackHash::from_hex(l.key.strip_prefix("pack-")?)?, l)))
@@ -366,6 +354,9 @@ impl Gc {
                     }
                 }
             }
+        }
+        if !self.dry_run {
+            self.backend.flush().await?;
         }
         Ok(stats)
     }

@@ -1,8 +1,10 @@
 //! An OCI distribution registry (GHCR first). Content keys are blobs at
 //! `sha256:<key suffix>`, each with a one-layer manifest so registries
 //! that hide unreferenced blobs serve them. Heads are tags on a manifest
-//! whose config blob is the record. Listing is `tags/list`, so only heads
-//! can be listed. Deleting is registry-specific and not here yet.
+//! whose config blob is the record, and every manifest names its key in
+//! an annotation. Listing is `tags/list`, so only heads can be listed,
+//! except on GHCR where the [`ghcr`](super::ghcr) ledger knows every
+//! object. Delete is `DELETE /manifests/<digest>`, or GHCR's packages API.
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
@@ -13,9 +15,10 @@ use reqwest::{RequestBuilder, Response, StatusCode, header};
 use serde::Deserialize;
 use tokio::sync::OnceCell;
 
+use super::ghcr::{Ledger, Packages};
 use super::{Error, Listed};
 use crate::gha::blob::{is_transient, status_error};
-use crate::gha::rest::ENV_GITHUB_TOKEN;
+use crate::gha::rest::{DEFAULT_API_URL, ENV_GITHUB_API_URL, ENV_GITHUB_TOKEN};
 use crate::manifest::Hash32;
 
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -23,6 +26,7 @@ const EMPTY_TYPE: &str = "application/vnd.oci.empty.v1+json";
 const EMPTY_DIGEST: &str =
     "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 const ARTIFACT_PREFIX: &str = "application/vnd.hestia.";
+const KEY_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 const TAGS_PAGE: usize = 1000;
 const TRANSIENT_RETRIES: u32 = 4;
 
@@ -39,6 +43,9 @@ pub struct Oci {
     basic: Option<(String, String)>,
     token: Arc<Mutex<Option<String>>>,
     empty_pushed: Arc<OnceCell<bool>>,
+    ghcr: Option<Packages>,
+    /// Loaded and synced on first use, written back by [`Oci::flush`].
+    ledger: Arc<OnceCell<tokio::sync::Mutex<Ledger>>>,
 }
 
 fn content_digest(key: &str) -> Option<String> {
@@ -59,15 +66,17 @@ fn descriptor(media_type: &str, digest: &str, size: usize) -> serde_json::Value 
     serde_json::json!({"mediaType": media_type, "digest": digest, "size": size})
 }
 
-/// Deterministic, so a content key's manifest digest follows from the key.
-fn manifest(kind: &str, config: Option<(&str, usize)>, layer: Option<(&str, usize)>) -> Vec<u8> {
+/// The key annotation makes every head its own manifest, so deleting one
+/// never takes another tag with it, and tells GC which key a manifest is.
+fn manifest(key: &str, config: Option<(&str, usize)>, layer: Option<(&str, usize)>) -> Vec<u8> {
     let empty = || descriptor(EMPTY_TYPE, EMPTY_DIGEST, 2);
     let m = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": MANIFEST_TYPE,
-        "artifactType": format!("{ARTIFACT_PREFIX}{kind}"),
+        "artifactType": format!("{ARTIFACT_PREFIX}{}", kind(key)),
         "config": config.map_or_else(empty, |(d, n)| descriptor("application/cbor", d, n)),
         "layers": [layer.map_or_else(empty, |(d, n)| descriptor("application/octet-stream", d, n))],
+        "annotations": {KEY_ANNOTATION: key},
     });
     serde_json::to_vec(&m).expect("json")
 }
@@ -75,6 +84,8 @@ fn manifest(kind: &str, config: Option<(&str, usize)>, layer: Option<(&str, usiz
 #[derive(Deserialize)]
 struct Manifest {
     config: Descriptor,
+    #[serde(default)]
+    annotations: std::collections::BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
 struct Descriptor {
@@ -109,9 +120,11 @@ fn parse_challenge(h: &str) -> Option<(String, Option<String>)> {
 
 impl Oci {
     /// `repo` is `<registry host>/<name>` or a full `http(s)://host/<name>`.
+    /// `github_api` (URL, token) marks the registry as GHCR.
     pub fn new(
         repo: &str,
         basic: Option<(String, String)>,
+        github_api: Option<(&str, String)>,
         http: reqwest::Client,
     ) -> Result<Self, Error> {
         let invalid = |reason: &str| Error::InvalidEnv {
@@ -128,25 +141,29 @@ impl Oci {
         if name.is_empty() || host.is_empty() {
             return Err(invalid("want <registry>/<repository>"));
         }
+        let name = name.trim_end_matches('/');
         Ok(Oci {
+            ghcr: github_api.and_then(|(api, token)| Packages::new(http.clone(), api, name, token)),
             http,
             registry: format!("{scheme}://{host}"),
-            name: name.trim_end_matches('/').to_owned(),
+            name: name.to_owned(),
             basic,
             token: Default::default(),
             empty_pushed: Default::default(),
+            ledger: Default::default(),
         })
     }
 
     pub fn from_env(repo: &str, http: reqwest::Client) -> Result<Self, Error> {
         let var = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
+        let github_token = var(ENV_GITHUB_TOKEN).filter(|_| repo.starts_with("ghcr.io/"));
         let basic = match (var(ENV_OCI_USER), var(ENV_OCI_PASSWORD)) {
             (Some(u), Some(p)) => Some((u, p)),
             // GHCR takes any user name with a token.
-            _ if repo.starts_with("ghcr.io/") => var(ENV_GITHUB_TOKEN).map(|t| ("token".into(), t)),
-            _ => None,
+            _ => github_token.clone().map(|t| ("token".into(), t)),
         };
-        Self::new(repo, basic, http)
+        let api = var(ENV_GITHUB_API_URL).unwrap_or_else(|| DEFAULT_API_URL.to_owned());
+        Self::new(repo, basic, github_token.map(|t| (api.as_str(), t)), http)
     }
 
     fn v2(&self, path: &str) -> String {
@@ -222,13 +239,7 @@ impl Oci {
     }
 
     async fn blob_exists(&self, digest: &str) -> Result<bool, Error> {
-        let url = self.v2(&format!("blobs/{digest}"));
-        let r = self.send(|| self.http.head(&url)).await?;
-        match r.status() {
-            StatusCode::OK => Ok(true),
-            StatusCode::NOT_FOUND => Ok(false),
-            _ => Err(status_error(&url, r).await),
-        }
+        Ok(self.head_size(&format!("blobs/{digest}")).await?.is_some())
     }
 
     /// POST then PUT, the one upload flow every registry has. `false` if
@@ -294,16 +305,56 @@ impl Oci {
             assert_eq!(digest, expected, "{key} does not name its content");
             let created = self.upload_blob(&digest, data.clone()).await?;
             // Also when the blob existed: heals one whose manifest never landed.
-            let m = manifest(kind(key), None, blob);
+            let m = manifest(key, None, blob);
             self.put_manifest(&sha256(&m), m).await?;
             return Ok(created);
         }
         if !data.is_empty() {
             self.upload_blob(&digest, data.clone()).await?;
         }
-        let m = manifest(kind(key), blob.filter(|_| !data.is_empty()), None);
+        let m = manifest(key, blob.filter(|_| !data.is_empty()), None);
         self.put_manifest(key, m).await?;
         Ok(true)
+    }
+
+    /// A manifest by tag or digest.
+    async fn get_manifest(&self, reference: &str) -> Result<Option<Manifest>, Error> {
+        let url = self.v2(&format!("manifests/{reference}"));
+        let r = self
+            .send(|| self.http.get(&url).header(header::ACCEPT, MANIFEST_TYPE))
+            .await?;
+        match r.status() {
+            StatusCode::NOT_FOUND => Ok(None),
+            StatusCode::OK => Ok(Some(
+                serde_json::from_slice(&r.bytes().await?)
+                    .map_err(|e| Error::InvalidResponse(format!("manifest {reference}: {e}")))?,
+            )),
+            _ => Err(status_error(&url, r).await),
+        }
+    }
+
+    /// The hestia key a manifest was written for.
+    pub(super) async fn key_of(&self, digest: &str) -> Result<Option<String>, Error> {
+        Ok(self
+            .get_manifest(digest)
+            .await?
+            .and_then(|m| m.annotations.get(KEY_ANNOTATION).cloned()))
+    }
+
+    /// `Content-Length` of a HEAD, `None` on 404.
+    async fn head_size(&self, path: &str) -> Result<Option<usize>, Error> {
+        let url = self.v2(path);
+        let r = self
+            .send(|| self.http.head(&url).header(header::ACCEPT, MANIFEST_TYPE))
+            .await?;
+        match r.status() {
+            StatusCode::OK => Ok(r
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()?.parse().ok())),
+            StatusCode::NOT_FOUND => Ok(None),
+            _ => Err(status_error(&url, r).await),
+        }
     }
 
     async fn get_blob(
@@ -344,17 +395,9 @@ impl Oci {
         if let Some(digest) = content_digest(key) {
             return self.get_blob(&digest, range).await;
         }
-        let url = self.v2(&format!("manifests/{key}"));
-        let r = self
-            .send(|| self.http.get(&url).header(header::ACCEPT, MANIFEST_TYPE))
-            .await?;
-        match r.status() {
-            StatusCode::NOT_FOUND => return Ok(None),
-            StatusCode::OK => {}
-            _ => return Err(status_error(&url, r).await),
-        }
-        let m: Manifest = serde_json::from_slice(&r.bytes().await?)
-            .map_err(|e| Error::InvalidResponse(format!("manifest {key}: {e}")))?;
+        let Some(m) = self.get_manifest(key).await? else {
+            return Ok(None);
+        };
         if m.config.digest == EMPTY_DIGEST {
             return Ok(Some(Bytes::new()));
         }
@@ -366,6 +409,36 @@ impl Oci {
             Some(d) => self.blob_exists(&d).await,
             None => Ok(self.get(key, None).await?.is_some()),
         }
+    }
+
+    async fn ledger(&self) -> Result<Option<tokio::sync::MutexGuard<'_, Ledger>>, Error> {
+        let Some(ghcr) = &self.ghcr else {
+            return Ok(None);
+        };
+        let cell = self
+            .ledger
+            .get_or_try_init(|| async {
+                let stored = self.get(super::ghcr::LEDGER_TAG, None).await?;
+                let mut ledger = Ledger::decode(&stored.unwrap_or_default());
+                ghcr.sync(self, &mut ledger).await?;
+                Ok::<_, Error>(tokio::sync::Mutex::new(ledger))
+            })
+            .await?;
+        Ok(Some(cell.lock().await))
+    }
+
+    pub async fn flush(&self) -> Result<(), Error> {
+        if let Some(cell) = self.ledger.get() {
+            let body = cell.lock().await.encode();
+            self.put(super::ghcr::LEDGER_TAG, body.into()).await?;
+        }
+        Ok(())
+    }
+
+    /// GC only: every content object with its creation time, through the
+    /// GHCR ledger. Plain registries cannot enumerate blobs.
+    pub async fn list_objects(&self) -> Result<Option<Vec<Listed>>, Error> {
+        Ok(self.ledger().await?.map(|l| l.objects()))
     }
 
     /// Tags only: blobs cannot be enumerated, so other prefixes give `None`.
@@ -413,15 +486,20 @@ impl Oci {
         }
     }
 
-    /// Heads only, by plain OCI tag DELETE. GHCR answers 405: it deletes
-    /// through its packages API, which GC will drive separately.
+    /// Deletes the key's manifest. The registry's own GC reclaims the blobs.
     pub async fn delete(&self, key: &str) -> Result<bool, Error> {
-        if content_digest(key).is_some() {
-            return Err(Error::InvalidResponse(format!(
-                "an OCI registry cannot delete {key} by name"
-            )));
+        if let (Some(ghcr), Some(mut ledger)) = (&self.ghcr, self.ledger().await?) {
+            return ghcr.delete(&mut ledger, key).await;
         }
-        let url = self.v2(&format!("manifests/{key}"));
+        // Content manifests are untagged but follow from key and blob size.
+        let reference = match content_digest(key) {
+            Some(blob) => match self.head_size(&format!("blobs/{blob}")).await? {
+                Some(size) => sha256(&manifest(key, None, Some((&blob, size)))),
+                None => return Ok(false),
+            },
+            None => key.to_owned(),
+        };
+        let url = self.v2(&format!("manifests/{reference}"));
         let r = self.send(|| self.http.delete(&url)).await?;
         match r.status() {
             StatusCode::ACCEPTED | StatusCode::OK => Ok(true),

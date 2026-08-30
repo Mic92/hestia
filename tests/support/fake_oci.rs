@@ -10,7 +10,8 @@
 //!   last-writer-wins
 //! * `tags/list` lexically ordered, paged with `n`/`last` + `Link`, and
 //!   new tags invisible for `tag_lag` further requests (GHCR ≤ 30 s)
-//! * DELETE is 405 (GHCR)
+//! * DELETE is 405, deletes go through GitHub's packages REST API on a
+//!   third origin: versions paged newest-first, delete by version id (GHCR)
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -25,11 +26,13 @@ use serde_json::json;
 
 use hestia::backend::Backend;
 use hestia::backend::oci::Oci;
+use hestia::gha::rest::format_timestamp;
 use hestia::manifest::Hash32;
 
 pub const REPO: &str = "owner/repo/hestia";
 pub const USER: &str = "ci";
 pub const PASSWORD: &str = "secret";
+pub const API_TOKEN: &str = "gh-api-token";
 const PULL_TOKEN: &str = "pull-token";
 const PUSH_TOKEN: &str = "push-token";
 
@@ -38,6 +41,11 @@ struct Inner {
     blobs: HashMap<String, Bytes>,
     next_upload: u64,
     manifests: HashMap<String, Bytes>,
+    /// manifest digest → (version id, created), GHCR's package versions
+    versions: BTreeMap<String, (u64, u64)>,
+    next_version: u64,
+    clock: u64,
+    api_calls: u64,
     /// Blob digests some manifest lists (config or layer).
     referenced: HashSet<String>,
     /// tag → (manifest digest, request count when written)
@@ -47,6 +55,85 @@ struct Inner {
     deny_push: bool,
     /// Every blob GET as (digest, Range header).
     blob_gets: Vec<(String, Option<String>)>,
+}
+
+fn api_authed(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == format!("Bearer {API_TOKEN}"))
+}
+
+/// `/orgs/{owner}/packages/container/{name}/versions[/{id}]`
+async fn api(State(state): State<AppState>, req: Request) -> Response {
+    if !api_authed(req.headers()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let (owner, pkg) = REPO.split_once('/').unwrap();
+    let prefix = format!(
+        "/orgs/{owner}/packages/container/{}/versions",
+        pkg.replace('/', "%2F")
+    );
+    let path = req.uri().path().to_owned();
+    let query = req.uri().query().unwrap_or("").to_owned();
+    let Some(rest) = path.strip_prefix(&prefix) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let param = |k: &str| -> Option<usize> {
+        query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(key, _)| *key == k)
+            .and_then(|(_, v)| v.parse().ok())
+    };
+    let mut inner = state.inner.lock().unwrap();
+    inner.api_calls += 1;
+    match (req.method().clone(), rest) {
+        (Method::GET, "") => {
+            let per_page = param("per_page").unwrap_or(30).min(100);
+            let page = param("page").unwrap_or(1).max(1);
+            let mut all: Vec<(&String, &(u64, u64))> = inner.versions.iter().collect();
+            all.sort_by_key(|(_, (id, _))| std::cmp::Reverse(*id));
+            let body: Vec<_> = all
+                .iter()
+                .skip((page - 1) * per_page)
+                .take(per_page)
+                .map(|(digest, (id, created))| {
+                    let tags: Vec<&String> = inner
+                        .tags
+                        .iter()
+                        .filter(|(_, (d, _))| d == *digest)
+                        .map(|(t, _)| t)
+                        .collect();
+                    json!({
+                        "id": id,
+                        "name": digest,
+                        "created_at": format_timestamp(*created),
+                        "metadata": {"package_type": "container", "container": {"tags": tags}},
+                    })
+                })
+                .collect();
+            Json(body).into_response()
+        }
+        (Method::DELETE, id) => {
+            let Ok(id) = id.trim_start_matches('/').parse::<u64>() else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            let Some(digest) = inner
+                .versions
+                .iter()
+                .find(|(_, (i, _))| *i == id)
+                .map(|(d, _)| d.clone())
+            else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            inner.versions.remove(&digest);
+            inner.manifests.remove(&digest);
+            inner.tags.retain(|_, (d, _)| *d != digest);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 #[derive(Clone)]
@@ -60,6 +147,7 @@ struct AppState {
 pub struct FakeOci {
     inner: Arc<Mutex<Inner>>,
     pub base_url: String,
+    pub api_url: String,
     servers: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -287,6 +375,11 @@ async fn v2(State(state): State<AppState>, req: Request) -> Response {
                 }
                 inner.referenced.extend(refs);
                 inner.manifests.insert(digest.clone(), body);
+                if !inner.versions.contains_key(&digest) {
+                    inner.next_version += 1;
+                    let v = (inner.next_version, inner.clock);
+                    inner.versions.insert(digest.clone(), v);
+                }
                 if !by_digest {
                     inner
                         .tags
@@ -367,6 +460,7 @@ impl FakeOci {
         };
         let (registry, base_url) = bind().await;
         let (cdn_listener, cdn_url) = bind().await;
+        let (api_listener, api_url) = bind().await;
         let inner = Arc::new(Mutex::new(Inner::default()));
         let state = AppState {
             inner: inner.clone(),
@@ -379,14 +473,17 @@ impl FakeOci {
             .with_state(state.clone());
         let cdn_router = Router::new()
             .route("/cdn/{*digest}", get(cdn))
-            .with_state(state);
+            .with_state(state.clone());
+        let api_router = Router::new().fallback(api).with_state(state);
         let servers = vec![
             tokio::spawn(async move { axum::serve(registry, router).await.unwrap() }),
             tokio::spawn(async move { axum::serve(cdn_listener, cdn_router).await.unwrap() }),
+            tokio::spawn(async move { axum::serve(api_listener, api_router).await.unwrap() }),
         ];
         FakeOci {
             inner,
             base_url,
+            api_url,
             servers,
         }
     }
@@ -395,11 +492,26 @@ impl FakeOci {
         format!("{}/{REPO}", self.base_url)
     }
 
+    /// Push credentials plus the packages API, like a GHCR job token.
     pub fn backend(&self, http: &reqwest::Client) -> Backend {
         Backend::Oci(
             Oci::new(
                 &self.repo(),
                 Some((USER.into(), PASSWORD.into())),
+                Some((&self.api_url, API_TOKEN.into())),
+                http.clone(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Push credentials on a registry without a delete side channel.
+    pub fn plain(&self, http: &reqwest::Client) -> Backend {
+        Backend::Oci(
+            Oci::new(
+                &self.repo(),
+                Some((USER.into(), PASSWORD.into())),
+                None,
                 http.clone(),
             )
             .unwrap(),
@@ -407,7 +519,33 @@ impl FakeOci {
     }
 
     pub fn anonymous(&self, http: &reqwest::Client) -> Backend {
-        Backend::Oci(Oci::new(&self.repo(), None, http.clone()).unwrap())
+        Backend::Oci(Oci::new(&self.repo(), None, None, http.clone()).unwrap())
+    }
+
+    pub fn set_clock(&self, unix_seconds: u64) {
+        self.inner.lock().unwrap().clock = unix_seconds;
+    }
+
+    pub fn clock(&self) -> hestia::pipeline::Clock {
+        let inner = self.inner.clone();
+        Arc::new(move || inner.lock().unwrap().clock)
+    }
+
+    /// Package versions (manifests) whose hestia key starts with `prefix`.
+    pub fn versions(&self, prefix: &str) -> usize {
+        let inner = self.inner.lock().unwrap();
+        let needle = format!("\"org.opencontainers.image.ref.name\":\"{prefix}");
+        inner
+            .versions
+            .keys()
+            .filter(|d| {
+                std::str::from_utf8(&inner.manifests[*d]).is_ok_and(|m| m.contains(&needle))
+            })
+            .count()
+    }
+
+    pub fn api_calls(&self) -> u64 {
+        self.inner.lock().unwrap().api_calls
     }
 
     /// New tags stay out of `tags/list` for this many further requests.

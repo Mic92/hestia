@@ -20,7 +20,7 @@ use tokio::time::Instant;
 use crate::gha::Error;
 
 /// Default GitHub API endpoint; `GITHUB_API_URL` overrides it (GHES).
-const DEFAULT_API_URL: &str = "https://api.github.com";
+pub const DEFAULT_API_URL: &str = "https://api.github.com";
 
 pub const ENV_GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 pub const ENV_GITHUB_REPOSITORY: &str = "GITHUB_REPOSITORY";

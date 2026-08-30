@@ -11,7 +11,7 @@ use hestia::gc::{Error as GcError, GcPolicy, SECS_PER_DAY, SECS_PER_HOUR};
 use hestia::store::Heads;
 
 use support::fake_gha::FakeGha;
-use support::sim::{SimCache, SimPath, last_accessed, one_byte_reads};
+use support::sim::{SimCache, SimPath, one_byte_reads};
 
 const T0: u64 = 1_750_000_000;
 const DAY: u64 = SECS_PER_DAY;
@@ -29,6 +29,11 @@ async fn setup() -> (FakeGha, SimCache) {
     fake.set_clock(T0);
     let sim = SimCache::new(&fake, &reqwest::Client::new());
     (fake, sim)
+}
+
+async fn stored_pack_bytes(fake: &FakeGha, sim: &SimCache) -> u64 {
+    let packs = fake.rest(&sim.http).list_caches("pack-").await.unwrap();
+    packs.iter().map(|e| e.size_in_bytes).sum()
 }
 
 #[tokio::test]
@@ -123,7 +128,7 @@ async fn dropped_path_gets_repacked_away() {
         let drop = SimPath::new("drop", 2, 600_000);
         sim.push(ROOT, &[&keep, &drop], &[&keep, &drop]).await;
         assert_eq!(sim.stored_keys("pack-").await.len(), 1);
-        let both = sim.stored_pack_bytes().await;
+        let both = stored_pack_bytes(&fake, &sim).await;
 
         sim.run_gc(GcPolicy::default(), T0 + 2 * HOUR).await;
         fake.set_clock(T0 + DAY);
@@ -142,7 +147,7 @@ async fn dropped_path_gets_repacked_away() {
         fake.set_clock(T0 + 3 * DAY);
         sim.run_gc(GcPolicy::default(), T0 + 3 * DAY).await;
         assert_eq!(sim.stored_keys("pack-").await.len(), 1);
-        assert!(sim.stored_pack_bytes().await < both / 2);
+        assert!(stored_pack_bytes(&fake, &sim).await < both / 2);
         sim.assert_readable(&[&keep]).await;
         sim.assert_no_dangling_references().await;
     })
@@ -193,7 +198,7 @@ async fn evicted_pack_drops_its_paths_and_a_repush_restores_them() {
             let r = snap.resolve(&a.path_hash()).await.unwrap().unwrap();
             hestia::chunker::pack_cache_key(&r.map.chunks.values().next().unwrap().pack)
         };
-        sim.rest.delete_by_key(&a_pack).await.unwrap();
+        sim.backend.delete(&a_pack).await.unwrap();
 
         let stats = sim.run_gc(GcPolicy::default(), T0 + 2 * HOUR).await;
         assert_eq!((stats.packs_evicted, stats.paths_dropped), (1, 1));
@@ -244,7 +249,8 @@ async fn idle_live_packs_are_touched() {
         let stats = sim.run_gc(GcPolicy::default(), now).await;
         assert_eq!(stats.touched, 1);
         assert_eq!(one_byte_reads(&fake, &pack), 1);
-        assert!(last_accessed(&sim.rest, &pack).await.unwrap() >= now);
+        let entry = fake.rest(&sim.http).list_caches(&pack).await.unwrap();
+        assert!(entry[0].last_accessed_unix().unwrap() >= now);
     })
     .await;
 }
@@ -375,7 +381,7 @@ async fn thirty_day_history_converges_to_live_set_storage() {
         sim.assert_unavailable(&feature.iter().collect::<Vec<_>>())
             .await;
         let live = sim.live_chunk_bytes().await;
-        let stored = sim.stored_pack_bytes().await;
+        let stored = stored_pack_bytes(&fake, &sim).await;
         assert!(
             stored <= live * 2,
             "storage {stored} should converge towards the live set {live}"

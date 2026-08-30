@@ -8,12 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use hestia::gc::GcPolicy;
 use hestia::manifest::Hash32;
 use hestia::pipeline::AccessLog;
 use hestia::store::Snapshot;
 use hestia::substituter::{ManifestStore, Substituter};
 use support::common::{TEST_ROOT_KEY, pipeline_context_with, to_path_set};
 use support::fake_oci::FakeOci;
+use support::sim::{SimCache, SimPath};
 use support::store::{ScratchStore, assert_trees_equal, nix_copy};
 
 async fn timed<T>(f: impl std::future::Future<Output = T>) -> T {
@@ -234,6 +236,99 @@ async fn drain_and_nix_copy_over_oci() {
         );
         assert_trees_equal(&top, &destination.physical_path(&top));
         assert_trees_equal(&dep, &destination.physical_path(&dep));
+    })
+    .await;
+}
+
+const T0: u64 = 1_750_000_000;
+const HOUR: u64 = 3600;
+
+/// Two roots drained over OCI, one abandoned. GC over the GHCR packages
+/// API folds heads, and the run after sweeps the retired segments and the
+/// expired root's packs plus an orphan by version id.
+#[tokio::test]
+async fn gc_over_ghcr_deletes_by_version_id() {
+    timed(async {
+        let fake = FakeOci::start().await;
+        let http = reqwest::Client::new();
+        fake.set_clock(T0);
+        let sim = SimCache::with(fake.backend(&http), fake.clock());
+        let a = SimPath::new("a", 1, 200_000);
+        let b = SimPath::new("b", 3, 200_000);
+        let gone = SimPath::new("gone", 5, 200_000);
+        sim.push("main", &[&a], &[&a]).await;
+        sim.push("main", &[&b], &[&a, &b]).await;
+        sim.push("old", &[&gone], &[&gone]).await;
+        sim.upload_orphan_pack(9).await;
+        assert_eq!(fake.versions("pack-"), 4);
+        assert_eq!(fake.versions("seg-"), 3);
+
+        let policy = GcPolicy {
+            root_ttl: 24 * HOUR,
+            ..GcPolicy::default()
+        };
+        fake.set_clock(T0 + 2 * HOUR);
+        let stats = sim.run_gc(policy.clone(), T0 + 2 * HOUR).await;
+        assert_eq!((stats.roots, stats.deleted), (2, 4), "{stats:?}");
+        assert_eq!(
+            fake.versions("pack-"),
+            3,
+            "orphan swept via the ledger listing"
+        );
+        assert!(fake.tags().iter().any(|t| t == "x-ledger"));
+        sim.assert_readable(&[&a, &b, &gone]).await;
+
+        // A day on only main is drained: old expires, its pack goes, and
+        // the segments the first run merged away are swept.
+        fake.set_clock(T0 + 30 * HOUR);
+        sim.push("main", &[], &[&a, &b]).await;
+        let calls = fake.api_calls();
+        let stats = sim.run_gc(policy, T0 + 30 * HOUR).await;
+        assert_eq!(stats.roots_expired, 1, "{stats:?}");
+        sim.assert_readable(&[&a, &b]).await;
+        assert_eq!(fake.versions("pack-"), 3, "old's pack waits one epoch");
+        assert_eq!(
+            fake.versions("seg-"),
+            2,
+            "main's merged segment and old's, retired"
+        );
+        assert!(
+            fake.api_calls() - calls < 20,
+            "ledger resumes: one versions page plus deletes, got {}",
+            fake.api_calls() - calls
+        );
+        fake.set_clock(T0 + 60 * HOUR);
+        let stats = sim.run_gc(GcPolicy::default(), T0 + 60 * HOUR).await;
+        assert!(stats.deleted >= 2, "{stats:?}");
+        assert_eq!(fake.versions("pack-"), 2);
+        assert_eq!(fake.versions("seg-"), 1);
+        sim.assert_readable(&[&a, &b]).await;
+    })
+    .await;
+}
+
+/// Without a packages API GC deletes manifests over plain OCI (405 on the
+/// fake, like GHCR) and cannot list, so it must still complete and serve.
+#[tokio::test]
+async fn gc_over_plain_registry_survives_refused_deletes() {
+    timed(async {
+        let fake = FakeOci::start().await;
+        let http = reqwest::Client::new();
+        fake.set_clock(T0);
+        let sim = SimCache::with(fake.plain(&http), fake.clock());
+        let a = SimPath::new("a", 1, 100_000);
+        sim.push("main", &[&a], &[&a]).await;
+        sim.push("main", &[], &[&a]).await;
+        let err = sim
+            .gc(GcPolicy::default())
+            .run(T0 + 2 * HOUR)
+            .await
+            .expect_err("head delete is refused");
+        assert!(err.to_string().contains("405"), "{err}");
+        // The record landed before the sweep, so readers see the GC'd view.
+        let snap = sim.snapshot().await;
+        assert_eq!(snap.view.roots["main"].len(), 1);
+        sim.assert_readable(&[&a]).await;
     })
     .await;
 }
