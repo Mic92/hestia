@@ -220,6 +220,7 @@ All inputs are optional; the defaults work for the quick start above.
 | `upstream-cache-key-names` | `cache.nixos.org-1` | Space-separated key names treated as upstream caches by the filter. |
 | `filter-drv-closures` | `false` | Apply the upstream filter to registered derivation closures; requires `upstream-cache-filter`. Use `hestia prefetch` for bulk closure fetching. |
 | `oci` | — | `<registry>/<repository>` (e.g. `ghcr.io/OWNER/REPO/hestia`): store in an OCI registry instead of the Actions cache. On ghcr.io the job token is the credential (`packages: write` to upload, public packages substitute anonymously). GC needs `packages: write` there. Other registries must accept manifest deletes and run their own blob GC. |
+| `s3`, `s3-endpoint` | — | `s3://BUCKET/PREFIX` (plus an endpoint URL for MinIO, R2, Garage, Ceph, ...): store in an S3-compatible bucket. Credentials from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` in `env`. Jobs without credentials substitute if the bucket allows public reads. |
 | `read-only` | `false` | Substitute from the cache but never write to it (no post-build-hook, no drain). |
 | `no-closure` | `false` | Cache built paths only, without their runtime closure. |
 

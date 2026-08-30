@@ -45,6 +45,12 @@ hestia creates three kinds of cache entry, all write-once: pack blobs
 and heads (`g-*`, `h-*`, `c-*`). Everything but a head is named by the
 SHA-256 of its bytes, so the same names work as OCI blob digests.
 
+The same objects go into one of three stores: the Actions cache (the
+default, evicts by LRU), an OCI registry (blobs plus one manifest each,
+heads as tags) or an S3-compatible bucket (`pack/<xx>/`, `seg/`,
+`heads/` under a prefix). The rest of this document is store-agnostic:
+a store only needs put, ranged get, list by prefix and delete.
+
 ### Segments and heads
 
 A segment is what one writer published for one root: `.meta` holds a
