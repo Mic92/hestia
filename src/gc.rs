@@ -168,8 +168,16 @@ impl Gc {
         Ok(self.backend.delete(key).await?)
     }
 
-    async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
-        Ok(self.backend.list(prefix, None).await?.expect("unbounded"))
+    /// Stored content objects, `None` where the backend cannot enumerate them.
+    async fn list_objects(&self) -> Result<Option<Vec<Listed>>, Error> {
+        let mut out = Vec::new();
+        for prefix in ["pack-", "seg-", "tree-"] {
+            match self.backend.list(prefix, None).await? {
+                Some(l) => out.extend(l),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
     }
 
     pub async fn run(&self, now: u64) -> Result<GcStats, Error> {
@@ -183,14 +191,12 @@ impl Gc {
         }
         stats.epoch = prev.map_or(0, |g| g.epoch) + 1;
 
-        let mut objects = self.list("pack-").await?;
-        objects.extend(self.list("seg-").await?);
-        objects.extend(self.list("tree-").await?);
-        let stored_packs: HashMap<PackHash, &Listed> = objects
-            .iter()
-            .filter(|l| l.key.starts_with("pack-"))
-            .filter_map(|l| Some((PackHash::from_hex(&l.key[5..])?, l)))
-            .collect();
+        let objects = self.list_objects().await?;
+        let stored_packs: Option<HashMap<PackHash, &Listed>> = objects.as_ref().map(|o| {
+            o.iter()
+                .filter_map(|l| Some((PackHash::from_hex(l.key.strip_prefix("pack-")?)?, l)))
+                .collect()
+        });
 
         // Roots: a drain's segment names every path it wants kept, so once
         // any drain published, the previous GC segment is not an input.
@@ -249,11 +255,14 @@ impl Gc {
                     .add(&row.live_bits);
             }
         }
-        let mut lost: BTreeSet<PackHash> = usage
-            .keys()
-            .filter(|p| !stored_packs.contains_key(p))
-            .copied()
-            .collect();
+        let mut lost: BTreeSet<PackHash> = match &stored_packs {
+            Some(stored) => usage
+                .keys()
+                .filter(|p| !stored.contains_key(p))
+                .copied()
+                .collect(),
+            None => BTreeSet::new(),
+        };
         stats.packs_evicted = lost.len();
         for p in &lost {
             eprintln!("hestia gc: pack {p} was evicted, dropping the paths that need it");
@@ -316,31 +325,37 @@ impl Gc {
             .await?;
 
         // Sweep. This run's inputs and their packs stay one more epoch: a
-        // reader may hold the previous view. Anything else unreferenced and
-        // older than `min_age` goes, which covers what the last run retired.
+        // reader may hold the previous view. What the last run retired goes
+        // now, and where the backend can list, so does anything else
+        // unreferenced and older than `min_age` (drains that never published).
         for d in &retired {
             if let Some(body) = self.backend.get(&meta_key(d), None).await? {
                 keep.extend(object_keys(d, &Meta::open(&body)?));
             }
         }
-        for l in &objects {
-            let referenced = keep.contains(&l.key);
-            let old = l
-                .created
-                .is_some_and(|c| now.saturating_sub(c) > self.policy.min_age);
-            if !referenced && old && self.delete(&l.key).await? {
-                stats.deleted += 1;
+        let mut sweep: BTreeSet<String> = BTreeSet::new();
+        for d in prev.into_iter().flat_map(|g| &g.retired) {
+            if let Some(body) = self.backend.get(&meta_key(d), None).await? {
+                sweep.extend(object_keys(d, &Meta::open(&body)?));
             }
         }
-        for name in &record.folded {
-            if self.delete(name).await? {
+        for l in objects.iter().flatten() {
+            if l.created
+                .is_some_and(|c| now.saturating_sub(c) > self.policy.min_age)
+            {
+                sweep.insert(l.key.clone());
+            }
+        }
+        sweep.extend(record.folded.iter().cloned());
+        for key in sweep.difference(&keep) {
+            if self.delete(key).await? {
                 stats.deleted += 1;
             }
         }
 
-        if !self.dry_run {
+        if let Some(stored) = stored_packs.filter(|_| !self.dry_run) {
             for hash in &live_packs {
-                let idle = stored_packs
+                let idle = stored
                     .get(hash)
                     .and_then(|l| l.last_accessed)
                     .map_or(0, |t| now.saturating_sub(t));
