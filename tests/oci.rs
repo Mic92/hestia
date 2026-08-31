@@ -210,9 +210,14 @@ async fn drain_and_nix_copy_over_oci() {
 
         // Substitution needs no credentials.
         let backend = fake.anonymous(&http);
-        let snapshot = Snapshot::load(backend.clone(), &[TEST_ROOT_KEY.to_string()], None)
-            .await
-            .unwrap();
+        let snapshot = Snapshot::load(
+            backend.clone(),
+            hestia::trust::Trust::open(),
+            &[TEST_ROOT_KEY.to_string()],
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(snapshot.path_count(), 2);
         let manifest_store = ManifestStore::new();
         manifest_store.set_snapshot(Arc::new(snapshot));

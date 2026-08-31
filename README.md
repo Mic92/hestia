@@ -220,6 +220,7 @@ All inputs are optional; the defaults work for the quick start above.
 | `upstream-cache-key-names` | `cache.nixos.org-1` | Space-separated key names treated as upstream caches by the filter. |
 | `filter-drv-closures` | `false` | Apply the upstream filter to registered derivation closures; requires `upstream-cache-filter`. Use `hestia prefetch` for bulk closure fetching. |
 | `oci` | — | `<registry>/<repository>` (e.g. `ghcr.io/OWNER/REPO/hestia`): store in an OCI registry instead of the Actions cache. On ghcr.io the job token is the credential (`packages: write` to upload, public packages substitute anonymously). GC needs `packages: write` there. Other registries must accept manifest deletes and run their own blob GC. |
+| `trust`, `trust-rows`, `sign` | `open` | Head provenance, see [Security](#stores-without-scopes-head-provenance). `strict`: default-branch roots and GC only from default-branch workflows. `same-repo`: any workflow of this repository. Needs `id-token: write` and cosign. |
 | `s3`, `s3-endpoint` | — | `s3://BUCKET/PREFIX` (plus an endpoint URL for MinIO, R2, Garage, Ceph, ...): store in an S3-compatible bucket. Credentials from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` in `env`. Jobs without credentials substitute if the bucket allows public reads. |
 | `read-only` | `false` | Substitute from the cache but never write to it (no post-build-hook, no drain). |
 | `no-closure` | `false` | Cache built paths only, without their runtime closure. |
@@ -301,6 +302,18 @@ when the branch is deleted. In practice this means:
   bounded by the 10 GB repository quota that GitHub evicts by LRU anyway.
 * `pull_request_target` / fork PRs never get write tokens for the base
   scope; the standard GitHub Actions security guidance applies unchanged.
+
+### Stores without scopes: head provenance
+
+An OCI registry or S3 bucket has no per-branch scopes: anyone who can
+push can publish a head into `main-*`. With `trust: strict` (or
+`same-repo`) every head carries a [cosign](https://github.com/sigstore/cosign)
+bundle, keyless from the job's OIDC token by default, and readers and GC
+ignore heads whose signer the policy does not list for that root. A PR
+job can then still fill its own root and waste space, but cannot put a
+path into a `main` build or hide one from it. Keys instead of OIDC
+(`sign: --key awskms://...`, a Hydra pushing with a file key) are extra
+`trust-rows`. On GitHub verification uses the preinstalled `gh`, signing jobs get cosign from the action.
 
 ### What hestia itself enforces
 

@@ -53,6 +53,7 @@ use crate::pipeline::{self, AccessLog, PipelineContext};
 use crate::protocol::{DrainStats, Request, Response, encode_line};
 use crate::store::Snapshot;
 use crate::substituter::{ManifestStore, Substituter, verify_packs};
+use crate::trust::Trust;
 use crate::upstream::UpstreamFilter;
 
 /// How often the idle-exit timer checks for inactivity.
@@ -416,9 +417,14 @@ impl Daemon {
 }
 
 /// Load what the heads of `roots` publish into the served store.
-async fn load_published(backend: &Backend, manifest_store: &ManifestStore, roots: &[String]) {
+async fn load_published(
+    backend: &Backend,
+    trust: &Trust,
+    manifest_store: &ManifestStore,
+    roots: &[String],
+) {
     let previous = manifest_store.snapshot();
-    match Snapshot::load(backend.clone(), roots, previous.as_deref()).await {
+    match Snapshot::load(backend.clone(), trust.clone(), roots, previous.as_deref()).await {
         Ok(snapshot) => manifest_store.set_snapshot(Arc::new(snapshot)),
         Err(err) => eprintln!(
             "hestia serve: cannot list heads, substituting nothing (grant `actions: read`): {err}"
@@ -548,6 +554,13 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let trust = match Trust::from_env() {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("hestia serve: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Store database: fail fast if unreadable; a daemon that can never
     // drain is worse than a failed step.
@@ -588,6 +601,7 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     serve_roots.dedup();
     let pipeline = PipelineContext {
         backend: backend.clone(),
+        trust: trust.clone(),
         store,
         upstream,
         expand_closure: !args.no_closure,
@@ -650,13 +664,17 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     .with_manifest_ready(manifest_ready_rx)
     .with_manifest_reload({
         let backend = backend.clone();
+        let trust = trust.clone();
         let manifest_store = manifest_store.clone();
         let serve_roots = serve_roots.clone();
         Arc::new(move || {
             let backend = backend.clone();
             let manifest_store = manifest_store.clone();
             let serve_roots = serve_roots.clone();
-            Box::pin(async move { load_published(&backend, &manifest_store, &serve_roots).await })
+            let trust = trust.clone();
+            Box::pin(async move {
+                load_published(&backend, &trust, &manifest_store, &serve_roots).await
+            })
         })
     });
     let substituter_task = tokio::spawn(async move {
@@ -672,10 +690,11 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     // load failure both mean "serve nothing until the first drain".
     let load_task = {
         let backend = backend.clone();
+        let trust = trust.clone();
         let manifest_store = manifest_store.clone();
         let wait_head = args.wait_head.clone();
         tokio::spawn(async move {
-            let reload = || load_published(&backend, &manifest_store, &serve_roots);
+            let reload = || load_published(&backend, &trust, &manifest_store, &serve_roots);
             wait_for_head(&manifest_store, wait_head.as_deref(), reload).await;
             let _ = manifest_ready_tx.send(true);
             verify_packs(&backend, &manifest_store, MAX_PACK_VERIFY_ENTRIES).await;

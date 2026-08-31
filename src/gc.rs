@@ -14,6 +14,7 @@ use crate::manifest::{ChunkHash, PackHash, SegDigest};
 use crate::pipeline::{now_unix, upload_pack};
 use crate::segment::{self, Meta, PackRow, Relocated, Tree};
 use crate::store::{self, Heads, fetch_pack_index, meta_key, tree_key};
+use crate::trust::Trust;
 
 pub const SECS_PER_HOUR: u64 = 3_600;
 pub const SECS_PER_DAY: u64 = 86_400;
@@ -24,6 +25,8 @@ pub enum Error {
     Backend(#[from] backend::Error),
     #[error(transparent)]
     Store(#[from] store::Error),
+    #[error(transparent)]
+    Trust(#[from] crate::trust::Error),
     #[error(transparent)]
     Segment(#[from] segment::Error),
     #[error(transparent)]
@@ -77,6 +80,7 @@ pub struct GcStats {
 
 pub struct Gc {
     pub backend: Backend,
+    pub trust: Trust,
     pub policy: GcPolicy,
     pub dry_run: bool,
 }
@@ -170,7 +174,7 @@ impl Gc {
 
     pub async fn run(&self, now: u64) -> Result<GcStats, Error> {
         let mut stats = GcStats::default();
-        let heads = Heads::load(&self.backend).await?;
+        let heads = Heads::load(&self.backend, &self.trust).await?;
         let prev = heads.gc.as_ref();
         if let Some(age) = prev.map(|g| now.saturating_sub(g.time))
             && age < self.policy.min_interval
@@ -309,8 +313,8 @@ impl Gc {
             orphan_cursor: None,
             time: now,
         };
-        self.put(&record.head_name().to_string(), record.encode())
-            .await?;
+        let body = store::signed(&self.trust, record.encode()).await?;
+        self.put(&record.head_name(&body).to_string(), body).await?;
 
         // Sweep. This run's inputs and their packs stay one more epoch: a
         // reader may hold the previous view. What the last run retired goes
@@ -451,8 +455,16 @@ pub async fn run(args: &GcArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let trust = match Trust::from_env() {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("hestia gc: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let gc = Gc {
         backend,
+        trust,
         policy: GcPolicy {
             root_ttl: args.root_ttl * SECS_PER_DAY,
             touch_age: args.touch_age * SECS_PER_DAY,

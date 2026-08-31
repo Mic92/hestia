@@ -383,6 +383,79 @@ function serveFlags() {
   return flags;
 }
 
+const COSIGN_VERSION = 'v3.1.3';
+const COSIGN_SHA256 = {
+  'cosign-linux-amd64': '4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71',
+  'cosign-linux-arm64': 'c5d324e091826b0d7a78eb16fef316450b4eb9aaec045611c08ba06f5e73220a',
+  'cosign-darwin-amd64': '2347488e5d5b25336644024dfeca5601b190e91197a71a917bda44744aff106c',
+  'cosign-darwin-arm64': '5cf948c2f4dfe59687bdd0b8523709067383e03982cc543475c8a7dc70e92a76',
+};
+
+/** cosign into installDir unless already on PATH (signing only, gh verifies). */
+async function installCosign(installDir) {
+  const found = (process.env.PATH || '')
+    .split(path.delimiter)
+    .some((d) => d && fs.existsSync(path.join(d, 'cosign')));
+  if (found) {
+    return;
+  }
+  const arch = { x64: 'amd64', arm64: 'arm64' }[process.arch];
+  const asset = `cosign-${process.platform}-${arch}`;
+  const expected = COSIGN_SHA256[asset];
+  if (!expected) {
+    fail(`trust: no pinned cosign for ${asset}, install cosign yourself`);
+  }
+  const url = `https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${asset}`;
+  console.log(`hestia-cache: downloading ${url}`);
+  const response = await fetch(url, { redirect: 'follow' });
+  if (!response.ok) {
+    fail(`download failed: HTTP ${response.status} for ${url}`);
+  }
+  const data = Buffer.from(await response.arrayBuffer());
+  const digest = crypto.createHash('sha256').update(data).digest('hex');
+  if (digest !== expected) {
+    fail(`cosign checksum mismatch: ${digest}`);
+  }
+  const target = path.join(installDir, 'cosign');
+  fs.writeFileSync(target, data);
+  fs.chmodSync(target, 0o755);
+}
+
+/**
+ * Export HESTIA_TRUST and HESTIA_SIGN from the `trust` preset, verified
+ * with the runner's `gh` against this repository's keyless identities.
+ */
+async function trustEnv(installDir) {
+  const preset = getInput('trust') || 'open';
+  const extra = getInput('trust-rows');
+  if (preset === 'open' && !extra) {
+    return;
+  }
+  const repo = process.env.GITHUB_REPOSITORY;
+  let defaultBranch = 'main';
+  try {
+    const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+    defaultBranch = event.repository?.default_branch || defaultBranch;
+  } catch {}
+  const anyRef = `gh --repo ${repo}`;
+  const onDefault = `${anyRef} --source-ref refs/heads/${defaultBranch}`;
+  const rows = extra ? extra.split('\n').map((l) => l.trim()).filter(Boolean) : [];
+  if (preset === 'strict') {
+    rows.push(`${defaultBranch}-* ${onDefault}`, `@gc ${onDefault}`, `* ${anyRef}`);
+  } else if (preset === 'same-repo') {
+    rows.push(`@gc ${anyRef}`, `* ${anyRef}`);
+  } else if (preset !== 'open') {
+    throw new Error(`trust: unknown preset ${preset}`);
+  }
+  exportVariable('HESTIA_TRUST', rows.join('\n'));
+  const sign = getInput('sign');
+  if (sign !== 'none' && !readOnly()) {
+    await installCosign(installDir);
+    process.env.PATH = `${installDir}${path.delimiter}${process.env.PATH || ''}`;
+    exportVariable('HESTIA_SIGN', sign);
+  }
+}
+
 /** Start `hestia serve` detached so it outlives this action step. */
 function startDaemon(hestiaBin, listen, socket, logFile) {
   const log = fs.openSync(logFile, 'a');
@@ -456,6 +529,16 @@ async function waitForReadiness(listen, logFile, pid) {
 async function main() {
   captureTokens();
 
+  // Unique per invocation: a job can run this action more than once, and a
+  // shared directory would overwrite the first daemon's binary and log.
+  const tempDir = process.env.RUNNER_TEMP || '/tmp';
+  fs.mkdirSync(tempDir, { recursive: true });
+  const installDir = fs.mkdtempSync(path.join(tempDir, 'hestia-cache-'));
+  const logFile = path.join(installDir, 'serve.log');
+  fs.appendFileSync(process.env.GITHUB_PATH, `${installDir}\n`);
+  // Also in token-capture mode: a later `hestia gc` verifies and signs.
+  await trustEnv(installDir);
+
   const binary = getInput('binary');
   const version = getInput('version');
   if (!binary && !version) {
@@ -465,13 +548,6 @@ async function main() {
     );
     return;
   }
-
-  // Unique per invocation: a job can run this action more than once, and a
-  // shared directory would overwrite the first daemon's binary and log.
-  const tempDir = process.env.RUNNER_TEMP || '/tmp';
-  fs.mkdirSync(tempDir, { recursive: true });
-  const installDir = fs.mkdtempSync(path.join(tempDir, 'hestia-cache-'));
-  const logFile = path.join(installDir, 'serve.log');
 
   // Like installDir, the defaults are unique per invocation: a fixed
   // address/socket would make a second invocation unlink the first
@@ -495,7 +571,6 @@ async function main() {
   exportVariable('HESTIA_LISTEN', listen);
   exportVariable('HESTIA_DRAIN_TIMEOUT', getInput('drain-timeout') || '300');
   exportVariable('HESTIA_SERVE_LOG', logFile);
-  fs.appendFileSync(process.env.GITHUB_PATH, `${installDir}\n`);
 
   // State for this invocation's own post step.
   saveState('bin', hestiaBin);

@@ -1,9 +1,9 @@
 //! Head names, head records, and the view rule.
 //!
 //! ```text
-//! g-<epoch>-<time>-<d>                GC head, body = GcRecord, <d> = sha256(body)
-//! h-<base_epoch>-<root>-<time>-<seg>  drain head, no body
-//! c-<base_epoch>-<root>-<time>-<d>    compaction head, body = CompactionRecord
+//! g-<epoch>-<time>-<d>                GC head, body = Signed(GcRecord), <d> = sha256(body)
+//! h-<base_epoch>-<root>-<time>-<seg>  drain head, body = proof over the name (may be empty)
+//! c-<base_epoch>-<root>-<time>-<d>    compaction head, body = Signed(CompactionRecord)
 //! ```
 //!
 //! All fields are fixed-width lowercase hex so listings sort by epoch and
@@ -185,6 +185,31 @@ pub struct CompactionRecord {
     pub time: u64,
 }
 
+/// Body of `g-*` and `c-*`.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct Signed {
+    #[cbor(n(0), with = "minicbor::bytes")]
+    pub record: Vec<u8>,
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub proof: Vec<u8>,
+}
+
+impl Signed {
+    pub fn unsigned(record: Vec<u8>) -> Vec<u8> {
+        Signed {
+            record,
+            proof: vec![],
+        }
+        .encode()
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        minicbor::to_vec(self).expect("Vec write")
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Signed, Error> {
+        decode_record(bytes)
+    }
+}
+
 const MAX_RECORD_BYTES: usize = 64 << 20;
 
 fn decode_record<'a, T: Decode<'a, ()>>(bytes: &'a [u8]) -> Result<T, Error> {
@@ -205,11 +230,11 @@ impl GcRecord {
         }
         Ok(r)
     }
-    pub fn head_name(&self) -> HeadName {
+    pub fn head_name(&self, body: &[u8]) -> HeadName {
         HeadName::Gc {
             epoch: self.epoch,
             time: self.time,
-            digest: SegDigest::digest(self.encode()),
+            digest: SegDigest::digest(body),
         }
     }
 }
@@ -221,33 +246,29 @@ impl CompactionRecord {
     pub fn decode(bytes: &[u8]) -> Result<CompactionRecord, Error> {
         decode_record(bytes)
     }
-    pub fn head_name(&self, base_epoch: u64) -> HeadName {
+    pub fn head_name(&self, base_epoch: u64, body: &[u8]) -> HeadName {
         HeadName::Compaction {
             base_epoch,
             root: root_id(&self.root),
             time: self.time,
-            digest: SegDigest::digest(self.encode()),
+            digest: SegDigest::digest(body),
         }
     }
 }
 
 // ---------------------------------------------------------------- view
 
-/// `g-*` names at the highest epoch. More than one means a clobbered tag or
-/// a re-run after eviction. The caller keeps the one whose body matches its digest.
+/// `g-*` names, highest epoch first.
 pub fn newest_gc<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
-    let gcs: Vec<(u64, &str)> = names
+    let mut gcs: Vec<(u64, &str)> = names
         .into_iter()
         .filter_map(|n| match HeadName::parse(n)? {
             HeadName::Gc { epoch, .. } => Some((epoch, n)),
             _ => None,
         })
         .collect();
-    let max = gcs.iter().map(|(e, _)| *e).max();
-    gcs.into_iter()
-        .filter(|(e, _)| Some(*e) == max)
-        .map(|(_, n)| n)
-        .collect()
+    gcs.sort_by(|a, b| b.cmp(a));
+    gcs.into_iter().map(|(_, n)| n).collect()
 }
 
 /// Writer heads GC has not compacted yet: based on this epoch or the one
@@ -277,16 +298,12 @@ fn pending<'a>(
     out
 }
 
-/// `c-*` names whose bodies [`View::compute`] needs.
-pub fn compactions_to_fetch<'a>(
+/// Writer heads [`View::compute`] would consider.
+pub fn pending_heads<'a>(
     names: impl IntoIterator<Item = &'a str>,
     gc: Option<&GcRecord>,
-) -> Vec<&'a str> {
+) -> Vec<(&'a str, HeadName)> {
     pending(names, gc)
-        .into_iter()
-        .filter(|(_, h)| matches!(h, HeadName::Compaction { .. }))
-        .map(|(n, _)| n)
-        .collect()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -487,12 +504,14 @@ mod tests {
     fn records_roundtrip_and_name_binds_body() {
         let g = gc(4, &[("main", 1), ("dev", 2)], &["h-x"]);
         assert_eq!(GcRecord::decode(&g.encode()).unwrap(), g);
+        let body = Signed::unsigned(g.encode());
+        assert_eq!(Signed::decode(&body).unwrap().record, g.encode());
         assert_eq!(
-            g.head_name(),
+            g.head_name(&body),
             HeadName::Gc {
                 epoch: 4,
                 time: 0,
-                digest: SegDigest::digest(g.encode())
+                digest: SegDigest::digest(&body)
             }
         );
         let mut unsorted = g.clone();
@@ -518,7 +537,7 @@ mod tests {
         );
 
         let c = crec("main", 2, &[], &[]);
-        let cn = c.head_name(0).to_string();
+        let cn = c.head_name(0, &Signed::unsigned(c.encode())).to_string();
         let v = View::compute(
             [h.as_str(), cn.as_str()],
             None,
@@ -540,10 +559,12 @@ mod tests {
 
         // replaces base 10 and h_cur's 11, subsumes h_cur
         let c = crec("main", 30, &[10, 11], &[&h_cur]);
-        let cn = c.head_name(5).to_string();
+        let cn = c.head_name(5, &Signed::unsigned(c.encode())).to_string();
         // body not fetched: ignored entirely, so h_dev stays
         let c_missing = crec("dev", 31, &[20], &[&h_dev]);
-        let cn_missing = c_missing.head_name(5).to_string();
+        let cn_missing = c_missing
+            .head_name(5, &Signed::unsigned(c_missing.encode()))
+            .to_string();
         // name says main, body says dev: ignored
         let c_lie = crec("dev", 32, &[], &[]);
         let cn_lie = HeadName::Compaction {
@@ -553,7 +574,7 @@ mod tests {
             digest: d(99),
         }
         .to_string();
-        let gn = g.head_name().to_string();
+        let gn = g.head_name(&Signed::unsigned(g.encode())).to_string();
 
         let names = [
             &h_cur,
@@ -596,7 +617,10 @@ mod tests {
         .to_string();
         let g4 = gc(4, &[], &[]);
         let g5 = gc(5, &[], &[&c_folded]);
-        let (n4, n5) = (g4.head_name().to_string(), g5.head_name().to_string());
+        let (n4, n5) = (
+            g4.head_name(&Signed::unsigned(g4.encode())).to_string(),
+            g5.head_name(&Signed::unsigned(g5.encode())).to_string(),
+        );
         let n5_clobbered = HeadName::Gc {
             epoch: 5,
             time: 0,
@@ -626,8 +650,17 @@ mod tests {
             c_folded.as_str(),
         ];
 
-        let newest: BTreeSet<&str> = newest_gc(names).into_iter().collect();
-        assert_eq!(newest, BTreeSet::from([n5.as_str(), n5_clobbered.as_str()]));
-        assert_eq!(compactions_to_fetch(names, Some(&g5)), vec![c_ok.as_str()]);
+        let newest = newest_gc(names);
+        assert_eq!(
+            newest[..2].iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([n5.as_str(), n5_clobbered.as_str()])
+        );
+        assert_eq!(newest[2], n4.as_str());
+        let fetch: Vec<&str> = pending_heads(names, Some(&g5))
+            .into_iter()
+            .filter(|(_, h)| matches!(h, HeadName::Compaction { .. }))
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(fetch, vec![c_ok.as_str()]);
     }
 }

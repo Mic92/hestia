@@ -92,6 +92,31 @@ inputs:
       addressed path-style.
     required: false
     default: ""
+  trust:
+    description: >
+      Which heads the daemon and GC accept. `open`: everything, nothing
+      is signed. `same-repo`: heads attested keyless by a workflow of this
+      repository. `strict`: `<default branch>-*` roots and GC records only
+      from runs on the default branch, other roots from any ref. Verified
+      with the runner's `gh attestation verify`. Anything but `open` signs
+      this job's heads with cosign (downloaded if missing) and needs
+      `id-token: write`.
+    required: false
+    default: "open"
+  trust-rows:
+    description: >
+      Extra policy rows, one `<root glob | @gc> <cosign | gh> <verify args>`
+      per line, consulted before the preset's (first matching glob wins).
+      E.g. `main-* cosign --key hydra.pub --insecure-ignore-tlog=true` or
+      `main-* gh --repo OWNER/REPO --source-ref refs/heads/staging`.
+    required: false
+    default: ""
+  sign:
+    description: >
+      `cosign attest-blob` arguments for this job's heads instead of
+      keyless, e.g. `--key awskms:///arn:...`. `none` publishes unsigned.
+    required: false
+    default: ""
   read-only:
     description: >
       Substitute from the cache but never write to it: no post-build-hook,

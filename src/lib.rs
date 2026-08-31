@@ -22,4 +22,5 @@ pub mod segment;
 pub mod serve;
 pub mod store;
 pub mod substituter;
+pub mod trust;
 pub mod upstream;

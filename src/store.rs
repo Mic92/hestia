@@ -4,11 +4,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use futures_util::future::join_all;
 use tokio::sync::OnceCell;
 
 use crate::backend::{Backend, Listed};
 use crate::chunker::pack_cache_key;
-use crate::heads::{self, CompactionRecord, GcRecord, HeadName, View, root_id};
+use crate::heads::{self, CompactionRecord, GcRecord, HeadName, Signed, View, root_id};
 use crate::manifest::{
     ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Hash32, PackHash,
     PathEntry, PathHash, Regular, SegDigest, Symlink,
@@ -16,6 +17,7 @@ use crate::manifest::{
 use crate::segment::{
     self, ChunkRef, Chunks, Meta, Node, PackIndex, PackRow, Sealed, SegmentWriter, Tree,
 };
+use crate::trust::{GC_ROW, Trust};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -23,6 +25,8 @@ pub enum Error {
     Backend(#[from] crate::backend::Error),
     #[error(transparent)]
     Segment(#[from] segment::Error),
+    #[error(transparent)]
+    Trust(#[from] crate::trust::Error),
     #[error("{0} missing from the store")]
     Missing(String),
     #[error("pack {0} missing from the store")]
@@ -59,6 +63,7 @@ pub struct Resolved {
 /// a new one that shares loaded segments and pack indexes.
 pub struct Snapshot {
     backend: Backend,
+    trust: Trust,
     roots: Vec<String>,
     listed: Vec<Listed>,
     pub view: View,
@@ -83,28 +88,66 @@ pub async fn fetch_pack_index(backend: &Backend, row: &PackRow) -> Result<PackIn
     Ok(PackIndex::decode(&bytes)?)
 }
 
-/// A `g-*` body that decodes and hashes back to its name.
-async fn gc_record(backend: &Backend, name: &str) -> Result<Option<GcRecord>, Error> {
-    let (Some(body), Some(parsed)) = (backend.get(name, None).await?, HeadName::parse(name)) else {
+async fn signed_record(backend: &Backend, name: &str) -> Result<Option<(Signed, Vec<u8>)>, Error> {
+    Ok(backend
+        .get(name, None)
+        .await?
+        .and_then(|body| Some((Signed::decode(&body).ok()?, body.to_vec()))))
+}
+
+async fn gc_record(
+    backend: &Backend,
+    trust: &Trust,
+    name: &str,
+) -> Result<Option<GcRecord>, Error> {
+    let Some((s, body)) = signed_record(backend, name).await? else {
         return Ok(None);
     };
-    Ok(GcRecord::decode(&body)
+    let Some(r) = GcRecord::decode(&s.record)
         .ok()
-        .filter(|r| r.head_name() == parsed))
+        .filter(|r| Some(r.head_name(&body)) == HeadName::parse(name))
+    else {
+        return Ok(None);
+    };
+    Ok(trust.verify(GC_ROW, &s.record, &s.proof).await.then_some(r))
 }
 
 async fn compaction_record(
     backend: &Backend,
+    trust: &Trust,
     name: &str,
 ) -> Result<Option<CompactionRecord>, Error> {
-    let (Some(body), Some(HeadName::Compaction { base_epoch, .. })) =
-        (backend.get(name, None).await?, HeadName::parse(name))
+    let (Some((s, body)), Some(HeadName::Compaction { base_epoch, .. })) =
+        (signed_record(backend, name).await?, HeadName::parse(name))
     else {
         return Ok(None);
     };
-    Ok(CompactionRecord::decode(&body)
+    let Some(r) = CompactionRecord::decode(&s.record)
         .ok()
-        .filter(|r| r.head_name(base_epoch).to_string() == name))
+        .filter(|r| r.head_name(base_epoch, &body).to_string() == name)
+    else {
+        return Ok(None);
+    };
+    Ok(trust
+        .verify(&r.root, &s.record, &s.proof)
+        .await
+        .then_some(r))
+}
+
+/// A drain head's proof signs its own name.
+async fn drain_verified(
+    backend: &Backend,
+    trust: &Trust,
+    name: &str,
+    root: &str,
+) -> Result<bool, Error> {
+    if trust.is_open() {
+        return Ok(true);
+    }
+    let Some(body) = backend.get(name, None).await? else {
+        return Ok(false);
+    };
+    Ok(trust.verify(root, name.as_bytes(), &body).await)
 }
 
 /// The head listing and what it resolves to.
@@ -116,7 +159,8 @@ pub struct Heads {
 }
 
 impl Heads {
-    pub async fn load(backend: &Backend) -> Result<Heads, Error> {
+    /// Heads whose proof `trust` rejects count as not listed.
+    pub async fn load(backend: &Backend, trust: &Trust) -> Result<Heads, Error> {
         let mut listed = Vec::new();
         for prefix in ["g-", "h-", "c-"] {
             listed.extend(backend.list(prefix, None).await?.expect("unbounded"));
@@ -124,18 +168,51 @@ impl Heads {
         let names = || listed.iter().map(|l| l.key.as_str());
         let mut gc = None;
         for name in heads::newest_gc(names()) {
-            if let Some(record) = gc_record(backend, name).await? {
+            if let Some(record) = gc_record(backend, trust, name).await? {
                 gc = Some(record);
                 break;
             }
         }
-        let mut compactions = HashMap::new();
-        for name in heads::compactions_to_fetch(names(), gc.as_ref()) {
-            if let Some(c) = compaction_record(backend, name).await? {
-                compactions.insert(name.to_owned(), c);
-            }
-        }
-        let view = View::compute(names(), gc.as_ref(), &compactions);
+        let pending = heads::pending_heads(names(), gc.as_ref());
+        let compactions: HashMap<String, CompactionRecord> = join_all(
+            pending
+                .iter()
+                .filter(|(_, h)| matches!(h, HeadName::Compaction { .. }))
+                .map(|(n, _)| async move {
+                    compaction_record(backend, trust, n)
+                        .await
+                        .map(|c| c.map(|c| ((*n).to_owned(), c)))
+                }),
+        )
+        .await
+        .into_iter()
+        .filter_map(Result::transpose)
+        .collect::<Result<_, _>>()?;
+        let root_names: HashMap<_, &str> = gc
+            .iter()
+            .flat_map(|g| g.roots.iter().map(|r| r.name.as_str()))
+            .chain(compactions.values().map(|c| c.root.as_str()))
+            .map(|n| (root_id(n), n))
+            .collect();
+        let rejected: BTreeSet<&str> = join_all(
+            pending
+                .iter()
+                .filter_map(|(n, h)| match h {
+                    HeadName::Drain { root, .. } => Some((*n, *root_names.get(root)?)),
+                    _ => None,
+                })
+                .map(|(n, root)| async move {
+                    drain_verified(backend, trust, n, root)
+                        .await
+                        .map(|ok| (!ok).then_some(n))
+                }),
+        )
+        .await
+        .into_iter()
+        .filter_map(Result::transpose)
+        .collect::<Result<_, _>>()?;
+        let accepted = || names().filter(|n| !rejected.contains(n));
+        let view = View::compute(accepted(), gc.as_ref(), &compactions);
         Ok(Heads { listed, gc, view })
     }
 }
@@ -143,10 +220,11 @@ impl Heads {
 impl Snapshot {
     pub async fn load(
         backend: Backend,
+        trust: Trust,
         roots: &[String],
         previous: Option<&Snapshot>,
     ) -> Result<Snapshot, Error> {
-        let Heads { listed, view, .. } = Heads::load(&backend).await?;
+        let Heads { listed, view, .. } = Heads::load(&backend, &trust).await?;
         let loaded: HashMap<SegDigest, Arc<Segment>> = previous
             .into_iter()
             .flat_map(|p| p.segments.iter().map(|s| (s.digest, s.clone())))
@@ -178,6 +256,7 @@ impl Snapshot {
             .unwrap_or_default();
         Ok(Snapshot {
             backend,
+            trust,
             roots: roots.to_vec(),
             listed,
             view,
@@ -189,7 +268,13 @@ impl Snapshot {
     /// Reload, then make sure `sealed` (just published under the first
     /// root) is served even if the listing does not show its head yet.
     pub async fn refresh_with(&self, sealed: &Sealed) -> Result<Snapshot, Error> {
-        let mut next = Snapshot::load(self.backend.clone(), &self.roots, Some(self)).await?;
+        let mut next = Snapshot::load(
+            self.backend.clone(),
+            self.trust.clone(),
+            &self.roots,
+            Some(self),
+        )
+        .await?;
         let digest = sealed.digest();
         if !next.segments.iter().any(|s| s.digest == digest) {
             let segment = Segment {
@@ -252,9 +337,9 @@ impl Snapshot {
             subsumes: pending.iter().map(|(n, _)| (*n).to_owned()).collect(),
             time: now,
         };
-        let name = record.head_name(self.view.epoch).to_string();
-        self.backend.put(&name, record.encode().into()).await?;
-        Ok(Some(name))
+        Ok(Some(
+            put_compaction(&self.backend, &self.trust, record, self.view.epoch).await?,
+        ))
     }
 
     /// Copy a stored entry into `writer`. `false` if no served segment has it.
@@ -562,28 +647,35 @@ async fn put_segment(backend: &Backend, sealed: &Sealed) -> Result<SegDigest, Er
     Ok(digest)
 }
 
+pub async fn signed(trust: &Trust, record: Vec<u8>) -> Result<Vec<u8>, crate::trust::Error> {
+    let proof = trust.sign(&record).await?;
+    Ok(Signed { record, proof }.encode())
+}
+
+async fn put_compaction(
+    backend: &Backend,
+    trust: &Trust,
+    record: CompactionRecord,
+    base_epoch: u64,
+) -> Result<String, Error> {
+    let body = signed(trust, record.encode()).await?;
+    let name = record.head_name(base_epoch, &body).to_string();
+    backend.put(&name, body.into()).await?;
+    Ok(name)
+}
+
 /// Upload a sealed segment and a head for it under `root`. A root the
 /// view cannot name yet gets a `c-*` (which carries the name), else `h-*`.
 pub async fn publish(
     backend: &Backend,
+    trust: &Trust,
     view: &View,
     root: &str,
     sealed: &Sealed,
     now: u64,
 ) -> Result<String, Error> {
     let digest = put_segment(backend, sealed).await?;
-    let (name, body) = if view.roots.contains_key(root) {
-        (
-            HeadName::Drain {
-                base_epoch: view.epoch,
-                root: root_id(root),
-                time: now,
-                seg: digest,
-            }
-            .to_string(),
-            vec![0u8],
-        )
-    } else {
+    if !view.roots.contains_key(root) {
         let record = CompactionRecord {
             root: root.to_owned(),
             added: digest,
@@ -591,8 +683,20 @@ pub async fn publish(
             subsumes: vec![],
             time: now,
         };
-        (record.head_name(view.epoch).to_string(), record.encode())
-    };
+        return put_compaction(backend, trust, record, view.epoch).await;
+    }
+    let name = HeadName::Drain {
+        base_epoch: view.epoch,
+        root: root_id(root),
+        time: now,
+        seg: digest,
+    }
+    .to_string();
+    // Never empty: the Actions cache refuses zero-byte entries.
+    let mut body = trust.sign(name.as_bytes()).await?;
+    if body.is_empty() {
+        body.push(0);
+    }
     backend.put(&name, body.into()).await?;
     Ok(name)
 }
