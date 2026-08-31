@@ -11,6 +11,7 @@ pub mod gha;
 pub mod ghcr;
 pub mod oci;
 pub mod s3;
+mod urls;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
