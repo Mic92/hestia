@@ -11,6 +11,7 @@ pub mod gc;
 pub mod gha;
 pub mod heads;
 pub mod hook;
+pub mod listing;
 pub mod manifest;
 pub mod matrix;
 pub mod narzstd;

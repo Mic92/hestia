@@ -299,6 +299,19 @@ async fn narinfo_matches_nix_path_info_oracle() {
             narinfo["URL"]
         );
         assert!(!narinfo.contains_key("References"), "fixture has no refs");
+        let ls: serde_json::Value = substituter
+            .get(&http, &format!("{}.ls", path_hash_str(&fixture)))
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(ls["version"], 1);
+        assert_eq!(
+            ls["root"],
+            store
+                .nar_ls_json(&fixture)
+                .expect("nix nar ls oracle unavailable")
+        );
         // nix-store --add produces a content-addressed path; CA must round-trip.
         assert_eq!(
             narinfo.get("CA").map(String::as_str),

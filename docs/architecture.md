@@ -17,7 +17,8 @@ job builds, and an HTTP listener serving the Nix binary cache protocol.
 
 The action puts the daemon first in `extra-substituters`, so Nix asks
 it before cache.nixos.org. A narinfo hit answers straight from the
-segments loaded at startup. A NAR request is more involved: the daemon fetches the path's
+segments loaded at startup, and so does `<hash>.ls` (file listing with NAR offsets,
+computed from the stored tree and pack indexes). A NAR request is more involved: the daemon fetches the path's
 chunks from pack blobs with HTTP Range reads and serves them as
 `.nar.zst` without recompressing: the stored zstd frames are spliced
 verbatim between small raw frames carrying the NAR framing, and Nix
