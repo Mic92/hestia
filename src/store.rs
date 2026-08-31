@@ -161,10 +161,7 @@ pub struct Heads {
 impl Heads {
     /// Heads whose proof `trust` rejects count as not listed.
     pub async fn load(backend: &Backend, trust: &Trust) -> Result<Heads, Error> {
-        let mut listed = Vec::new();
-        for prefix in ["g-", "h-", "c-"] {
-            listed.extend(backend.list(prefix, None).await?.expect("unbounded"));
-        }
+        let listed = backend.list_heads().await?;
         let names = || listed.iter().map(|l| l.key.as_str());
         let mut gc = None;
         for name in heads::newest_gc(names()) {
