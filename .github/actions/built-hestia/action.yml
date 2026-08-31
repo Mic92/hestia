@@ -1,0 +1,14 @@
+name: built hestia
+description: Import the hestia closure the build job exported, as ./hestia-bin (and ./gha-real-tests on Linux).
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v5
+      with:
+        name: hestia-${{ runner.os }}
+    - shell: bash
+      run: |
+        set -euo pipefail
+        nix-store --import < hestia-closure.nar > /dev/null
+        while read -r name path; do ln -sfn "$path" "$name"; done < hestia-closure.paths
+        rm hestia-closure.nar hestia-closure.paths
