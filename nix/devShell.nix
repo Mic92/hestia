@@ -13,6 +13,7 @@
       cargo-watch
       cargo-nextest
       nix-eval-jobs
+      cosign
     ];
 
     buildInputs = with pkgs; [

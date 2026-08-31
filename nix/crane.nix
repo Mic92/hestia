@@ -131,6 +131,7 @@ in
       nativeBuildInputs = [
         pkgs.nix
         pkgs.nix-eval-jobs
+        pkgs.cosign
       ];
       # nix needs a writable HOME.
       preBuild = ''

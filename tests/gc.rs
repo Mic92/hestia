@@ -58,7 +58,9 @@ async fn compacts_each_root_to_one_segment_and_folds_heads() {
         );
         assert_eq!(stats.deleted, 3, "just the heads");
 
-        let heads = Heads::load(&sim.backend).await.unwrap();
+        let heads = Heads::load(&sim.backend, &hestia::trust::Trust::open())
+            .await
+            .unwrap();
         assert_eq!(heads.view.epoch, 1);
         assert!(heads.view.roots.values().all(|s| s.len() == 1));
         assert!(sim.stored_keys("h-").await.is_empty());
@@ -173,7 +175,9 @@ async fn stale_root_expires_and_its_storage_is_swept() {
             sim.push(ROOT, &[], &[&a]).await;
             sim.run_gc(policy.clone(), now + HOUR).await;
         }
-        let heads = Heads::load(&sim.backend).await.unwrap();
+        let heads = Heads::load(&sim.backend, &hestia::trust::Trust::open())
+            .await
+            .unwrap();
         assert_eq!(heads.view.roots.keys().collect::<Vec<_>>(), [ROOT]);
         assert_eq!(sim.stored_keys("pack-").await.len(), 1);
         sim.assert_readable(&[&a]).await;
@@ -296,9 +300,16 @@ async fn drain_racing_gc_is_kept() {
             .await
             .unwrap();
         let sealed = writer.seal().unwrap();
-        hestia::store::publish(&sim.backend, &stale_view.view, ROOT, &sealed, T0 + DAY)
-            .await
-            .unwrap();
+        hestia::store::publish(
+            &sim.backend,
+            &hestia::trust::Trust::open(),
+            &stale_view.view,
+            ROOT,
+            &sealed,
+            T0 + DAY,
+        )
+        .await
+        .unwrap();
 
         fake.set_clock(T0 + DAY);
         sim.run_gc(GcPolicy::default(), T0 + DAY).await;
@@ -386,7 +397,9 @@ async fn thirty_day_history_converges_to_live_set_storage() {
             stored <= live * 2,
             "storage {stored} should converge towards the live set {live}"
         );
-        let heads = Heads::load(&sim.backend).await.unwrap();
+        let heads = Heads::load(&sim.backend, &hestia::trust::Trust::open())
+            .await
+            .unwrap();
         assert_eq!(heads.view.roots.len(), 1);
         assert_eq!(sim.stored_keys("g-").await.len(), 1);
     })

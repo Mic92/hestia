@@ -111,6 +111,7 @@ async fn quota_exhaustion_fails_gracefully_and_gc_cleans_orphaned_packs() {
     fake.exhaust_quota_after(&http, u64::MAX).await;
     let gc = Gc {
         backend: fake.backend(&http),
+        trust: hestia::trust::Trust::open(),
         policy: GcPolicy::default(),
         dry_run: false,
     };

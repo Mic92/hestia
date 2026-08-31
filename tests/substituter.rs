@@ -1048,7 +1048,9 @@ async fn concurrent_gc_repack_triggers_reload() {
             let manifest_store = reload_store.clone();
             Box::pin(async move {
                 let roots = [TEST_ROOT_KEY.to_string()];
-                if let Ok(s) = Snapshot::load(backend, &roots, None).await {
+                if let Ok(s) =
+                    Snapshot::load(backend, hestia::trust::Trust::open(), &roots, None).await
+                {
                     manifest_store.set_snapshot(Arc::new(s));
                 }
             })
@@ -1067,6 +1069,7 @@ async fn concurrent_gc_repack_triggers_reload() {
         let old_pack = *snapshot.pack_hashes().first().expect("one pack uploaded");
         let gc = Gc {
             backend: fake.backend(&http),
+            trust: hestia::trust::Trust::open(),
             policy: GcPolicy {
                 min_liveness: 0.9,
                 ..GcPolicy::default()

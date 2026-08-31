@@ -28,6 +28,7 @@ use crate::refnorm::RefTable;
 use crate::segment::SegmentWriter;
 use crate::store::{self, Snapshot};
 use crate::substituter::ManifestStore;
+use crate::trust::Trust;
 use crate::upstream::UpstreamFilter;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 
@@ -152,6 +153,7 @@ pub async fn upload_pack(backend: &Backend, pack: &chunker::Pack) -> Result<bool
 /// Everything the pipeline needs to talk to the world.
 pub struct PipelineContext {
     pub backend: Backend,
+    pub trust: Trust,
     pub store: StoreDatabase,
     pub upstream: UpstreamFilter,
     /// Expand hooked paths to their runtime closure before pushing.
@@ -231,6 +233,7 @@ impl PipelineContext {
             None => Arc::new(
                 Snapshot::load(
                     self.backend.clone(),
+                    self.trust.clone(),
                     std::slice::from_ref(&self.root_key),
                     None,
                 )
@@ -552,7 +555,15 @@ impl PipelineContext {
         let sealed = writer.seal().map_err(store::Error::from)?;
         let now = (self.clock)();
         stats.head = Some(
-            store::publish(&self.backend, &snapshot.view, &self.root_key, &sealed, now).await?,
+            store::publish(
+                &self.backend,
+                &self.trust,
+                &snapshot.view,
+                &self.root_key,
+                &sealed,
+                now,
+            )
+            .await?,
         );
         stats.commit_ms = commit_started.elapsed().as_millis() as u64;
         let next = match snapshot.refresh_with(&sealed).await {

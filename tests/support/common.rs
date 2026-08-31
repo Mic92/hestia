@@ -42,6 +42,7 @@ pub fn pipeline_context(
 pub fn pipeline_context_with(backend: Backend, store: StoreDatabase) -> PipelineContext {
     PipelineContext {
         backend,
+        trust: hestia::trust::Trust::open(),
         store,
         upstream: UpstreamFilter::default(),
         expand_closure: true,
@@ -57,9 +58,14 @@ pub fn pipeline_context_with(backend: Backend, store: StoreDatabase) -> Pipeline
 /// What the test root currently publishes, freshly listed.
 pub async fn load_snapshot(fake: &FakeGha, http: &reqwest::Client) -> Arc<Snapshot> {
     Arc::new(
-        Snapshot::load(fake.backend(http), &[TEST_ROOT_KEY.to_string()], None)
-            .await
-            .expect("loading heads failed"),
+        Snapshot::load(
+            fake.backend(http),
+            hestia::trust::Trust::open(),
+            &[TEST_ROOT_KEY.to_string()],
+            None,
+        )
+        .await
+        .expect("loading heads failed"),
     )
 }
 

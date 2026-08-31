@@ -104,6 +104,7 @@ impl SimPath {
 pub struct SimCache {
     pub http: reqwest::Client,
     pub backend: Backend,
+    pub trust: hestia::trust::Trust,
     /// The fake's clock, so head names age with `set_clock`.
     pub clock: Clock,
 }
@@ -117,6 +118,7 @@ impl SimCache {
         Self {
             http: reqwest::Client::new(),
             backend,
+            trust: hestia::trust::Trust::open(),
             clock,
         }
     }
@@ -124,6 +126,7 @@ impl SimCache {
     pub fn gc(&self, policy: GcPolicy) -> Gc {
         Gc {
             backend: self.backend.clone(),
+            trust: self.trust.clone(),
             policy,
             dry_run: false,
         }
@@ -135,14 +138,14 @@ impl SimCache {
 
     /// What a reader subscribed to every root sees.
     pub async fn snapshot(&self) -> Snapshot {
-        let roots: Vec<String> = store::Heads::load(&self.backend)
+        let roots: Vec<String> = store::Heads::load(&self.backend, &self.trust)
             .await
             .expect("heads")
             .view
             .roots
             .into_keys()
             .collect();
-        Snapshot::load(self.backend.clone(), &roots, None)
+        Snapshot::load(self.backend.clone(), self.trust.clone(), &roots, None)
             .await
             .expect("snapshot")
     }
@@ -209,6 +212,7 @@ impl SimCache {
         let sealed = writer.seal().expect("seal");
         store::publish(
             &self.backend,
+            &self.trust,
             &snapshot.view,
             root_key,
             &sealed,
