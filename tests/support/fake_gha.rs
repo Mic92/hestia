@@ -597,6 +597,7 @@ async fn test_dead_sigs(State(state): State<AppState>, Path(sigs): Path<u64>) ->
 
 /// A running fake GHA cache backend.
 pub struct FakeGha {
+    pub net: Arc<super::net::Net>,
     /// Base URL, used both as `ACTIONS_RESULTS_URL` and as the GitHub API URL.
     pub base_url: String,
     /// Repository slug the REST routes are mounted under.
@@ -665,12 +666,15 @@ impl FakeGha {
             )
             .route("/test/dead-sigs/{sigs}", post(test_dead_sigs))
             .with_state(state);
+        let net = Arc::new(super::net::Net::default());
+        let router = net.layer(router);
 
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
 
         Self {
+            net,
             base_url,
             repo: "fake/repo".to_string(),
             inner,

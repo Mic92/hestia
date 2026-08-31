@@ -50,6 +50,7 @@ struct AppState {
 
 pub struct FakeS3 {
     inner: Arc<Mutex<Inner>>,
+    pub net: Arc<super::net::Net>,
     base_url: String,
     server: tokio::task::JoinHandle<()>,
 }
@@ -240,14 +241,18 @@ impl FakeS3 {
             .expect("bind fake s3 listener");
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let inner = Arc::new(Mutex::new(Inner::default()));
-        let router = Router::new()
-            .route("/{*path}", axum::routing::any(handle))
-            .with_state(AppState {
-                inner: inner.clone(),
-            });
+        let net = Arc::new(super::net::Net::default());
+        let router = net.layer(
+            Router::new()
+                .route("/{*path}", axum::routing::any(handle))
+                .with_state(AppState {
+                    inner: inner.clone(),
+                }),
+        );
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         FakeS3 {
             inner,
+            net,
             base_url,
             server,
         }

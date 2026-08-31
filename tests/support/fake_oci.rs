@@ -146,6 +146,7 @@ struct AppState {
 
 pub struct FakeOci {
     inner: Arc<Mutex<Inner>>,
+    pub net: Arc<super::net::Net>,
     pub base_url: String,
     pub api_url: String,
     servers: Vec<tokio::task::JoinHandle<()>>,
@@ -467,14 +468,19 @@ impl FakeOci {
             base_url: base_url.clone(),
             cdn_url,
         };
-        let router = Router::new()
-            .route("/token", get(token))
-            .fallback(v2)
-            .with_state(state.clone());
-        let cdn_router = Router::new()
-            .route("/cdn/{*digest}", get(cdn))
-            .with_state(state.clone());
-        let api_router = Router::new().fallback(api).with_state(state);
+        let net = Arc::new(super::net::Net::default());
+        let router = net.layer(
+            Router::new()
+                .route("/token", get(token))
+                .fallback(v2)
+                .with_state(state.clone()),
+        );
+        let cdn_router = net.layer(
+            Router::new()
+                .route("/cdn/{*digest}", get(cdn))
+                .with_state(state.clone()),
+        );
+        let api_router = net.layer(Router::new().fallback(api).with_state(state));
         let servers = vec![
             tokio::spawn(async move { axum::serve(registry, router).await.unwrap() }),
             tokio::spawn(async move { axum::serve(cdn_listener, cdn_router).await.unwrap() }),
@@ -482,6 +488,7 @@ impl FakeOci {
         ];
         FakeOci {
             inner,
+            net,
             base_url,
             api_url,
             servers,
