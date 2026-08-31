@@ -114,7 +114,7 @@
   <text x="895" y="363" class="ms" text-anchor="middle">body n-1</text>
   <rect x="470" y="380" width="530" height="66" fill="#ffffff" stroke="#cdd6e0"/>
   <text x="480" y="396" class="m">u8 name_len | name | cbor {</text>
-  <text x="494" y="411" class="ms">nar_hash, nar_size, deriver, ca,</text>
+  <text x="494" y="411" class="ms">nar_hash, nar_size, deriver, ca, realises: "drv^out …",</text>
   <text x="494" y="425" class="ms">local_refs: bytes of u32 → row in this segment,  foreign_refs: "p1 p2 …"</text>
   <text x="480" y="440" class="m">}</text>
   <path class="edge" d="M 665 370 L 665 380" />

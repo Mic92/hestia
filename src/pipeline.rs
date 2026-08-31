@@ -441,6 +441,7 @@ impl PipelineContext {
                     nar_size,
                     ca: info.ca,
                     deriver: info.deriver,
+                    realises: info.realises,
                     tree: chunked.tree,
                 });
 

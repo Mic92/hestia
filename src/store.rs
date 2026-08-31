@@ -12,7 +12,7 @@ use crate::chunker::pack_cache_key;
 use crate::heads::{self, CompactionRecord, GcRecord, HeadName, Signed, View, root_id};
 use crate::manifest::{
     ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Hash32, PackHash,
-    PathEntry, PathHash, Regular, SegDigest, Symlink,
+    PathEntry, PathHash, Regular, SegDigest, StorePath, Symlink,
 };
 use crate::segment::{
     self, ChunkRef, Chunks, Meta, Node, PackIndex, PackRow, Sealed, SegmentWriter, Tree,
@@ -438,6 +438,13 @@ impl Snapshot {
         self.find(hash).is_some()
     }
 
+    /// The path realising CA output `id` (`drv^output`).
+    pub fn realisation(&self, id: &str) -> Option<StorePath> {
+        self.segments
+            .iter()
+            .find_map(|s| s.meta.realisation(id).map(|i| s.meta.store_path(i)))
+    }
+
     /// Without the file tree: enough for narinfo.
     pub fn lookup(&self, hash: &PathHash) -> Option<PathEntry> {
         let (seg, i) = self.find(hash)?;
@@ -520,6 +527,7 @@ fn path_entry(e: segment::Entry, tree: FileTree<ChunkList>) -> PathEntry {
         references: e.references,
         ca: e.ca,
         deriver: e.deriver,
+        realises: e.realises,
         tree,
     }
 }
@@ -623,6 +631,7 @@ pub fn push_entry(
         references: entry.references.clone(),
         deriver: entry.deriver.clone(),
         ca: entry.ca.clone(),
+        realises: entry.realises.clone(),
         tree,
     });
     Some(())

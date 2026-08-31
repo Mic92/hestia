@@ -66,6 +66,13 @@ so fields can be added without breaking older readers; a `features`
 word in the header marks changes a rewrite (compaction, GC) must
 understand, and a build that does not leaves such segments alone.
 
+With `ca-derivations`, Nix asks a cache which path an output of a
+content-addressed derivation resolved to
+(`build-trace-v2/<drv>/<output>.doi`) before it can ask for the
+narinfo. A drain copies those rows from the builder's `BuildTraceV3`
+table into the body of the output path, and the daemon answers from
+them.
+
 Which segments make up a root is decided by heads, empty-bodied or
 small entries whose *names* carry the claim: `h-<epoch>-<root>-<time>-<seg>`
 (a drain added a segment), `c-<epoch>-<root>-<time>-<id>` (a compaction

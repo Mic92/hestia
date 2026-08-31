@@ -12,7 +12,7 @@
 //! `nix-store --store 'local?store=…' --add` is queryable without spawning
 //! a daemon process.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use harmonia_store_db::StoreDb;
@@ -33,6 +33,8 @@ pub const DEFAULT_DB_PATH: &str = "/nix/var/nix/db/db.sqlite";
 pub enum Error {
     #[error("store database error: {0}")]
     Database(#[from] harmonia_store_db::Error),
+    #[error("store database error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 /// Everything the write pipeline needs to know about one valid store path.
@@ -50,6 +52,8 @@ pub struct PathInfo {
     /// path is content-addressed.
     pub ca: Option<String>,
     pub signatures: Vec<Signature>,
+    /// `drv^output` ids from the CA build trace naming this path.
+    pub realises: Vec<String>,
 }
 
 impl PathInfo {
@@ -84,6 +88,7 @@ fn convert(path: StorePath, info: UnkeyedValidPathInfo) -> PathInfo {
         ca: info.ca.map(|ca| ca.to_string()),
         signatures: info.signatures.into_iter().collect(),
         store_path: path,
+        realises: Vec::new(),
     }
 }
 
@@ -159,13 +164,15 @@ impl StoreDatabase {
             return Ok(Vec::new());
         }
         let db = self.open()?;
-        store_paths
+        let mut results = store_paths
             .into_iter()
             .map(|path| {
                 let lookup = self.lookup_one(&db, &path)?;
                 Ok((path, lookup))
             })
-            .collect()
+            .collect::<Result<Vec<_>, Error>>()?;
+        attach_realises(&db, &mut results)?;
+        Ok(results)
     }
 
     /// Look up `roots` and everything they transitively reference (their
@@ -202,6 +209,7 @@ impl StoreDatabase {
             }
             results.push((path, lookup));
         }
+        attach_realises(&db, &mut results)?;
         Ok(results)
     }
 
@@ -219,6 +227,34 @@ impl StoreDatabase {
             None => Ok(Lookup::Unknown),
         }
     }
+}
+
+/// Fill in the `drv^output` ids naming each found path in the CA build
+/// trace. Nix indexes that table by drv only, so this is one scan per
+/// batch rather than a query per path. No table means `ca-derivations`
+/// was never on: nothing to add.
+fn attach_realises(db: &StoreDb, results: &mut [(String, Lookup)]) -> Result<(), Error> {
+    let mut found: HashMap<&str, &mut PathInfo> = results
+        .iter_mut()
+        .filter_map(|(path, lookup)| match lookup {
+            Lookup::Found(info) => Some((path.as_str(), &mut **info)),
+            _ => None,
+        })
+        .collect();
+    let conn = db.connection();
+    let Ok(mut stmt) = conn.prepare("SELECT outputPath, drvPath, outputName FROM BuildTraceV3")
+    else {
+        return Ok(());
+    };
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let out: String = row.get(0)?;
+        if let Some(info) = found.get_mut(out.as_str()) {
+            let (drv, name): (String, String) = (row.get(1)?, row.get(2)?);
+            info.realises.push(format!("{drv}^{name}"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1064,6 +1064,7 @@ dependencies = [
  "minicbor",
  "proptest",
  "reqwest",
+ "rusqlite",
  "rusty-s3",
  "serde",
  "serde_json",
