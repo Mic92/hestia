@@ -14,6 +14,8 @@
       cargo-nextest
       nix-eval-jobs
       cosign
+      rustfs
+      distribution
     ];
 
     buildInputs = with pkgs; [

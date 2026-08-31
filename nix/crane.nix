@@ -132,6 +132,8 @@ in
         pkgs.nix
         pkgs.nix-eval-jobs
         pkgs.cosign
+        pkgs.rustfs
+        pkgs.distribution
       ];
       # nix needs a writable HOME.
       preBuild = ''
