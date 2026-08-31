@@ -61,7 +61,10 @@ live-chunk bitset per pack; `.tree` holds the file trees, where a
 file's contents is a list of `(pack row, index in pack)` references
 plus reference rewrites (see below). Nothing in a segment is ever
 modified, so there is no merge conflict to resolve: concurrent drains
-simply publish one segment each.
+simply publish one segment each. The `.meta` header and bodies are CBOR,
+so fields can be added without breaking older readers; a `features`
+word in the header marks changes a rewrite (compaction, GC) must
+understand, and a build that does not leaves such segments alone.
 
 Which segments make up a root is decided by heads, empty-bodied or
 small entries whose *names* carry the claim: `h-<epoch>-<root>-<time>-<seg>`
