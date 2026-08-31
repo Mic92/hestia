@@ -20,7 +20,7 @@ use hestia::pipeline::{AccessLog, now_unix};
 use hestia::store::Snapshot;
 use hestia::substituter::{ManifestStore, Substituter, verify_packs};
 
-use support::common::{TEST_ROOT_KEY, load_snapshot, pipeline_context, to_path_set};
+use support::common::{TEST_ROOT_KEY, load_snapshot, nar_body, pipeline_context, to_path_set};
 use support::fake_gha::FakeGha;
 use support::store::{ScratchStore, assert_trees_equal, nix_copy};
 
@@ -195,9 +195,9 @@ async fn narinfo_miss_is_404() {
         for path in [
             "zzz.narinfo",
             "x",
-            "nar/zzz.nar",
+            "nar/zzz.nar.zst",
             "nar/x",
-            "nar/zzz.nar?hash=a&hash=b",
+            "nar/zzz.nar.zst?hash=a&hash=b",
         ] {
             let response = substituter.get(&http, path).await;
             assert_eq!(response.status(), 404, "GET /{path}");
@@ -236,7 +236,7 @@ async fn narinfo_matches_nix_path_info_oracle() {
         let narinfo = parse_narinfo(&response.text().await.unwrap());
 
         assert_eq!(narinfo["StorePath"], fixture.display().to_string());
-        assert_eq!(narinfo["Compression"], "none");
+        assert_eq!(narinfo["Compression"], "zstd");
         assert_eq!(
             narinfo["NarSize"],
             oracle["narSize"].as_u64().unwrap().to_string()
@@ -247,7 +247,7 @@ async fn narinfo_matches_nix_path_info_oracle() {
             Hash32::parse_sha256(oracle["narHash"].as_str().unwrap()).unwrap(),
         );
         assert!(
-            narinfo["URL"].starts_with("nar/") && narinfo["URL"].contains(".nar"),
+            narinfo["URL"].starts_with("nar/") && narinfo["URL"].contains(".nar.zst"),
             "URL: {}",
             narinfo["URL"]
         );
@@ -314,15 +314,12 @@ async fn nar_round_trips_with_matching_hash() {
             .await
             .unwrap();
         let narinfo = parse_narinfo(&narinfo_text);
+        assert!(narinfo["URL"].ends_with(&format!(".nar.zst?hash={}", path_hash_of(&fixture))));
+        assert_eq!(narinfo["Compression"], "zstd");
         let response = substituter.get(&http, &narinfo["URL"]).await;
         assert_eq!(response.status(), 200);
-        assert_eq!(
-            response.content_length(),
-            Some(expected_size),
-            "Content-Length must equal the NAR size"
-        );
-
-        let nar = response.bytes().await.unwrap();
+        assert!(response.content_length().is_some());
+        let nar = nar_body(response).await;
         assert_eq!(nar.len() as u64, expected_size);
 
         // Body hashes to the value in the manifest AND the value Nix recorded.
@@ -339,7 +336,7 @@ async fn nar_round_trips_with_matching_hash() {
         let bare_url = narinfo["URL"].split('?').next().unwrap();
         let response = substituter.get(&http, bare_url).await;
         assert_eq!(response.status(), 200);
-        assert_eq!(Hash32::digest(response.bytes().await.unwrap()), body_hash);
+        assert_eq!(Hash32::digest(nar_body(response).await), body_hash);
     })
     .await;
 }
@@ -753,7 +750,7 @@ async fn second_nar_request_reuses_cached_chunks() {
         // First NAR request fetches chunks from packs.
         let response = substituter.get(&http, &narinfo["URL"]).await;
         assert_eq!(response.status(), 200);
-        let nar = response.bytes().await.unwrap();
+        let nar = nar_body(response).await;
         let (expected_hash, _) = store.nar_hash_oracle(&fixture).unwrap();
         assert_eq!(Hash32::digest(&nar), expected_hash);
 
@@ -767,7 +764,7 @@ async fn second_nar_request_reuses_cached_chunks() {
         // from the in-memory chunk cache — no additional pack reads.
         let response = substituter.get(&http, &narinfo["URL"]).await;
         assert_eq!(response.status(), 200);
-        let nar = response.bytes().await.unwrap();
+        let nar = nar_body(response).await;
         assert_eq!(Hash32::digest(&nar), expected_hash);
 
         assert_eq!(
@@ -828,10 +825,7 @@ async fn expired_download_url_is_refreshed_mid_serving() {
             "expired URLs must be refreshed transparently"
         );
         let (expected_hash, _) = store.nar_hash_oracle(&fixture_b).unwrap();
-        assert_eq!(
-            Hash32::digest(response.bytes().await.unwrap()),
-            expected_hash
-        );
+        assert_eq!(Hash32::digest(nar_body(response).await), expected_hash);
     })
     .await;
 }
@@ -872,10 +866,7 @@ async fn drains_become_visible_without_restart() {
             let response = substituter.get(&http, &narinfo["URL"]).await;
             assert_eq!(response.status(), 200);
             let (expected_hash, _) = store.nar_hash_oracle(fixture).unwrap();
-            assert_eq!(
-                Hash32::digest(response.bytes().await.unwrap()),
-                expected_hash
-            );
+            assert_eq!(Hash32::digest(nar_body(response).await), expected_hash);
         }
 
         // The destination of a real substitution sees both paths too.
@@ -949,7 +940,7 @@ async fn transient_blob_failure_is_retried_transparently() {
         // Request the NAR directly: the narinfo round-trip is irrelevant
         // here, the injected failure targets the pack Range read.
         let entry = snapshot.lookup(&path_hash_of(&fixture)).unwrap();
-        let nar_url = format!("nar/{}.nar", entry.nar_hash.to_hex());
+        let nar_url = format!("nar/{}.nar.zst", entry.nar_hash.to_hex());
 
         // Exactly one connection drop: within the retry budget.
         fake.fail_blob_reads(&http, 1).await;
@@ -960,7 +951,7 @@ async fn transient_blob_failure_is_retried_transparently() {
             200,
             "a single transient failure must be absorbed by the retry"
         );
-        let nar = response.bytes().await.unwrap();
+        let nar = nar_body(response).await;
         assert_eq!(
             Hash32::digest(&nar),
             entry.nar_hash,
@@ -996,15 +987,12 @@ async fn nar_downloads_record_access_without_a_narinfo_hit() {
         // Fetch the NAR directly, both with and without the ?hash= parameter
         // a narinfo URL would carry. No narinfo request is ever made.
         for nar_url in [
-            format!("nar/{}.nar?hash={}", entry.nar_hash.to_hex(), path_hash),
-            format!("nar/{}.nar", entry.nar_hash.to_hex()),
+            format!("nar/{}.nar.zst?hash={}", entry.nar_hash.to_hex(), path_hash),
+            format!("nar/{}.nar.zst", entry.nar_hash.to_hex()),
         ] {
             let response = substituter.get(&http, &nar_url).await;
             assert_eq!(response.status(), 200);
-            assert_eq!(
-                Hash32::digest(response.bytes().await.unwrap()),
-                entry.nar_hash
-            );
+            assert_eq!(Hash32::digest(nar_body(response).await), entry.nar_hash);
         }
 
         assert!(
@@ -1089,17 +1077,14 @@ async fn concurrent_gc_repack_triggers_reload() {
         // The served view is stale (still points at the deleted pack), but
         // the NAR request must succeed via the reload.
         let entry = snapshot.lookup(&path_hash_of(&fixture)).unwrap();
-        let nar_url = format!("{base_url}/nar/{}.nar", entry.nar_hash.to_hex());
+        let nar_url = format!("{base_url}/nar/{}.nar.zst", entry.nar_hash.to_hex());
         let response = http.get(&nar_url).send().await.unwrap();
         assert_eq!(
             response.status(),
             200,
             "a pack deleted by a concurrent gc repack must trigger a reload, not a 404"
         );
-        assert_eq!(
-            Hash32::digest(response.bytes().await.unwrap()),
-            entry.nar_hash
-        );
+        assert_eq!(Hash32::digest(nar_body(response).await), entry.nar_hash);
         server.abort();
     })
     .await;
@@ -1122,7 +1107,7 @@ async fn persistent_blob_failures_yield_404_then_recover() {
         let substituter = RunningSubstituter::start(&fake, &http, &store).await;
 
         let entry = snapshot.lookup(&path_hash_of(&fixture)).unwrap();
-        let nar_url = format!("nar/{}.nar", entry.nar_hash.to_hex());
+        let nar_url = format!("nar/{}.nar.zst", entry.nar_hash.to_hex());
 
         // More failures than the retry budget can absorb.
         fake.fail_blob_reads(&http, 1_000).await;
@@ -1150,10 +1135,7 @@ async fn persistent_blob_failures_yield_404_then_recover() {
         fake.fail_blob_reads(&http, 0).await;
         let response = substituter.get(&http, &nar_url).await;
         assert_eq!(response.status(), 200);
-        assert_eq!(
-            Hash32::digest(response.bytes().await.unwrap()),
-            entry.nar_hash
-        );
+        assert_eq!(Hash32::digest(nar_body(response).await), entry.nar_hash);
     })
     .await;
 }

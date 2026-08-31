@@ -13,6 +13,7 @@ pub mod heads;
 pub mod hook;
 pub mod manifest;
 pub mod matrix;
+pub mod narzstd;
 pub mod pathinfo;
 pub mod pipeline;
 pub mod prefetch;

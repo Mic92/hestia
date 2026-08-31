@@ -18,9 +18,11 @@ job builds, and an HTTP listener serving the Nix binary cache protocol.
 The action puts the daemon first in `extra-substituters`, so Nix asks
 it before cache.nixos.org. A narinfo hit answers straight from the
 segments loaded at startup. A NAR request is more involved: the daemon fetches the path's
-chunks from pack blobs with HTTP Range reads, reassembles the NAR, and
-verifies its hash before the first byte leaves the process. Any failure
-along the way (evicted pack, missing chunk, hash mismatch) becomes a
+chunks from pack blobs with HTTP Range reads and serves them as
+`.nar.zst` without recompressing: the stored zstd frames are spliced
+verbatim between small raw frames carrying the NAR framing, and Nix
+checks `NarHash` after decoding. Any failure
+along the way (evicted pack, missing chunk) becomes a
 404 and Nix quietly falls through to the next substituter; the daemon
 would rather serve nothing than something corrupt.
 
@@ -109,8 +111,8 @@ even though nothing else in the file changed.
 hestia rewrites those occurrences to zeros before chunking, so the
 stored chunk stays identical across rebuilds. Each occurrence is
 recorded in a per-file position table (`ChunkList::rewrites`: file
-offset + reference index); on NAR reassembly the daemon copies the real
-hash back into each span. The hashes are not stored twice -- they come
+offset + reference index); when serving, the daemon re-encodes just the
+chunks an occurrence touches with the real hash copied back. The hashes are not stored twice -- they come
 from the path's `references` in the `PathEntry`, and a reference's index
 is its position in the sorted, deduplicated reference set, so write and
 read derive identical indices.

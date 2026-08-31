@@ -70,6 +70,12 @@ pub async fn load_snapshot(fake: &FakeGha, http: &reqwest::Client) -> Arc<Snapsh
 }
 
 /// Store path hash (`<hash>` of `<hash>-<name>`).
+/// A served `.nar.zst` body back to the NAR.
+pub async fn nar_body(response: reqwest::Response) -> Bytes {
+    let body = response.bytes().await.expect("nar body");
+    Bytes::from(zstd::decode_all(&body[..]).expect("nar.zst decodes"))
+}
+
 pub fn path_hash_of(store_path: &Path) -> PathHash {
     let name = store_path.file_name().unwrap().to_str().unwrap();
     name[..32]

@@ -13,7 +13,7 @@ use hestia::protocol::DrainStats;
 use hestia::store::Snapshot;
 use hestia::substituter::{ManifestStore, Substituter};
 
-use support::common::{TEST_ROOT_KEY, pipeline_context, to_path_set};
+use support::common::{TEST_ROOT_KEY, nar_body, pipeline_context, to_path_set};
 use support::fake_gha::FakeGha;
 use support::store::{ScratchStore, assert_trees_equal, nix_copy};
 
@@ -96,7 +96,7 @@ async fn narinfo_and_nar_from_segments() {
 
         let nar = http.get(format!("{base}/{url}")).send().await.unwrap();
         assert_eq!(nar.status(), 200);
-        let body = nar.bytes().await.unwrap();
+        let body = nar_body(nar).await;
         assert_eq!(body.len() as u64, expected_size);
         assert_eq!(Hash32::digest(&body), expected_hash);
         assert!(access_log.snapshot().contains(&hash.parse().unwrap()));

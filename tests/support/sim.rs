@@ -295,7 +295,7 @@ impl SimCache {
                 .await
                 .expect("nar request");
             assert_eq!(response.status(), 200, "NAR for {}", path.name);
-            let nar = response.bytes().await.expect("nar body");
+            let nar = super::common::nar_body(response).await;
             assert_eq!(
                 nar.len() as u64,
                 entry.nar_size,
