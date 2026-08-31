@@ -33,49 +33,53 @@
   <!-- heads -->
   <text x="40" y="78" class="t">heads</text>
   <rect x="40"  y="90" width="92" height="34" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
-  <text x="86"  y="111" class="m" text-anchor="middle">g-7</text>
+  <text x="86"  y="111" class="m" text-anchor="middle">g-7-…</text>
   <rect x="150" y="90" width="92" height="34" rx="6" fill="#3f5e85" stroke="#33506f"/>
-  <text x="196" y="111" class="mw" text-anchor="middle">h-…-jobA</text>
+  <text x="196" y="111" class="mw" text-anchor="middle">h-7-main-…</text>
   <rect x="260" y="90" width="92" height="34" rx="6" fill="#3f5e85" stroke="#33506f"/>
-  <text x="306" y="111" class="mw" text-anchor="middle">h-…-jobB</text>
+  <text x="306" y="111" class="mw" text-anchor="middle">c-7-main-…</text>
   <path class="edge" d="M 150 107 L 136 107" marker-end="url(#arrow)"/>
   <path class="edge" d="M 306 124 L 306 131 L 86 131 L 86 127" marker-end="url(#arrow)"/>
-  <text x="40" y="148" class="ts">view = newest g-N + writer heads based on it</text>
+  <text x="40" y="148" class="ts">view = newest g-N + h-/c- heads based on it</text>
+  <text x="40" y="164" class="ts">g: GC epoch · h: one drain · c: a root compacted</text>
 
   <!-- segment objects -->
   <text x="420" y="78" class="t">segments</text>
   <rect x="420" y="90" width="150" height="34" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
-  <text x="495" y="111" class="m" text-anchor="middle">seg-71c0….meta</text>
+  <text x="495" y="111" class="m" text-anchor="middle">seg-71c0…  (.meta)</text>
   <rect x="420" y="130" width="150" height="34" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
-  <text x="495" y="151" class="m" text-anchor="middle">seg-71c0….tree</text>
+  <text x="495" y="151" class="m" text-anchor="middle">tree-71c0…  (.tree)</text>
 
   <!-- packs -->
   <text x="640" y="78" class="t">packs</text>
-  <rect x="640" y="90" width="170" height="34" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
-  <text x="725" y="111" class="m" text-anchor="middle">pack-3fa9…  (64 MiB)</text>
-  <rect x="820" y="90" width="170" height="34" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
-  <text x="905" y="111" class="m" text-anchor="middle">pack-3fa9….idx (40 KB)</text>
-  <rect x="640" y="130" width="170" height="34" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
-  <text x="725" y="151" class="m" text-anchor="middle">pack-b21c…</text>
-  <rect x="820" y="130" width="170" height="34" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
-  <text x="905" y="151" class="m" text-anchor="middle">pack-b21c….idx</text>
+  <rect x="640" y="90" width="260" height="34" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
+  <rect x="900" y="90" width="90" height="34" rx="6" fill="#dfe7f0" stroke="#b9c5d2"/>
+  <text x="770" y="111" class="m" text-anchor="middle">pack-3fa9…  frames (64 MiB)</text>
+  <text x="945" y="111" class="ms" text-anchor="middle">index 40 KB</text>
+  <rect x="640" y="130" width="260" height="34" rx="6" fill="#e6ebf1" stroke="#b9c5d2"/>
+  <rect x="900" y="130" width="90" height="34" rx="6" fill="#dfe7f0" stroke="#b9c5d2"/>
+  <text x="770" y="151" class="m" text-anchor="middle">pack-b21c…</text>
+  <text x="945" y="151" class="ms" text-anchor="middle">index</text>
+  <text x="640" y="180" class="ts">index is a trailer: one content address, one extra Range read</text>
 
   <!-- head -> decoded -->
   <path class="edge" d="M 250 124 C 250 170, 200 200, 200 222" marker-end="url(#arrow)"/>
 
   <!-- ======================= head ======================= -->
   <rect x="20" y="224" width="360" height="236" rx="10" fill="#fbfcfd" stroke="#cdd6e0"/>
-  <text x="40" y="250" class="h1">g-7 (GC) and h-…-jobA (writer)</text>
+  <text x="40" y="250" class="h1">g (GC) and h/c (writer) records</text>
   <rect x="40" y="264" width="320" height="24" rx="4" fill="#3f5e85"/>
   <text x="50" y="281" class="h2">Heads</text>
   <rect x="40" y="288" width="320" height="156" fill="#ffffff" stroke="#cdd6e0"/>
-  <text x="50" y="306" class="m">epoch: 7</text>
-  <text x="50" y="322" class="ms">roots: { main-x86_64-linux: [71c0…],</text>
-  <text x="50" y="336" class="ms">         pr-512-aarch64-darwin: [c3d1…] }</text>
-  <text x="50" y="350" class="ms">retired: [seg…]   folded: [h-…, g-6]</text>
-  <text x="50" y="380" class="m">base_epoch: 7, root: main-x86_64-linux</text>
-    <text x="50" y="396" class="ms">added: [9e2d…]   replaces: []  (= view if compacted)</text>
-  <text x="50" y="422" class="ms">GC g+1 deletes what g retired. No other clock.</text>
+  <text x="50" y="306" class="m">g: epoch: 7, time</text>
+  <text x="50" y="322" class="ms">roots: [ (main-x86_64-linux, 71c0…, stamp),</text>
+  <text x="50" y="336" class="ms">         (pr-512-aarch64-darwin, c3d1…, stamp) ]</text>
+  <text x="50" y="350" class="ms">retired: [seg…]  folded: [h-…, g-6]</text>
+  <text x="50" y="364" class="ms">origin: [(seg, identity)]</text>
+  <text x="50" y="384" class="m">h/c: base_epoch: 7, root: main-…</text>
+  <text x="50" y="400" class="ms">h: adds seg 9e2d…   c: one seg replaces the root's</text>
+  <text x="50" y="414" class="ms">+ sigstore bundle when trust is on</text>
+  <text x="50" y="432" class="ms">GC g+1 deletes what g retired. No other clock.</text>
   <text x="40" y="455" class="ts" fill="#3b8a5c">narinfo: head + .meta</text>
 
   <path class="edge-green" d="M 360 322 L 398 322" marker-end="url(#arrow-green)"/>
@@ -86,7 +90,7 @@
 
   <text x="420" y="276" class="t">header</text>
   <rect x="470" y="262" width="530" height="22" class="cell"/>
-  <text x="480" y="277" class="ms">pack_table: [ (PackHash, size, oci_digest?) … ]</text>
+  <text x="480" y="277" class="ms">packs: [ (PackHash, size, chunks, live_count, live_bits) … ],  tree: SegDigest</text>
 
   <text x="420" y="308" class="t">index</text>
   <rect x="470" y="294" width="40"  height="22" class="cell"/>
@@ -110,7 +114,7 @@
   <text x="895" y="363" class="ms" text-anchor="middle">body n-1</text>
   <rect x="470" y="380" width="530" height="66" fill="#ffffff" stroke="#cdd6e0"/>
   <text x="480" y="396" class="m">u8 name_len | name | cbor {</text>
-  <text x="494" y="411" class="ms">nar_hash, nar_size, deriver_name, ca,</text>
+  <text x="494" y="411" class="ms">nar_hash, nar_size, deriver, ca,</text>
   <text x="494" y="425" class="ms">local_refs: bytes of u32 → row in this segment,  foreign_refs: "p1 p2 …"</text>
   <text x="480" y="440" class="m">}</text>
   <path class="edge" d="M 665 370 L 665 380" />
@@ -148,17 +152,17 @@
 
   <!-- ======================= pack ======================= -->
   <rect x="640" y="478" width="380" height="302" rx="10" fill="#f4f6f9" stroke="#cdd6e0"/>
-  <text x="660" y="504" class="h1">pack + index</text>
+  <text x="660" y="504" class="h1">pack = frames + index trailer</text>
 
-  <text x="660" y="530" class="t">pack-3fa9….idx</text>
+  <text x="660" y="530" class="t">index  (magic | n | 32 B rows)</text>
   <rect x="660" y="540" width="340" height="24" rx="4" fill="#3f5e85"/>
-  <text x="670" y="557" class="h2">chunk_idx &#8594; (offset, zsize, size, Blake3Chunk)</text>
+  <text x="670" y="557" class="h2">chunk_idx &#8594; (Blake3Chunk, offset, zsize, size)</text>
   <rect x="660" y="564" width="340" height="58" fill="#ffffff" stroke="#cdd6e0"/>
-  <text x="670" y="582" class="ms">0 → 0, 18 KiB, 64 KiB, c44d…</text>
-  <text x="670" y="597" class="ms" fill="#c2603e">7 → 131072, 22 KiB, 64 KiB, 9b1e…</text>
+  <text x="670" y="582" class="ms">0 → c44d…, 0, 18 KiB, 64 KiB</text>
+  <text x="670" y="597" class="ms" fill="#c2603e">7 → 9b1e…, 131072, 22 KiB, 64 KiB</text>
   <text x="670" y="612" class="ms">…</text>
 
-  <text x="660" y="650" class="t">pack-3fa9…</text>
+  <text x="660" y="650" class="t">frames  (index at offset = packs[].size)</text>
   <rect x="660" y="660" width="80"  height="30" class="cell"/>
   <rect x="740" y="660" width="120" height="30" fill="#f2d9cd" stroke="#c2603e" stroke-width="1.5"/>
   <rect x="860" y="660" width="50"  height="30" class="cell"/>
@@ -176,7 +180,7 @@
   <!-- .tree body -> pack idx -->
   <path class="edge-accent" d="M 600 652 L 630 652 L 630 597 L 656 597" marker-end="url(#arrow-accent)"/>
   <text x="636" y="636" class="ts" fill="#c2603e">chunk_idx</text>
-  <!-- .tree pack_idx -> .meta pack_table -->
+  <!-- .tree pack_idx -> .meta packs -->
   <path class="edge" d="M 600 626 L 622 626 L 622 473 L 1010 473 L 1010 288" marker-end="url(#arrow)"/>
   <text x="950" y="465" class="ts">pack_idx</text>
   <!-- NAR path: .meta row i -> .tree row i -->
