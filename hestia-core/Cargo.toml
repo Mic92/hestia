@@ -17,7 +17,7 @@ ciborium = "0.2"
 zstd = "0.13"
 
 # Content-defined chunking
-fastcdc = "4"
+fastcdc = "5"
 
 # Internal content addresses (chunk + pack hashes); faster than SHA-256
 aho-corasick = "1"
