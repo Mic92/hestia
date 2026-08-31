@@ -9,5 +9,6 @@ pub mod common;
 pub mod fake_gha;
 pub mod fake_oci;
 pub mod fake_s3;
+pub mod real;
 pub mod sim;
 pub mod store;
