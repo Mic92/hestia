@@ -652,6 +652,9 @@ fn narinfo_for_entry(store_dir: &StoreDir, entry: &PathEntry, hash: &str) -> Vec
 async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>) -> Response {
     let _activity = state.touch();
     state.manifest_ready().await;
+    if let Some(hash_str) = file.strip_suffix(".ls") {
+        return listing(&state, hash_str).await;
+    }
     let Some(hash_str) = file.strip_suffix(".narinfo") else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -677,6 +680,22 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
 
     let body = narinfo_for_entry(&state.store_dir, &entry, hash_str);
     ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], body).into_response()
+}
+
+/// nix's `<hash>.ls` from the stored tree and pack indexes; no pack data.
+async fn listing(state: &Substituter, hash_str: &str) -> Response {
+    let Ok(path_hash) = hash_str.parse::<PathHash>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(Some(r)) = state.manifest.view().resolve(&path_hash).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match crate::listing::listing(&r.entry.tree, |h| {
+        r.map.chunks.get(h).map(|c| u64::from(c.uncompressed_size))
+    }) {
+        Ok(v) => ([(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// CA build trace lookup; nix follows up with the narinfo of `outPath`,
