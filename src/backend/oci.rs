@@ -6,9 +6,10 @@
 //! except on GHCR where the [`ghcr`](super::ghcr) ledger knows every
 //! object. Delete is `DELETE /manifests/<digest>`, or GHCR's packages API.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use reqwest::{RequestBuilder, Response, StatusCode, header};
@@ -29,6 +30,8 @@ const ARTIFACT_PREFIX: &str = "application/vnd.hestia.";
 const KEY_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 const TAGS_PAGE: usize = 1000;
 const TRANSIENT_RETRIES: u32 = 4;
+/// GHCR's signed blob URLs carry a longer expiry, this stays below it.
+const REDIRECT_TTL: Duration = Duration::from_secs(60);
 
 pub const ENV_OCI_USER: &str = "HESTIA_OCI_USER";
 pub const ENV_OCI_PASSWORD: &str = "HESTIA_OCI_PASSWORD";
@@ -36,6 +39,10 @@ pub const ENV_OCI_PASSWORD: &str = "HESTIA_OCI_PASSWORD";
 #[derive(Clone)]
 pub struct Oci {
     http: reqwest::Client,
+    /// Same, but sees blob redirects instead of following them.
+    no_redirect: reqwest::Client,
+    /// Blob digest -> CDN URL the registry redirected to.
+    redirects: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     /// `https://ghcr.io`
     registry: String,
     /// `owner/repo/hestia`
@@ -145,6 +152,11 @@ impl Oci {
         Ok(Oci {
             ghcr: github_api.and_then(|(api, token)| Packages::new(http.clone(), api, name, token)),
             http,
+            no_redirect: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+            redirects: Default::default(),
             registry: format!("{scheme}://{host}"),
             name: name.to_owned(),
             basic,
@@ -243,9 +255,9 @@ impl Oci {
     }
 
     /// POST then PUT, the one upload flow every registry has. `false` if
-    /// the blob was there already.
-    async fn upload_blob(&self, digest: &str, data: Bytes) -> Result<bool, Error> {
-        if self.blob_exists(digest).await? {
+    /// `may_exist` and the blob was there already.
+    async fn upload_blob(&self, digest: &str, data: Bytes, may_exist: bool) -> Result<bool, Error> {
+        if may_exist && self.blob_exists(digest).await? {
             return Ok(false);
         }
         let url = self.v2("blobs/uploads/");
@@ -280,7 +292,7 @@ impl Oci {
     /// Every manifest here references the empty descriptor.
     async fn put_manifest(&self, reference: &str, body: Vec<u8>) -> Result<(), Error> {
         self.empty_pushed
-            .get_or_try_init(|| self.upload_blob(EMPTY_DIGEST, Bytes::from_static(b"{}")))
+            .get_or_try_init(|| self.upload_blob(EMPTY_DIGEST, Bytes::from_static(b"{}"), true))
             .await?;
         let url = self.v2(&format!("manifests/{reference}"));
         let body = Bytes::from(body);
@@ -303,14 +315,17 @@ impl Oci {
         let blob = Some((digest.as_str(), data.len()));
         if let Some(expected) = content_digest(key) {
             assert_eq!(digest, expected, "{key} does not name its content");
-            let created = self.upload_blob(&digest, data.clone()).await?;
+            // Packs may come from a concurrent writer, segments never do.
+            let created = self
+                .upload_blob(&digest, data.clone(), kind(key) == "pack")
+                .await?;
             // Also when the blob existed: heals one whose manifest never landed.
             let m = manifest(key, None, blob);
             self.put_manifest(&sha256(&m), m).await?;
             return Ok(created);
         }
         if !data.is_empty() {
-            self.upload_blob(&digest, data.clone()).await?;
+            self.upload_blob(&digest, data.clone(), false).await?;
         }
         let m = manifest(key, blob.filter(|_| !data.is_empty()), None);
         self.put_manifest(key, m).await?;
@@ -357,21 +372,69 @@ impl Oci {
         }
     }
 
+    /// Through a remembered CDN URL, unless there is none or it expired.
+    async fn fetch_redirected(
+        &self,
+        digest: &str,
+        fetch: &impl Fn(&str, &reqwest::Client) -> RequestBuilder,
+    ) -> Result<Option<Response>, Error> {
+        let cdn = {
+            let mut redirects = self.redirects.lock().unwrap();
+            redirects.retain(|_, (_, t)| t.elapsed() < REDIRECT_TTL);
+            redirects.get(digest).map(|(u, _)| u.clone())
+        };
+        let Some(cdn) = cdn else { return Ok(None) };
+        let r = fetch(&cdn, &self.http).send().await?;
+        Ok((!matches!(r.status(), StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)).then_some(r))
+    }
+
+    fn remember_redirect(
+        &self,
+        digest: &str,
+        url: &str,
+        r: &Response,
+    ) -> Result<Option<String>, Error> {
+        if !r.status().is_redirection() {
+            return Ok(None);
+        }
+        let cdn = r
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|l| l.to_str().ok())
+            .map(|l| self.absolute(l))
+            .ok_or_else(|| Error::InvalidResponse(format!("{url}: redirect without Location")))?;
+        self.redirects
+            .lock()
+            .unwrap()
+            .insert(digest.to_owned(), (cdn.clone(), Instant::now()));
+        Ok(Some(cdn))
+    }
+
+    /// Registries like GHCR redirect blob reads to signed CDN URLs. Those
+    /// are remembered so a burst of range reads on one pack skips the
+    /// registry round trip.
     async fn get_blob(
         &self,
         digest: &str,
         range: Option<Range<u64>>,
     ) -> Result<Option<Bytes>, Error> {
         let url = self.v2(&format!("blobs/{digest}"));
-        let r = self
-            .send(|| {
-                let mut req = self.http.get(&url);
-                if let Some(r) = &range {
-                    req = req.header(header::RANGE, format!("bytes={}-{}", r.start, r.end - 1));
+        let fetch = |u: &str, http: &reqwest::Client| match &range {
+            Some(r) => http
+                .get(u)
+                .header(header::RANGE, format!("bytes={}-{}", r.start, r.end - 1)),
+            None => http.get(u),
+        };
+        let r = match self.fetch_redirected(digest, &fetch).await? {
+            Some(r) => r,
+            None => {
+                let r = self.send(|| fetch(&url, &self.no_redirect)).await?;
+                match self.remember_redirect(digest, &url, &r)? {
+                    Some(cdn) => fetch(&cdn, &self.http).send().await?,
+                    None => r,
                 }
-                req
-            })
-            .await?;
+            }
+        };
         match (r.status(), &range) {
             (StatusCode::NOT_FOUND, _) => Ok(None),
             (StatusCode::OK, None) => Ok(Some(r.bytes().await?)),
@@ -493,6 +556,9 @@ impl Oci {
 
     /// Deletes the key's manifest. The registry's own GC reclaims the blobs.
     pub async fn delete(&self, key: &str) -> Result<bool, Error> {
+        if let Some(d) = content_digest(key) {
+            self.redirects.lock().unwrap().remove(&d);
+        }
         if let (Some(ghcr), Some(mut ledger)) = (&self.ghcr, self.ledger().await?) {
             return ghcr.delete(&mut ledger, key).await;
         }
