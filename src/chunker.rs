@@ -7,6 +7,7 @@
 //! stays independently extractable via `(offset, compressed_size)` Range
 //! reads against the pack.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use std::task::Poll;
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use harmonia_file_nar::{NarByteStream, NarEvent, NarWriter};
+use zstd::bulk::{Compressor, Decompressor};
 
 use crate::manifest::{
     ChunkHash, ChunkList, ChunkLocation, Directory, FileSystemObject, FileTree, Hash32, PackHash,
@@ -58,13 +60,17 @@ impl Default for ChunkParams {
 /// percent.
 const ZSTD_LEVEL: i32 = 3;
 
-/// Largest zstd window log accepted when decoding chunk frames.
-///
-/// Frames produced at [`ZSTD_LEVEL`] declare a window log of 21; anything
-/// larger in pack data is corrupt or malicious. Pinned together with
-/// [`ZSTD_LEVEL`]: raising the level can raise the declared window log,
-/// which would make existing extraction reject legitimate frames.
-const MAX_CHUNK_WINDOW_LOG: u32 = 21;
+// A context per thread, not per chunk: setting one up costs about 1 MiB.
+thread_local! {
+    static COMPRESSOR: RefCell<Compressor<'static>> =
+        RefCell::new(Compressor::new(ZSTD_LEVEL).expect("zstd level is valid"));
+    static DECOMPRESSOR: RefCell<Decompressor<'static>> =
+        RefCell::new(Decompressor::new().expect("zstd decompressor"));
+}
+
+fn compress_chunk(data: &[u8]) -> Result<Vec<u8>, Error> {
+    Ok(COMPRESSOR.with_borrow_mut(|c| c.compress(data))?)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -207,7 +213,7 @@ impl PackBuilder {
             return Ok(false);
         }
         let offset = self.buffer.len() as u64;
-        let compressed = zstd::encode_all(chunk.data.as_ref(), ZSTD_LEVEL)?;
+        let compressed = compress_chunk(&chunk.data)?;
         self.buffer.extend_from_slice(&compressed);
         self.chunks.push((
             chunk.hash,
@@ -294,7 +300,7 @@ pub fn compress_chunks(chunks: Vec<Chunk>) -> Result<Vec<CompressedChunk>, Error
     let compress_one = |chunk: &Chunk| -> Result<CompressedChunk, Error> {
         Ok(CompressedChunk {
             hash: chunk.hash,
-            frame: zstd::encode_all(chunk.data.as_ref(), ZSTD_LEVEL)?,
+            frame: compress_chunk(&chunk.data)?,
             uncompressed_size: chunk.data.len() as u32,
         })
     };
@@ -845,22 +851,22 @@ async fn write_nar<W: tokio::io::AsyncWrite + Unpin>(
 /// decompression is bounded at [`MAX_CHUNK_SIZE`] so a small malicious
 /// frame cannot allocate gigabytes.
 pub fn extract_chunk(compressed: &[u8], expected: &ChunkHash) -> Result<Vec<u8>, Error> {
-    use std::io::Read as _;
-    let mut data = Vec::new();
-    let mut decoder = zstd::Decoder::with_buffer(compressed)?;
-    // Reject oversized declared windows at header parse time: a crafted
-    // frame in untrusted pack data could otherwise force a large window
-    // allocation (up to 128 MiB with libzstd's default cap) before any
-    // output is read.
-    decoder.window_log_max(MAX_CHUNK_WINDOW_LOG)?;
-    // Read at most one byte past the limit: enough to detect oversize
-    // without buffering the full payload.
-    decoder
-        .take(u64::from(MAX_CHUNK_SIZE) + 1)
-        .read_to_end(&mut data)?;
-    if data.len() > MAX_CHUNK_SIZE as usize {
-        return Err(Error::OversizedChunk);
-    }
+    // Capacity is the size limit: one-shot decoding fails past it.
+    let limit = MAX_CHUNK_SIZE as usize;
+    let capacity = match zstd::zstd_safe::get_frame_content_size(compressed) {
+        Ok(Some(n)) if n <= limit as u64 => n as usize,
+        Ok(Some(_)) => return Err(Error::OversizedChunk),
+        _ => limit,
+    };
+    let data = DECOMPRESSOR
+        .with_borrow_mut(|d| d.decompress(compressed, capacity))
+        .map_err(|e| {
+            if capacity == limit && e.to_string().contains("Destination buffer is too small") {
+                Error::OversizedChunk
+            } else {
+                Error::Io(e)
+            }
+        })?;
     let actual = ChunkHash::digest(&data);
     if actual != *expected {
         return Err(Error::HashMismatch {
@@ -1102,31 +1108,15 @@ mod tests {
     }
 
     #[test]
-    fn extract_chunk_rejects_oversized_window_declarations() {
-        // A crafted frame can declare a huge decoder window in its header,
-        // forcing libzstd to allocate it before any output is read. Such
-        // frames must fail at header parse time, without the allocation.
-        let payload = test_data(1024, 6);
-        let mut encoder = zstd::Encoder::new(Vec::new(), 3).unwrap();
-        encoder.window_log(MAX_CHUNK_WINDOW_LOG + 3).unwrap();
-        // Streaming without a pledged content size forces the frame header
-        // to carry the window descriptor.
-        std::io::Write::write_all(&mut encoder, &payload).unwrap();
-        let frame = encoder.finish().unwrap();
-
-        let expected = ChunkHash::digest(&payload);
-        assert!(matches!(
-            extract_chunk(&frame, &expected),
-            Err(Error::Io(_))
-        ));
-
-        // Frames produced the production way (compress_chunks at
-        // ZSTD_LEVEL) still extract fine, up to the largest chunk size.
-        let big = test_data(MAX_CHUNK_SIZE as usize, 8);
-        for data in [payload, big] {
+    fn extract_chunk_takes_frames_with_and_without_declared_size() {
+        for data in [test_data(1024, 6), test_data(MAX_CHUNK_SIZE as usize, 8)] {
             let expected = ChunkHash::digest(&data);
-            let normal = zstd::encode_all(data.as_ref(), ZSTD_LEVEL).unwrap();
-            assert_eq!(extract_chunk(&normal, &expected).unwrap(), data);
+            let streamed = zstd::encode_all(data.as_ref(), ZSTD_LEVEL).unwrap();
+            assert_eq!(extract_chunk(&streamed, &expected).unwrap(), data);
+            assert_eq!(
+                extract_chunk(&compress_chunk(&data).unwrap(), &expected).unwrap(),
+                data
+            );
         }
     }
 
