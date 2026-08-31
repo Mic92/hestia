@@ -91,3 +91,8 @@ proptest = "1"
 tempfile = "3"
 # Basic auth check in the fake OCI registry
 base64 = "0.22"
+divan = "0.1"
+
+[[bench]]
+name = "backend"
+harness = false
