@@ -183,9 +183,14 @@ async function verifyAttestation(repo, assetName, digest, token) {
  * Falls back to the GitHub API for the repository this action was loaded
  * from, so forks resolve their own releases.
  */
+/** The repo this action was loaded from. Empty for `uses: ./`, then this repo. */
+function actionRepo() {
+  return process.env.GITHUB_ACTION_REPOSITORY || process.env.GITHUB_REPOSITORY || 'Mic92/hestia';
+}
+
 async function resolveVersion(version) {
   if (version !== 'latest') return version;
-  const repo = process.env.GITHUB_ACTION_REPOSITORY || 'Mic92/hestia';
+  const repo = actionRepo();
   // /releases/latest skips prereleases, so list recent releases and pick
   // the highest published (non-draft) version. The list endpoint orders by
   // creation date, so a hotfix for an older line would otherwise downgrade
@@ -230,9 +235,7 @@ async function installBinary(installDir) {
           "pass the 'binary' input to use a locally built hestia"
       );
     }
-    // GITHUB_ACTION_REPOSITORY points at the repo this action was loaded
-    // from, so forks automatically download their own releases.
-    const repo = process.env.GITHUB_ACTION_REPOSITORY || 'Mic92/hestia';
+    const repo = actionRepo();
     const assetName = `hestia-${arch}-${process.platform}`;
     const url = `${serverBase}/${repo}/releases/download/${version}/${assetName}`;
     console.log(`hestia-cache: downloading ${url}`);
