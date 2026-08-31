@@ -292,6 +292,7 @@ async fn drain_racing_gc_is_kept() {
             references: vec![],
             ca: None,
             deriver: None,
+            realises: Vec::new(),
             tree,
         };
         hestia::store::push_entry(&mut writer, &entry, &known).unwrap();

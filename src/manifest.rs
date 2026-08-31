@@ -200,6 +200,8 @@ pub struct PathEntry {
     pub references: Vec<StorePath>,
     pub ca: Option<String>,
     pub deriver: Option<StorePath>,
+    /// `drv^output` ids of CA derivation outputs this path realises.
+    pub realises: Vec<String>,
     pub tree: FileTree<ChunkList>,
 }
 

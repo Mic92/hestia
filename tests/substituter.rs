@@ -206,6 +206,53 @@ async fn narinfo_miss_is_404() {
     .await;
 }
 
+/// nix with `ca-derivations` asks `build-trace-v2/<drv>/<output>.doi`
+/// before the narinfo; the answer comes from the builder's `BuildTraceV3`.
+#[tokio::test]
+async fn ca_build_trace_is_served() {
+    timed(async {
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let fixture = store.add_fixture("trace", 5);
+        let out = fixture.file_name().unwrap().to_str().unwrap().to_owned();
+        let drv = "7a1cn6yiwx3gk5g5m5d5d9dp7hh0b3vr-trace.drv";
+        {
+            let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS BuildTraceV3 (id integer primary key, drvPath text, \
+                 outputName text, outputPath text, signatures text)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO BuildTraceV3 (drvPath, outputName, outputPath) VALUES (?1, ?2, ?3)",
+                (drv, "out", fixture.to_str().unwrap()),
+            )
+            .unwrap();
+        }
+
+        let fake = FakeGha::start().await;
+        let http = reqwest::Client::new();
+        push_paths(&fake, &http, &store, &[&fixture]).await;
+        let substituter = RunningSubstituter::start(&fake, &http, &store).await;
+
+        let response = substituter
+            .get(&http, &format!("build-trace-v2/{drv}/out.doi"))
+            .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body, serde_json::json!({"outPath": out, "signatures": []}));
+        for miss in [
+            format!("build-trace-v2/{drv}/dev.doi"),
+            format!("build-trace-v2/{drv}/out"),
+            format!("build-trace-v2/{out}/out.doi"),
+        ] {
+            assert_eq!(substituter.get(&http, &miss).await.status(), 404, "{miss}");
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn narinfo_matches_nix_path_info_oracle() {
     timed(async {

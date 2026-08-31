@@ -584,6 +584,7 @@ impl Substituter {
             .route("/nix-cache-info", get(nix_cache_info))
             .route("/{file}", get(narinfo))
             .route("/nar/{file}", get(nar))
+            .route("/build-trace-v2/{drv}/{file}", get(build_trace))
             .route("/closure/{hashes}", get(closure))
             .route(
                 "/closure/{hashes}/external-references",
@@ -676,6 +677,34 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
 
     let body = narinfo_for_entry(&state.store_dir, &entry, hash_str);
     ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], body).into_response()
+}
+
+/// CA build trace lookup; nix follows up with the narinfo of `outPath`,
+/// which records the access.
+async fn build_trace(
+    State(state): State<Arc<Substituter>>,
+    Path((drv, file)): Path<(String, String)>,
+) -> Response {
+    let _activity = state.touch();
+    state.manifest_ready().await;
+    let Some(output) = file.strip_suffix(".doi") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(out_path) = state
+        .manifest
+        .view()
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.realisation(&format!("{drv}^{output}")))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let body = serde_json::json!({"outPath": out_path.to_string(), "signatures": []});
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1070,6 +1099,7 @@ mod tests {
             references: vec![],
             ca: None,
             deriver: None,
+            realises: Vec::new(),
             tree: FileTree(FileSystemObject::Regular(Regular {
                 executable: false,
                 contents: ChunkList::default(),
