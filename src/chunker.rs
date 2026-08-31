@@ -64,12 +64,19 @@ const ZSTD_LEVEL: i32 = 3;
 thread_local! {
     static COMPRESSOR: RefCell<Compressor<'static>> =
         RefCell::new(Compressor::new(ZSTD_LEVEL).expect("zstd level is valid"));
+    /// Serve path: chunks re-encoded per request after reference restore.
+    static FAST_COMPRESSOR: RefCell<Compressor<'static>> =
+        RefCell::new(Compressor::new(1).expect("zstd level is valid"));
     static DECOMPRESSOR: RefCell<Decompressor<'static>> =
         RefCell::new(Decompressor::new().expect("zstd decompressor"));
 }
 
-fn compress_chunk(data: &[u8]) -> Result<Vec<u8>, Error> {
+pub fn compress_chunk(data: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(COMPRESSOR.with_borrow_mut(|c| c.compress(data))?)
+}
+
+pub fn compress_chunk_fast(data: &[u8]) -> Result<Vec<u8>, Error> {
+    Ok(FAST_COMPRESSOR.with_borrow_mut(|c| c.compress(data))?)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -810,9 +817,9 @@ pub async fn nar_hash_from_chunks(
     sink.finish()
 }
 
-/// Serialize a complete NAR from the stored representation (file tree +
-/// chunk data). Shares event synthesis with [`nar_hash_from_chunks`], so
-/// the bytes served here are the bytes whose hash was verified on upload.
+/// The NAR whose hash [`nar_hash_from_chunks`] computes, as reference
+/// for the serve path's own encoder.
+#[cfg(test)]
 pub async fn nar_from_chunks(
     tree: &FileTree<ChunkList>,
     chunks: &BTreeMap<ChunkHash, Bytes>,

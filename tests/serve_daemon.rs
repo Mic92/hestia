@@ -18,7 +18,7 @@ use hestia::protocol::{self, DrainStats, Request};
 use hestia::serve::Daemon;
 use hestia::substituter::{ManifestStore, Substituter};
 
-use support::common::{load_snapshot, path_hash_of, pipeline_context};
+use support::common::{load_snapshot, nar_body, path_hash_of, pipeline_context};
 use support::fake_gha::FakeGha;
 use support::store::ScratchStore;
 
@@ -749,7 +749,7 @@ async fn substituter_serves_paths_pushed_by_daemon_drains() {
             .unwrap();
         assert_eq!(response.status(), 200);
         let (expected_hash, expected_size) = store.nar_hash_oracle(&fixture).unwrap();
-        let nar = response.bytes().await.unwrap();
+        let nar = nar_body(response).await;
         assert_eq!(nar.len() as u64, expected_size);
         assert_eq!(hestia::manifest::Hash32::digest(nar), expected_hash);
 

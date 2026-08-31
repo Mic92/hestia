@@ -134,20 +134,41 @@ impl RefTable {
     /// the concatenated (normalized) file content.
     pub fn restore(&self, data: &mut [u8], rewrites: &[Rewrite]) -> Result<(), Error> {
         for rewrite in rewrites {
+            let offset = rewrite.offset as usize;
+            if offset
+                .checked_add(HASH_LEN)
+                .is_none_or(|end| end > data.len())
+            {
+                return Err(Error::OffsetOutOfRange {
+                    offset,
+                    len: data.len(),
+                });
+            }
+        }
+        self.restore_window(data, 0, rewrites)
+    }
+
+    /// [`Self::restore`] with `data` being the file from byte `base` on:
+    /// occurrences are clipped to it.
+    pub fn restore_window(
+        &self,
+        data: &mut [u8],
+        base: u64,
+        rewrites: &[Rewrite],
+    ) -> Result<(), Error> {
+        let end = base + data.len() as u64;
+        for rewrite in rewrites {
             let index = rewrite.ref_index as usize;
             let hash = self.hashes.get(index).ok_or(Error::IndexOutOfRange {
                 index,
                 len: self.hashes.len(),
             })?;
-            let offset = rewrite.offset as usize;
-            let end = offset
-                .checked_add(HASH_LEN)
-                .filter(|&end| end <= data.len())
-                .ok_or(Error::OffsetOutOfRange {
-                    offset,
-                    len: data.len(),
-                })?;
-            data[offset..end].copy_from_slice(hash);
+            let (from, to) = (rewrite.offset, rewrite.offset + HASH_LEN as u64);
+            let (lo, hi) = (from.max(base), to.min(end));
+            if lo < hi {
+                data[(lo - base) as usize..(hi - base) as usize]
+                    .copy_from_slice(&hash[(lo - from) as usize..(hi - from) as usize]);
+            }
         }
         Ok(())
     }

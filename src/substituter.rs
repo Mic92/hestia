@@ -6,7 +6,7 @@
 //! * `GET /{hash}.narinfo` — manifest lookup; a hit is recorded in the
 //!   [`AccessLog`] (narinfo hits are the liveness signal: accessed paths
 //!   join this run's GC root).
-//! * `GET /nar/{narhash}.nar` — chunks are fetched from packs (batched
+//! * `GET /nar/{narhash}.nar.zst` — chunks are fetched from packs (batched
 //!   Range requests, parallel across packs, signed URLs cached and
 //!   refreshed on 403), the NAR is synthesized from the manifest tree, and
 //!   its hash is verified before a single byte leaves the process. Any
@@ -45,11 +45,12 @@ use harmonia_store_path::StoreDir;
 use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
 
 use crate::backend::Backend;
-use crate::chunker::{self, extract_chunk, flatten_tree, nar_from_chunks, pack_cache_key};
+use crate::chunker::{self, flatten_tree, pack_cache_key};
 use crate::gha::Error as GhaError;
 use crate::manifest::{
     ChunkHash, ChunkLocation, FileSystemObject, Hash32, PackHash, PathEntry, PathHash,
 };
+use crate::narzstd::{self, Frame};
 use crate::pipeline::AccessLog;
 use crate::refnorm::RefTable;
 use crate::segment::PackIndex;
@@ -194,19 +195,19 @@ impl From<crate::store::Error> for FetchError {
     }
 }
 
-/// Decompressed chunks kept in memory, evicted least-recently-used first
+/// Chunk frames kept in memory, evicted least-recently-used first
 /// once over budget: chunks shared across paths (dedup) and repeated NAR
 /// requests keep hitting early-inserted chunks, so insertion-order
 /// eviction would drop the hot set first.
 #[derive(Default)]
 struct ChunkCache {
-    chunks: HashMap<ChunkHash, Bytes>,
+    chunks: HashMap<ChunkHash, Frame>,
     order: VecDeque<ChunkHash>,
     total: usize,
 }
 
 impl ChunkCache {
-    fn get(&mut self, hash: &ChunkHash) -> Option<Bytes> {
+    fn get(&mut self, hash: &ChunkHash) -> Option<Frame> {
         let data = self.chunks.get(hash).cloned()?;
         // Move-to-back on hit (entry counts are small enough for the
         // linear scan): a hit must postpone eviction.
@@ -217,11 +218,11 @@ impl ChunkCache {
         Some(data)
     }
 
-    fn insert(&mut self, hash: ChunkHash, data: Bytes) {
+    fn insert(&mut self, hash: ChunkHash, data: Frame) {
         if self.chunks.contains_key(&hash) {
             return;
         }
-        self.total += data.len();
+        self.total += data.zstd.len();
         self.chunks.insert(hash, data);
         self.order.push_back(hash);
         while self.total > CHUNK_CACHE_BUDGET {
@@ -229,7 +230,7 @@ impl ChunkCache {
                 break;
             };
             if let Some(dropped) = self.chunks.remove(&oldest) {
-                self.total -= dropped.len();
+                self.total -= dropped.zstd.len();
             }
         }
     }
@@ -238,7 +239,7 @@ impl ChunkCache {
 /// Fetches chunks from pack blobs.
 struct ChunkFetcher {
     backend: Backend,
-    /// Decompressed chunks (filled by NAR requests).
+    /// Filled by NAR requests.
     chunk_cache: Mutex<ChunkCache>,
     /// Per-path serialization: concurrent NAR requests for the same path
     /// must not fetch the same chunks twice.
@@ -284,7 +285,7 @@ impl ChunkFetcher {
         &self,
         path: PathHash,
         resolved: &Resolved,
-    ) -> Result<BTreeMap<ChunkHash, Bytes>, FetchError> {
+    ) -> Result<BTreeMap<ChunkHash, Frame>, FetchError> {
         // Serialize per path so concurrent NAR requests for the same
         // path do the work once.
         let lock = self.path_lock(path);
@@ -297,14 +298,13 @@ impl ChunkFetcher {
     ///
     /// Missing chunks are grouped by pack; nearby chunks within a pack are
     /// coalesced into single Range requests (with read-ahead, see
-    /// [`PACK_READ_AHEAD_BYTES`]); packs are fetched in parallel. Every
-    /// chunk is hash-verified during extraction.
+    /// [`PACK_READ_AHEAD_BYTES`]); packs are fetched in parallel.
     async fn fetch_chunks(
         &self,
         source: &ChunkMap,
         needed: BTreeSet<ChunkHash>,
-    ) -> Result<BTreeMap<ChunkHash, Bytes>, FetchError> {
-        let mut result: BTreeMap<ChunkHash, Bytes> = BTreeMap::new();
+    ) -> Result<BTreeMap<ChunkHash, Frame>, FetchError> {
+        let mut result: BTreeMap<ChunkHash, Frame> = BTreeMap::new();
         let mut missing: BTreeMap<PackHash, Vec<(ChunkHash, ChunkLocation)>> = BTreeMap::new();
         {
             let mut cache = self.chunk_cache.lock().expect("chunk cache poisoned");
@@ -360,7 +360,7 @@ impl ChunkFetcher {
         pack: PackHash,
         mut chunks: Vec<(ChunkHash, ChunkLocation)>,
         index: Arc<PackIndex>,
-    ) -> Result<Vec<(ChunkHash, Bytes)>, FetchError> {
+    ) -> Result<Vec<(ChunkHash, Frame)>, FetchError> {
         chunks.sort_by_key(|(_, location)| location.offset);
         let chunk_count = chunks.len();
         let spans: Vec<(u64, u32)> = chunks
@@ -376,34 +376,17 @@ impl ChunkFetcher {
         for range in ranges {
             let start = range.start;
             range_bytes += range.end - range.start;
-            // Everything inside the fetched region gets extracted and
-            // cached: the requested chunks by construction, plus their
-            // neighbours pulled in by read-ahead.
-            let in_range: Vec<(u64, u32, ChunkHash)> = chunks_in_range(&index, &range).collect();
-            let data = self.read_pack_range(pack, range).await?;
-
-            // Decompression + hash verification are CPU-bound: off the
-            // runtime workers, like the write pipeline's compression
-            // stages, so concurrent fetches cannot starve the hook socket.
-            let extracted = tokio::task::spawn_blocking(move || {
-                let mut extracted = Vec::with_capacity(in_range.len());
-                for (offset, size, hash) in in_range {
-                    let from = (offset - start) as usize;
-                    let to = from + size as usize;
-                    // In bounds by construction: blob::get errors unless
-                    // the ranged response is exactly range.end - range.start
-                    // bytes, and plan_pack_reads/chunks_in_range only select
-                    // chunks fully inside the range. extract_chunk verifies
-                    // the SHA-256 of the decompressed data; corrupt or
-                    // truncated cache contents cannot pass.
-                    let chunk = extract_chunk(&data[from..to], &hash)?;
-                    extracted.push((hash, Bytes::from(chunk)));
-                }
-                Ok::<_, FetchError>(extracted)
-            })
-            .await
-            .expect("chunk extraction task panicked")?;
-            fetched.extend(extracted);
+            // Read-ahead neighbours get cached too. Slices are in bounds:
+            // the backend fails unless the response is the whole range.
+            let data = self.read_pack_range(pack, range.clone()).await?;
+            for e in chunks_in_range(&index, &range) {
+                let from = (e.offset - start) as usize;
+                let frame = Frame {
+                    zstd: data.slice(from..from + e.compressed_size as usize),
+                    size: e.uncompressed_size,
+                };
+                fetched.push((e.hash, frame));
+            }
         }
         // One line per pack fetch (= per burst of GHA cache traffic): shows
         // whether chunks coalesce into few large Range reads or degrade
@@ -412,7 +395,7 @@ impl ChunkFetcher {
         // (RUNNER_DEBUG=1).
         if std::env::var_os("RUNNER_DEBUG").is_some_and(|value| value == "1") {
             eprintln!(
-                "hestia substituter: pack {}: {chunk_count} chunks requested, {} extracted \
+                "hestia substituter: pack {}: {chunk_count} chunks requested, {} fetched \
                  in {range_count} range reads ({}, {:.1}s)",
                 pack_cache_key(&pack),
                 fetched.len(),
@@ -462,13 +445,12 @@ fn plan_pack_reads(spans: &[(u64, u32)], pack_end: u64) -> Vec<std::ops::Range<u
 fn chunks_in_range<'a>(
     index: &'a PackIndex,
     range: &'a std::ops::Range<u64>,
-) -> impl Iterator<Item = (u64, u32, ChunkHash)> + 'a {
+) -> impl Iterator<Item = &'a crate::segment::PackIndexEntry> + 'a {
     let start = index.entries.partition_point(|e| e.offset < range.start);
     index.entries[start..]
         .iter()
         .take_while(move |e| e.offset < range.end)
         .filter(move |e| e.offset + u64::from(e.compressed_size) <= range.end)
-        .map(|e| (e.offset, e.compressed_size, e.hash))
 }
 
 /// Mark manifest packs missing from one REST listing of `pack-*` entries
@@ -652,7 +634,7 @@ fn narinfo_for_entry(store_dir: &StoreDir, entry: &PathEntry, hash: &str) -> Vec
         }),
         store_dir: store_dir.clone(),
     };
-    let narinfo = build_narinfo(
+    let mut narinfo = build_narinfo(
         store_dir,
         ValidPathInfo {
             path: entry.store_path.clone(),
@@ -661,6 +643,8 @@ fn narinfo_for_entry(store_dir: &StoreDir, entry: &PathEntry, hash: &str) -> Vec
         hash,
         &[],
     );
+    narinfo.info.url = narinfo.info.url.map(|u| u.replace(".nar?", ".nar.zst?"));
+    narinfo.info.compression = Some("zstd".into());
     format_narinfo_txt(store_dir, &narinfo)
 }
 
@@ -697,7 +681,7 @@ async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>
 #[derive(Deserialize)]
 struct NarQuery {
     /// Store path hash, present when the URL came from one of our narinfo
-    /// responses (`nar/<narhash>.nar?hash=<pathhash>`).
+    /// responses (`nar/<narhash>.nar.zst?hash=<pathhash>`).
     hash: Option<String>,
 }
 
@@ -710,7 +694,7 @@ async fn nar(
     query: Result<Query<NarQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let _activity = state.touch();
-    let Some(nar_hash_str) = file.strip_suffix(".nar") else {
+    let Some(nar_hash_str) = file.strip_suffix(".nar.zst") else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(nar_hash) = Hash32::parse_sha256(&format!("sha256:{nar_hash_str}")) else {
@@ -792,18 +776,18 @@ async fn nar(
         }
     };
 
-    let nar = match assemble_verified_nar(&resolved.entry, Arc::new(chunks)).await {
-        Ok(nar) => nar,
+    let refs = RefTable::new(&resolved.entry.references);
+    let body =
+        tokio::task::spawn_blocking(move || narzstd::stitch(&resolved.entry.tree, &chunks, &refs))
+            .await
+            .expect("stitch task panicked");
+    match body {
+        Ok(body) => ([(header::CONTENT_TYPE, "application/x-nix-nar")], body).into_response(),
         Err(err) => {
             eprintln!("hestia substituter: cannot serve NAR for {path_hash}: {err}");
-            return StatusCode::NOT_FOUND.into_response();
+            StatusCode::NOT_FOUND.into_response()
         }
-    };
-
-    // axum derives Content-Length from the sized body; because the NAR is
-    // fully assembled and verified before responding, the length is always
-    // exact (= nar_size, asserted above).
-    ([(header::CONTENT_TYPE, "application/x-nix-nar")], nar).into_response()
+    }
 }
 
 /// All chunks referenced by an entry's file tree (deduplicated).
@@ -818,43 +802,16 @@ fn entry_chunks(entry: &PathEntry) -> BTreeSet<ChunkHash> {
         .collect()
 }
 
-/// Assemble the full NAR of `entry` from its fetched chunks and verify it
-/// against the recorded hash/size.
-///
-/// CPU-bound and a single non-yielding poll (the Vec sink never pends), so
-/// it runs off the runtime workers: with many NARs assembling at once, a
-/// multi-hundred-MiB path would otherwise pin every worker thread and
-/// starve the hook socket.
-async fn assemble_verified_nar(
-    entry: &PathEntry,
-    chunks: Arc<BTreeMap<ChunkHash, Bytes>>,
-) -> Result<Vec<u8>, String> {
-    let tree = entry.tree.clone();
-    let nar_size = entry.nar_size;
-    let expected_hash = entry.nar_hash;
-    // Reference occurrences normalized out on the write side (dedup v2) are
-    // restored from the path's own references; v1 entries carry no rewrites,
-    // so the table is unused for them.
+/// The plain NAR for the export stream, which nothing downstream
+/// verifies, so its hash is checked here. CPU-bound: run off the runtime.
+fn export_nar(entry: &PathEntry, frames: &BTreeMap<ChunkHash, Frame>) -> Result<Vec<u8>, String> {
     let refs = RefTable::new(&entry.references);
-    tokio::task::spawn_blocking(move || {
-        use futures_util::FutureExt as _;
-        let nar = nar_from_chunks(&tree, &chunks, &refs)
-            .now_or_never()
-            .expect("NAR synthesis into a Vec sink never pends")
-            .map_err(|err| format!("NAR synthesis failed: {err}"))?;
-        // Final integrity gate: the served bytes must hash to exactly the
-        // NAR hash the manifest (and the narinfo we served) promised.
-        if nar.len() as u64 != nar_size || Hash32::digest(&nar) != expected_hash {
-            return Err(
-                "synthesized NAR does not match its recorded hash/size; refusing to serve \
-                 corrupt data"
-                    .to_string(),
-            );
-        }
-        Ok(nar)
-    })
-    .await
-    .expect("NAR synthesis task panicked")
+    let zst = narzstd::stitch(&entry.tree, frames, &refs).map_err(|e| e.to_string())?;
+    let nar = zstd::decode_all(&zst[..]).map_err(|e| e.to_string())?;
+    if nar.len() as u64 != entry.nar_size || Hash32::digest(&nar) != entry.nar_hash {
+        return Err("NAR does not match its recorded hash".into());
+    }
+    Ok(nar)
 }
 
 // ---------------------------------------------------------------------------
@@ -993,30 +950,31 @@ async fn export_window(
         .iter()
         .flat_map(|(_, entry)| entry_chunks(entry))
         .collect();
-    let chunks = Arc::new(
-        state
-            .fetcher
-            .fetch_chunks(&source, needed)
-            .await
-            .map_err(|err| {
-                eprintln!("hestia substituter: closure export chunk fetch failed: {err}");
-                err.to_string()
-            })?,
-    );
-
-    let mut out = Vec::new();
-    for (path_hash, entry) in entries {
-        // Prefetched paths are accesses (GC liveness), same as narinfo hits.
-        state.access_log.record(path_hash);
-        let nar = assemble_verified_nar(&entry, Arc::clone(&chunks))
-            .await
-            .map_err(|err| {
+    let frames = state
+        .fetcher
+        .fetch_chunks(&source, needed)
+        .await
+        .map_err(|err| {
+            eprintln!("hestia substituter: closure export chunk fetch failed: {err}");
+            err.to_string()
+        })?;
+    for (path_hash, _) in &entries {
+        state.access_log.record(*path_hash);
+    }
+    let store_dir = state.store_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for (path_hash, entry) in entries {
+            let nar = export_nar(&entry, &frames).map_err(|err| {
                 eprintln!("hestia substituter: closure export failed at {path_hash}: {err}");
                 err
             })?;
-        out.extend_from_slice(&export_frame(&state.store_dir, &entry, &nar));
-    }
-    Ok(out)
+            out.extend_from_slice(&export_frame(&store_dir, &entry, &nar));
+        }
+        Ok(out)
+    })
+    .await
+    .expect("export task panicked")
 }
 
 async fn closure(State(state): State<Arc<Substituter>>, Path(hashes): Path<String>) -> Response {
@@ -1212,7 +1170,7 @@ mod tests {
             entries: vec![e(0, 0), e(100, 1), e(300, 2), e(350, 3)], // last straddles range end
         };
         let selected: Vec<ChunkHash> = chunks_in_range(&index, &(100..400))
-            .map(|(.., hash)| hash)
+            .map(|e| e.hash)
             .collect();
         assert_eq!(
             selected,
@@ -1240,7 +1198,10 @@ mod tests {
     fn chunk_cache_evicts_oldest_when_over_budget() {
         let mut cache = ChunkCache::default();
         // Three chunks of 100 MiB each: the third insert must evict the first.
-        let big = Bytes::from(vec![0u8; 100 * 1024 * 1024]);
+        let big = Frame {
+            zstd: Bytes::from(vec![0u8; 100 * 1024 * 1024]),
+            size: 0,
+        };
         for seed in 0..3u8 {
             cache.insert(ChunkHash::digest([seed]), big.clone());
         }
@@ -1255,7 +1216,10 @@ mod tests {
     #[test]
     fn chunk_cache_hits_refresh_recency() {
         let mut cache = ChunkCache::default();
-        let big = Bytes::from(vec![0u8; 100 * 1024 * 1024]);
+        let big = Frame {
+            zstd: Bytes::from(vec![0u8; 100 * 1024 * 1024]),
+            size: 0,
+        };
         cache.insert(ChunkHash::digest([0]), big.clone());
         cache.insert(ChunkHash::digest([1]), big.clone());
         assert!(cache.get(&ChunkHash::digest([0])).is_some());
@@ -1270,11 +1234,14 @@ mod tests {
     #[test]
     fn chunk_cache_insert_is_idempotent() {
         let mut cache = ChunkCache::default();
-        let data = Bytes::from_static(b"chunk data");
-        let hash = ChunkHash::digest(&data);
+        let data = Frame {
+            zstd: Bytes::from_static(b"chunk data"),
+            size: 0,
+        };
+        let hash = ChunkHash::digest(&data.zstd);
         cache.insert(hash, data.clone());
         cache.insert(hash, data.clone());
-        assert_eq!(cache.total, data.len(), "no double counting");
+        assert_eq!(cache.total, data.zstd.len(), "no double counting");
     }
 
     #[test]
@@ -1296,11 +1263,11 @@ mod tests {
             )),
             "narinfo:\n{text}"
         );
-        assert!(text.contains("Compression: none\n"), "narinfo:\n{text}");
+        assert!(text.contains("Compression: zstd\n"), "narinfo:\n{text}");
         assert!(text.contains("NarSize: 100\n"), "narinfo:\n{text}");
         assert!(text.contains("NarHash: sha256:"), "narinfo:\n{text}");
         assert!(
-            text.contains("URL: nar/") && text.contains(&format!(".nar?hash={hash}\n")),
+            text.contains("URL: nar/") && text.contains(&format!(".nar.zst?hash={hash}\n")),
             "narinfo:\n{text}"
         );
         // References: both deps, full basenames.

@@ -36,9 +36,9 @@
   <text x="390" y="100" class="t">substituter (HTTP)</text>
   <text x="390" y="118" class="ts">narinfo answers come straight from</text>
   <text x="390" y="133" class="ts">the manifest; every hit is logged</text>
-  <text x="390" y="154" class="ts">NARs are rebuilt from chunks and</text>
-  <text x="390" y="169" class="ts">hash-checked before serving; if</text>
-  <text x="390" y="184" class="ts">anything goes wrong: 404, never bad data</text>
+  <text x="390" y="154" class="ts">NARs go out as .nar.zst spliced from</text>
+  <text x="390" y="169" class="ts">the stored chunk frames, no recompress;</text>
+  <text x="390" y="184" class="ts">anything missing: 404, nix falls through</text>
   <text x="390" y="218" class="ts">accessed paths join this run's GC</text>
   <text x="390" y="233" class="ts">root at the next drain, keeping</text>
   <text x="390" y="248" class="ts">downloaded closures alive</text>
@@ -61,7 +61,7 @@
   <path class="edge" d="M 290 122 L 366 122" marker-end="url(#arrow)"/>
   <text x="328" y="112" class="lbl" text-anchor="middle">narinfo, nar</text>
   <path class="edge-accent" d="M 366 164 L 290 164" marker-end="url(#arrow-accent)"/>
-  <text x="328" y="182" class="lbla" text-anchor="middle">verified NAR</text>
+  <text x="328" y="182" class="lbla" text-anchor="middle">.nar.zst</text>
 
   <path class="edge" d="M 670 122 L 746 122" marker-end="url(#arrow)"/>
   <text x="708" y="112" class="lbl" text-anchor="middle">Range GET</text>
