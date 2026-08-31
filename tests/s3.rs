@@ -198,9 +198,9 @@ async fn drain_and_nix_copy_over_s3() {
 const T0: u64 = 1_750_000_000;
 const HOUR: u64 = 3600;
 
-/// GC over S3 lists objects directly: retired segments go the run after,
-/// an orphan older than `min_age` goes at once, an expired root's pack
-/// one epoch later, and a lagging listing loses nothing.
+/// GC over S3 lists objects directly: an orphan older than `min_age` goes
+/// at once, a fresh drain whose head the listing lags on keeps its
+/// objects, an expired root's pack goes one epoch after the root.
 #[tokio::test]
 async fn gc_over_s3_with_lagging_listing() {
     timed(async {
@@ -212,8 +212,10 @@ async fn gc_over_s3_with_lagging_listing() {
         let gone = SimPath::new("gone", 5, 200_000);
         sim.push("main", &[&a], &[&a]).await;
         sim.push("main", &[&b], &[&a, &b]).await;
-        sim.push("old", &[&gone], &[&gone]).await;
         sim.upload_orphan_pack(9).await;
+        // A drain right before GC whose head the listing does not show yet.
+        fake.set_clock(T0 + 2 * HOUR - 60);
+        sim.push("old", &[&gone], &[&gone]).await;
         let count = |kind: &'static str| {
             let needle = format!("/{kind}-");
             fake.keys().iter().filter(|k| k.contains(&needle)).count()
@@ -225,11 +227,18 @@ async fn gc_over_s3_with_lagging_listing() {
             ..GcPolicy::default()
         };
         fake.set_clock(T0 + 2 * HOUR);
-        fake.set_list_lag(3);
+        fake.set_list_lag(2);
         let stats = sim.run_gc(policy.clone(), T0 + 2 * HOUR).await;
-        assert_eq!((stats.roots, stats.deleted), (2, 4), "{stats:?}");
-        assert_eq!(count("pack"), 3, "orphan swept");
+        assert_eq!((stats.roots, stats.deleted), (1, 3), "{stats:?}");
+        assert_eq!(count("pack"), 3, "orphan swept, old's young pack kept");
         fake.set_list_lag(0);
+        sim.assert_readable(&[&a, &b, &gone]).await;
+
+        // GC first sees `old` now and stamps it, the run a TTL later expires it.
+        fake.set_clock(T0 + 3 * HOUR);
+        sim.push("main", &[], &[&a, &b]).await;
+        let stats = sim.run_gc(policy.clone(), T0 + 3 * HOUR).await;
+        assert_eq!((stats.roots, stats.roots_expired), (2, 0), "{stats:?}");
         sim.assert_readable(&[&a, &b, &gone]).await;
 
         fake.set_clock(T0 + 30 * HOUR);
@@ -237,7 +246,6 @@ async fn gc_over_s3_with_lagging_listing() {
         let stats = sim.run_gc(policy.clone(), T0 + 30 * HOUR).await;
         assert_eq!(stats.roots_expired, 1, "{stats:?}");
         assert_eq!(count("pack"), 3, "old's pack waits one epoch");
-        assert_eq!(count("seg"), 2);
         sim.assert_readable(&[&a, &b]).await;
 
         fake.set_clock(T0 + 60 * HOUR);

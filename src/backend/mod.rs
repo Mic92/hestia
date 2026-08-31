@@ -84,6 +84,20 @@ impl Backend {
         }
     }
 
+    /// Every `g-`/`h-`/`c-` key. One request where the backend can.
+    pub async fn list_heads(&self) -> Result<Vec<Listed>, Error> {
+        if let Backend::Gha(b) = self {
+            let (g, h, c) = futures_util::future::try_join3(
+                b.list("g-", None),
+                b.list("h-", None),
+                b.list("c-", None),
+            )
+            .await?;
+            return Ok([g, h, c].into_iter().flatten().flatten().collect());
+        }
+        Ok(self.list("", None).await?.expect("unbounded"))
+    }
+
     /// GC only: all `pack-`/`seg-`/`tree-` objects, `None` where the
     /// backend cannot enumerate them.
     pub async fn list_objects(&self) -> Result<Option<Vec<Listed>>, Error> {

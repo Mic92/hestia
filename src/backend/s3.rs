@@ -211,6 +211,7 @@ impl S3 {
         Ok(r.status() != StatusCode::NOT_FOUND)
     }
 
+    /// The empty prefix lists `heads/`.
     pub async fn list(
         &self,
         prefix: &str,

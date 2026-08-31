@@ -441,15 +441,20 @@ impl Oci {
         Ok(self.ledger().await?.map(|l| l.objects()))
     }
 
-    /// Tags only: blobs cannot be enumerated, so other prefixes give `None`.
+    /// Tags only: blobs cannot be enumerated, so other prefixes give
+    /// `None`. The empty prefix lists every head kind.
     pub async fn list(
         &self,
         prefix: &str,
         limit: Option<u64>,
     ) -> Result<Option<Vec<Listed>>, Error> {
-        if !matches!(kind(prefix), "g" | "h" | "c") {
+        if !matches!(kind(prefix), "" | "g" | "h" | "c") {
             return Ok(None);
         }
+        let wanted = |t: &str| match prefix {
+            "" => matches!(kind(t), "g" | "h" | "c"),
+            p => t.starts_with(p),
+        };
         let mut out = Vec::new();
         let mut url = self.v2(&format!("tags/list?n={TAGS_PAGE}"));
         loop {
@@ -468,7 +473,7 @@ impl Oci {
                 .map(|u| self.absolute(u.trim().trim_start_matches('<').trim_end_matches('>')));
             let tags: Tags = r.json().await?;
             for t in tags.tags.unwrap_or_default() {
-                if t.starts_with(prefix) {
+                if wanted(&t) {
                     out.push(Listed {
                         key: t,
                         created: None,
