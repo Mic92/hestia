@@ -119,12 +119,19 @@ impl PackRow {
     }
 }
 
+/// Format bits a reader must understand to rewrite this segment;
+/// [`merge`] refuses inputs with bits outside this set.
+const KNOWN_FEATURES: u32 = 0;
+
 #[derive(Encode, Decode)]
 struct Header {
     #[n(0)]
     packs: Vec<PackRow>,
     #[n(1)]
     tree: SegDigest,
+    /// `None` is 0, kept optional so older segments decode.
+    #[n(2)]
+    features: Option<u32>,
 }
 
 /// A chunk by location: row in the segment's pack table, entry in that pack's index.
@@ -342,6 +349,7 @@ pub struct Meta {
     pub packs: Vec<PackRow>,
     /// Digest of the `.tree` that goes with it.
     pub tree: SegDigest,
+    pub features: u32,
     index: Index,
     bodies: Vec<u8>,
 }
@@ -381,6 +389,7 @@ impl Meta {
         let meta = Meta {
             packs: header.packs,
             tree: header.tree,
+            features: header.features.unwrap_or(0),
             index,
             bodies: raw,
         };
@@ -741,6 +750,7 @@ impl SegmentWriter {
         let header = Header {
             packs: self.packs,
             tree: SegDigest::digest(&tree),
+            features: None,
         };
         let header = minicbor::to_vec(header).expect("Vec write");
         let mut meta = Vec::new();
@@ -766,6 +776,12 @@ pub fn merge(
     let mut writer = SegmentWriter::default();
     let mut dropped = BTreeSet::new();
     for (meta, tree) in inputs {
+        if meta.features & !KNOWN_FEATURES != 0 {
+            return Err(bad(format!(
+                "segment uses format features {:#x} this build cannot rewrite",
+                meta.features & !KNOWN_FEATURES
+            )));
+        }
         if meta.len() != tree.len() {
             return Err(bad(".meta and .tree disagree on entry count"));
         }
@@ -1070,6 +1086,16 @@ mod tests {
         assert_eq!(m.body(m.find(&e3.key()).unwrap()).foreign_refs().count(), 0);
         // only e3's chunk 3 is left in pack [1]
         assert_eq!(m.packs[1].live_count, 1);
+    }
+
+    #[test]
+    fn merge_refuses_unknown_features() {
+        let (mut meta, tree, _) = roundtrip(vec![entry(1, &[], &[c(0, 0)])], packs(1));
+        meta.features = 1 << 31;
+        assert!(matches!(
+            merge(&[(&meta, &tree)], in_place),
+            Err(Error::Format(_))
+        ));
     }
 
     #[test]

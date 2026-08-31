@@ -90,7 +90,7 @@
 
   <text x="420" y="276" class="t">header</text>
   <rect x="470" y="262" width="530" height="22" class="cell"/>
-  <text x="480" y="277" class="ms">packs: [ (PackHash, size, chunks, live_count, live_bits) … ],  tree: SegDigest</text>
+  <text x="480" y="277" class="ms">packs: [(PackHash, size, chunks, live_count, live_bits)…], tree, features</text>
 
   <text x="420" y="308" class="t">index</text>
   <rect x="470" y="294" width="40"  height="22" class="cell"/>
