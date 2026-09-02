@@ -43,7 +43,8 @@ fn raw_frame(out: &mut Vec<u8>, data: &[u8]) {
 
 struct Stitcher<'a> {
     frames: &'a BTreeMap<ChunkHash, Frame>,
-    refs: &'a RefTable,
+    /// Re-encoded frames of reference-touched chunks, in NAR order.
+    reencoded: std::vec::IntoIter<Vec<u8>>,
     out: Vec<u8>,
     /// NAR framing not yet wrapped into a raw frame.
     pending: Vec<u8>,
@@ -105,7 +106,6 @@ impl Stitcher<'_> {
     }
 
     /// Emits the length word and the file bytes, returns the length.
-    /// Only chunks a restored reference touches are re-encoded.
     fn contents(&mut self, c: &ChunkList) -> Result<u64, Error> {
         let frames = self.frames;
         let frame = |h: &ChunkHash| frames.get(h).ok_or(Error::MissingChunk(*h));
@@ -119,14 +119,9 @@ impl Stitcher<'_> {
         for h in &c.chunks {
             let f = frame(h)?;
             let end = start + u64::from(f.size);
-            let touched = c
-                .rewrites
-                .iter()
-                .any(|r| r.offset < end && r.offset + HASH_LEN as u64 > start);
-            if touched {
-                let mut data = extract_chunk(&f.zstd, h)?;
-                self.refs.restore_window(&mut data, start, &c.rewrites)?;
-                self.out.extend(compress_chunk_fast(&data)?);
+            if touched(c, start, end) {
+                let z = self.reencoded.next().expect("one per touched chunk");
+                self.out.extend(z);
             } else {
                 self.out.extend_from_slice(&f.zstd);
             }
@@ -134,6 +129,64 @@ impl Stitcher<'_> {
         }
         Ok(size)
     }
+}
+
+fn touched(c: &ChunkList, start: u64, end: u64) -> bool {
+    c.rewrites
+        .iter()
+        .any(|r| r.offset < end && r.offset + HASH_LEN as u64 > start)
+}
+
+/// Chunks a restored reference touches, re-encoded with the references
+/// put back, in NAR order. This is the only CPU-heavy part, so it runs
+/// across cores.
+fn reencode(
+    tree: &FileTree<ChunkList>,
+    frames: &BTreeMap<ChunkHash, Frame>,
+    refs: &RefTable,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let mut jobs: Vec<(&ChunkList, &ChunkHash, &Frame, u64)> = Vec::new();
+    for (_, node) in crate::chunker::flatten_tree(tree) {
+        let FileSystemObject::Regular(f) = node else {
+            continue;
+        };
+        let c = &f.contents;
+        if c.rewrites.is_empty() {
+            continue;
+        }
+        let mut start = 0u64;
+        for h in &c.chunks {
+            let frame = frames.get(h).ok_or(Error::MissingChunk(*h))?;
+            let end = start + u64::from(frame.size);
+            if touched(c, start, end) {
+                jobs.push((c, h, frame, start));
+            }
+            start = end;
+        }
+    }
+    let one = |&(c, h, f, start): &(&ChunkList, &ChunkHash, &Frame, u64)| {
+        let mut data = extract_chunk(&f.zstd, h)?;
+        refs.restore_window(&mut data, start, &c.rewrites)?;
+        compress_chunk_fast(&data)
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(jobs.len() / 8)
+        .max(1);
+    if workers == 1 {
+        return jobs.iter().map(one).collect();
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .chunks(jobs.len().div_ceil(workers))
+            .map(|slice| scope.spawn(move || slice.iter().map(one).collect::<Result<Vec<_>, _>>()))
+            .collect();
+        let mut out = Vec::with_capacity(jobs.len());
+        for h in handles {
+            out.extend(h.join().expect("re-encode worker panicked")?);
+        }
+        Ok(out)
+    })
 }
 
 /// The `.nar.zst` body for `tree`.
@@ -145,7 +198,7 @@ pub fn stitch(
     let zsize: usize = frames.values().map(|f| f.zstd.len()).sum();
     let mut s = Stitcher {
         frames,
-        refs,
+        reencoded: reencode(tree, frames, refs)?.into_iter(),
         out: Vec::with_capacity(zsize + 4096),
         pending: Vec::new(),
     };
