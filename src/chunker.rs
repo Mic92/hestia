@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -17,6 +18,7 @@ use std::task::Poll;
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use harmonia_file_nar::{NarByteStream, NarEvent, NarWriter};
+use tokio::io::{AsyncBufRead, AsyncRead};
 use zstd::bulk::{Compressor, Decompressor};
 
 use crate::manifest::{
@@ -211,6 +213,15 @@ pub struct PackBuilder {
 impl PackBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sized for `bytes` up front: growing by doubling would leave a sealed
+    /// pack holding twice its size until uploaded.
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(bytes),
+            ..Self::default()
+        }
     }
 
     /// Compress and append a chunk. Chunks already in this pack are skipped
@@ -540,7 +551,8 @@ fn name_to_string(name: &[u8], what: &str) -> Result<String, Error> {
 ///
 /// Returns the file tree (for the manifest `PathEntry`) plus the unique
 /// chunks in pack order. Identical chunks appearing in multiple files are
-/// returned once.
+/// returned once. Holds the whole path in memory: the pipeline uses
+/// [`ingest_path`] instead.
 pub async fn chunk_path(path: impl Into<PathBuf>, refs: &RefTable) -> Result<ChunkedPath, Error> {
     chunk_path_with(path, refs, ChunkParams::default()).await
 }
@@ -551,21 +563,93 @@ pub async fn chunk_path_with(
     refs: &RefTable,
     params: ChunkParams,
 ) -> Result<ChunkedPath, Error> {
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut seen: BTreeSet<ChunkHash> = BTreeSet::new();
+    let ingested = ingest_path_with(
+        path,
+        refs,
+        params,
+        |_| std::future::ready(()),
+        |file_chunks, ()| {
+            for chunk in file_chunks {
+                if seen.insert(chunk.hash) {
+                    chunks.push(chunk);
+                }
+            }
+            std::future::ready(Ok::<_, Error>(()))
+        },
+    )
+    .await?;
+    Ok(ChunkedPath {
+        tree: ingested.tree,
+        chunks,
+    })
+}
+
+/// What [`ingest_path`] learnt: the tree, and the NAR hash and size the
+/// chunked representation reproduces (restored chunk bytes re-serialized
+/// through harmonia's [`NarWriter`], file by file).
+pub struct Ingested {
+    pub tree: FileTree<ChunkList>,
+    pub nar_hash: Hash32,
+    pub nar_size: u64,
+}
+
+/// [`chunk_path`] one file at a time: `reserve` runs with a file's size
+/// before it is read, then its chunks go to `emit` (in NAR order,
+/// duplicates included) with what `reserve` returned and are dropped here,
+/// so memory is bounded by the largest file rather than the path.
+pub async fn ingest_path<R, RFut, T, F, Fut, E>(
+    path: impl Into<PathBuf>,
+    refs: &RefTable,
+    reserve: R,
+    emit: F,
+) -> Result<Ingested, E>
+where
+    R: FnMut(u64) -> RFut,
+    RFut: Future<Output = T>,
+    F: FnMut(Vec<Chunk>, T) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: From<Error>,
+{
+    ingest_path_with(path, refs, ChunkParams::default(), reserve, emit).await
+}
+
+async fn ingest_path_with<R, RFut, T, F, Fut, E>(
+    path: impl Into<PathBuf>,
+    refs: &RefTable,
+    params: ChunkParams,
+    mut reserve: R,
+    mut emit: F,
+) -> Result<Ingested, E>
+where
+    R: FnMut(u64) -> RFut,
+    RFut: Future<Output = T>,
+    F: FnMut(Vec<Chunk>, T) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: From<Error>,
+{
     let root: PathBuf = path.into();
     let mut events = harmonia_file_nar::dump(root.clone());
     let mut builder = TreeBuilder::new();
-    let mut chunks: Vec<Chunk> = Vec::new();
-    let mut seen: BTreeSet<ChunkHash> = BTreeSet::new();
+    let mut sink = HashSink::new();
+    let mut writer = NarWriter::new(&mut sink);
     // On-disk directory currently being walked (for cow_normalize).
     let mut current_dir = root.clone();
 
     while let Some(event) = events.next().await {
-        match event? {
+        match event.map_err(Error::from)? {
             NarEvent::StartDirectory { name } => {
                 let name = name_to_string(&name, "entry name")?;
                 if !name.is_empty() {
                     current_dir.push(&name);
                 }
+                writer
+                    .feed(NarEvent::StartDirectory {
+                        name: Bytes::from(name.clone()),
+                    })
+                    .await
+                    .map_err(Error::from)?;
                 builder.start_directory(name);
             }
             NarEvent::EndDirectory => {
@@ -573,14 +657,25 @@ pub async fn chunk_path_with(
                 if current_dir != root {
                     current_dir.pop();
                 }
+                writer
+                    .feed(NarEvent::EndDirectory)
+                    .await
+                    .map_err(Error::from)?;
                 builder.end_directory()?;
             }
             NarEvent::Symlink { name, target } => {
+                let name = name_to_string(&name, "entry name")?;
+                let target = name_to_string(&target, "symlink target")?;
+                writer
+                    .feed(NarEvent::Symlink {
+                        name: Bytes::from(name.clone()),
+                        target: Bytes::from(target.clone()),
+                    })
+                    .await
+                    .map_err(Error::from)?;
                 builder.place(
-                    name_to_string(&name, "entry name")?,
-                    FileTree(FileSystemObject::Symlink(Symlink {
-                        target: name_to_string(&target, "symlink target")?,
-                    })),
+                    name,
+                    FileTree(FileSystemObject::Symlink(Symlink { target })),
                 )?;
             }
             NarEvent::File {
@@ -590,6 +685,7 @@ pub async fn chunk_path_with(
                 reader,
             } => {
                 let entry_name = name_to_string(&name, "entry name")?;
+                let reserved = reserve(size).await;
                 // Large files with references normalize on a copy-on-write
                 // mapping; everything else uses the event reader's bytes,
                 // which normalize clones without copying when reference-free.
@@ -607,11 +703,15 @@ pub async fn chunk_path_with(
                     chunks: file_chunks.iter().map(|chunk| chunk.hash).collect(),
                     rewrites,
                 };
-                for chunk in file_chunks {
-                    if seen.insert(chunk.hash) {
-                        chunks.push(chunk);
-                    }
-                }
+                writer
+                    .feed(NarEvent::File {
+                        name: Bytes::from(entry_name.clone()),
+                        executable,
+                        size: normalized.len() as u64,
+                        reader: Restored::new(&file_chunks, &list.rewrites, refs)?,
+                    })
+                    .await
+                    .map_err(Error::from)?;
                 builder.place(
                     entry_name,
                     FileTree(FileSystemObject::Regular(Regular {
@@ -619,14 +719,88 @@ pub async fn chunk_path_with(
                         contents: list,
                     })),
                 )?;
+                emit(file_chunks, reserved).await?;
             }
         }
     }
-
-    Ok(ChunkedPath {
+    writer.close().await.map_err(Error::from)?;
+    let (nar_hash, nar_size) = sink.finish()?;
+    Ok(Ingested {
         tree: builder.finish()?,
-        chunks,
+        nar_hash,
+        nar_size,
     })
+}
+
+/// A file as it goes back into the NAR, one chunk at a time: chunks a
+/// reference touches are copied and restored, the rest read in place.
+struct Restored {
+    chunks: std::vec::IntoIter<Bytes>,
+    current: Bytes,
+}
+
+impl Restored {
+    fn new(chunks: &[Chunk], rewrites: &[Rewrite], refs: &RefTable) -> Result<Self, Error> {
+        let mut base = 0u64;
+        let mut out = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            let end = base + c.data.len() as u64;
+            let touched = rewrites
+                .iter()
+                .any(|r| r.offset < end && r.offset + crate::refnorm::HASH_LEN as u64 > base);
+            out.push(if touched {
+                let mut data = c.data.to_vec();
+                refs.restore_window(&mut data, base, rewrites)?;
+                Bytes::from(data)
+            } else {
+                c.data.clone()
+            });
+            base = end;
+        }
+        Ok(Restored {
+            chunks: out.into_iter(),
+            current: Bytes::new(),
+        })
+    }
+}
+
+impl AsyncRead for Restored {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let chunk = match self.as_mut().poll_fill_buf(cx) {
+            Poll::Ready(Ok(c)) => c,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        };
+        let n = chunk.len().min(buf.remaining());
+        buf.put_slice(&chunk[..n]);
+        self.consume(n);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncBufRead for Restored {
+    fn poll_fill_buf(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<&[u8]>> {
+        let this = self.get_mut();
+        while this.current.is_empty() {
+            match this.chunks.next() {
+                Some(next) => this.current = next,
+                None => break,
+            }
+        }
+        Poll::Ready(Ok(&this.current[..]))
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let this = self.get_mut();
+        drop(this.current.split_to(amt));
+    }
 }
 
 /// NAR hash and size of a path, computed by streaming harmonia's

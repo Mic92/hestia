@@ -26,10 +26,10 @@ use tokio::task::spawn_blocking;
 
 use crate::backend::Backend;
 use crate::chunker::{
-    self, Chunk, ChunkedPath, Pack, PackBuilder, chunk_path, compress_chunks, nar_hash_from_chunks,
+    self, Chunk, MAX_CHUNK_SIZE, Pack, PackBuilder, compress_chunks, ingest_path,
 };
 use crate::gha::Error as GhaError;
-use crate::manifest::{ChunkHash, NarHash, PathEntry, PathHash};
+use crate::manifest::{ChunkHash, ChunkList, FileTree, NarHash, PathEntry, PathHash};
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
 use crate::refnorm::RefTable;
@@ -49,14 +49,15 @@ const UPLOAD_CONCURRENCY: usize = 4;
 /// width is capped at the CPU count.
 const CHUNK_CONCURRENCY: usize = 32;
 
-/// Upper bound on the summed NAR size of paths whose raw chunks are in
-/// memory, from chunking until compressed.
-const CHUNK_INFLIGHT_NAR_BYTES: u64 = 1024 * 1024 * 1024;
+/// Budget for bytes in flight: files being read and chunked, and chunk
+/// batches from compression until packed.
+const CHUNK_INFLIGHT_NAR_BYTES: u64 = 512 * 1024 * 1024;
+/// A file's new chunks go to the compressor in batches of at most this.
+const COMPRESS_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
-/// Semaphore permits for one path's chunk-and-verify stage: its NAR size,
-/// clamped so a path larger than the whole budget still runs (alone).
-fn chunk_permits(nar_size: u64) -> u32 {
-    nar_size.clamp(1, CHUNK_INFLIGHT_NAR_BYTES) as u32
+/// Clamped so a file larger than the budget still runs (alone).
+fn chunk_permits(size: u64) -> u32 {
+    size.clamp(1, CHUNK_INFLIGHT_NAR_BYTES) as u32
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -194,12 +195,10 @@ pub fn system_clock() -> Clock {
 /// A path that chunked and passed NAR verification.
 struct ReadyPath {
     info: PathInfo,
-    chunked: ChunkedPath,
+    tree: FileTree<ChunkList>,
     nar_hash: NarHash,
     nar_size: u64,
     elapsed: Duration,
-    /// Released once the chunks are compressed.
-    permit: OwnedSemaphorePermit,
 }
 
 /// Result of the concurrent chunk-and-verify stage for one path.
@@ -208,6 +207,18 @@ enum Verified {
     Ready(Box<ReadyPath>),
     ChunkFailed,
     VerifyFailed,
+}
+
+/// Ends a path's ingest early when the packer is gone.
+enum IngestError {
+    Chunk(chunker::Error),
+    PackerGone,
+}
+
+impl From<chunker::Error> for IngestError {
+    fn from(e: chunker::Error) -> Self {
+        IngestError::Chunk(e)
+    }
 }
 
 impl PipelineContext {
@@ -326,7 +337,7 @@ impl PipelineContext {
             .map(|(_, i)| i.store_path.name().as_ref())
             .collect();
         snapshot.load_indexes_for(&names).await?;
-        let mut known_chunks = snapshot.known_chunks();
+        let known_chunks = Arc::new(snapshot.known_chunks());
 
         stats.load_ms = load_started.elapsed().as_millis() as u64;
 
@@ -351,65 +362,102 @@ impl PipelineContext {
             let mut failed_chunking = 0usize;
             let mut failed_verification = 0usize;
             // Chunks already emitted for this batch (cross-path dedup).
-            let mut batch_chunks: BTreeSet<ChunkHash> = BTreeSet::new();
-
-            // Per-path work is single-threaded, so running several at once
-            // is what fills the cores. Chunking or verification failures are
-            // skipped, not propagated: a pipeline error would re-buffer the
-            // whole batch, and a deterministic failure would then keep every
-            // later drain (including the shutdown drain) from caching
-            // anything.
+            let batch_chunks: Arc<Mutex<BTreeSet<ChunkHash>>> = Arc::default();
             let inflight = Arc::new(Semaphore::new(CHUNK_INFLIGHT_NAR_BYTES as usize));
+
+            // Several paths at once fill the cores; each file's new chunks
+            // leave for the compressor as soon as they are cut. Failures are
+            // skipped, not propagated: a pipeline error would re-buffer the
+            // whole batch, and a deterministic one would then block every
+            // later drain. A path failing verification has already fed
+            // chunks into packs: dead weight, never referenced.
+            let shared = (inflight, known_chunks.clone(), batch_chunks, chunks_tx);
             let mut verified = stream::iter(to_push)
-                .map(|(path, info)| {
-                    let inflight = inflight.clone();
+                .map(move |(path, info)| {
+                    let (inflight, known_chunks, batch_chunks, chunks_tx) = shared.clone();
                     tokio::spawn(async move {
-                        let permit = inflight
-                            .acquire_many_owned(chunk_permits(info.nar_size))
-                            .await
-                            .expect("in-flight NAR byte semaphore is never closed");
                         let started = Instant::now();
                         // The path's own references drive both normalization
                         // (so chunks stay stable across dependency-hash
                         // changes) and the read-side restore.
                         let refs = RefTable::new(&info.references);
-                        let chunked = match chunk_path(&path, &refs).await {
-                            Ok(chunked) => chunked,
-                            Err(err) => {
+                        let reserve = |size: u64| {
+                            let inflight = inflight.clone();
+                            async move {
+                                inflight
+                                    .acquire_many_owned(chunk_permits(size))
+                                    .await
+                                    .expect("in-flight byte semaphore is never closed")
+                            }
+                        };
+                        let emit = |file_chunks: Vec<Chunk>, reading: OwnedSemaphorePermit| {
+                            let (inflight, known_chunks, batch_chunks, chunks_tx) =
+                                (&inflight, &known_chunks, &batch_chunks, &chunks_tx);
+                            async move {
+                                let mut new: Vec<Chunk> = {
+                                    let mut batch = batch_chunks.lock().unwrap();
+                                    file_chunks
+                                        .into_iter()
+                                        .filter(|c| {
+                                            !known_chunks.contains(&c.hash) && batch.insert(c.hash)
+                                        })
+                                        .collect()
+                                };
+                                // Batches take their own share until packed; a
+                                // budget-sized file must not starve them.
+                                drop(reading);
+                                while !new.is_empty() {
+                                    let mut bytes = 0;
+                                    let n = new
+                                        .iter()
+                                        .take_while(|c| {
+                                            bytes += c.data.len();
+                                            bytes <= COMPRESS_BATCH_BYTES
+                                        })
+                                        .count()
+                                        .max(1);
+                                    let rest = new.split_off(n);
+                                    let bytes: usize = new.iter().map(|c| c.data.len()).sum();
+                                    let permit = inflight
+                                        .clone()
+                                        .acquire_many_owned(chunk_permits(bytes as u64))
+                                        .await
+                                        .expect("in-flight byte semaphore is never closed");
+                                    chunks_tx
+                                        .send((new, permit))
+                                        .await
+                                        .map_err(|_| IngestError::PackerGone)?;
+                                    new = rest;
+                                }
+                                Ok(())
+                            }
+                        };
+                        let ingested = match ingest_path(&path, &refs, reserve, emit).await {
+                            Ok(ingested) => ingested,
+                            Err(IngestError::PackerGone) => return Verified::ChunkFailed,
+                            Err(IngestError::Chunk(err)) => {
                                 eprintln!("hestia: NOT uploading {path}: chunking failed: {err}");
                                 return Verified::ChunkFailed;
                             }
                         };
-                        let chunk_map = chunked.chunk_map();
                         // Integrity gate: the chunked representation must
-                        // reproduce the NAR hash Nix recorded. A mismatch
-                        // means hestia would serve corrupt data; never upload.
-                        let (nar_hash, nar_size) =
-                            match nar_hash_from_chunks(&chunked.tree, &chunk_map, &refs).await {
-                                Ok(result) => result,
-                                Err(err) => {
-                                    eprintln!(
-                                        "hestia: NOT uploading {path}: NAR replay failed: {err}"
-                                    );
-                                    return Verified::ChunkFailed;
-                                }
-                            };
-                        if nar_hash != info.nar_hash || nar_size != info.nar_size {
+                        // reproduce the NAR hash Nix recorded.
+                        let nar_hash = ingested.nar_hash;
+                        if nar_hash != info.nar_hash || ingested.nar_size != info.nar_size {
                             eprintln!(
                                 "hestia: NOT uploading {path}: chunked NAR hash {nar_hash} (size \
-                                 {nar_size}) does not match the store's record {} (size {}); \
+                                 {}) does not match the store's record {} (size {}); \
                                  this indicates a chunker bug or store corruption",
-                                info.nar_hash, info.nar_size
+                                ingested.nar_size, info.nar_hash, info.nar_size
                             );
                             return Verified::VerifyFailed;
                         }
                         Verified::Ready(Box::new(ReadyPath {
+                            nar_size: ingested.nar_size,
+                            tree: ingested.tree,
                             info,
-                            chunked,
                             nar_hash,
-                            nar_size,
                             elapsed: started.elapsed(),
-                            permit,
                         }))
                     })
                 })
@@ -427,52 +475,31 @@ impl PipelineContext {
                         continue;
                     }
                 };
-                let ReadyPath {
-                    info,
-                    chunked,
-                    nar_hash,
-                    nar_size,
-                    elapsed,
-                    permit,
-                } = *ready;
-                chunk_time += elapsed;
-
-                let new_chunks: Vec<Chunk> = chunked
-                    .chunks
-                    .into_iter()
-                    .filter(|chunk| {
-                        !known_chunks.contains(&chunk.hash) && batch_chunks.insert(chunk.hash)
-                    })
-                    .collect();
-
+                chunk_time += ready.elapsed;
                 prepared.push(PathEntry {
                     // Verbatim, including any self-reference: this list
                     // becomes the narinfo References line, and stripping
                     // self would diverge substituted clients' store
                     // metadata from the builder's.
-                    references: info.references,
-                    store_path: info.store_path,
-                    nar_hash,
-                    nar_size,
-                    ca: info.ca,
-                    deriver: info.deriver,
-                    realises: info.realises,
-                    tree: chunked.tree,
+                    references: ready.info.references,
+                    store_path: ready.info.store_path,
+                    nar_hash: ready.nar_hash,
+                    nar_size: ready.nar_size,
+                    ca: ready.info.ca,
+                    deriver: ready.info.deriver,
+                    realises: ready.info.realises,
+                    tree: ready.tree,
                 });
-
-                if !new_chunks.is_empty() && chunks_tx.send((new_chunks, permit)).await.is_err() {
-                    // Packer gone: it failed, and try_join below reports its
-                    // error; stop producing.
-                    break;
-                }
             }
-            drop(chunks_tx);
             Ok::<_, Error>((prepared, chunk_time, failed_chunking, failed_verification))
         };
 
         let pack = async {
             let mut pack_time = Duration::ZERO;
-            let mut builder = PackBuilder::new();
+            let new_builder = || {
+                PackBuilder::with_capacity(self.pack_target_size as usize + MAX_CHUNK_SIZE as usize)
+            };
+            let mut builder = new_builder();
             // Compress paths' new-chunk sets concurrently; frames arrive out
             // of order, which is fine -- packs are content-addressed.
             let chunk_stream = stream::unfold(chunks_rx, |mut rx| async move {
@@ -480,22 +507,19 @@ impl PipelineContext {
             });
             let compressed = chunk_stream
                 .map(|(new_chunks, permit)| {
-                    spawn_blocking(move || {
-                        let frames = compress_chunks(new_chunks);
-                        drop(permit);
-                        frames
-                    })
+                    spawn_blocking(move || Ok::<_, Error>((compress_chunks(new_chunks)?, permit)))
                 })
                 .buffer_unordered(concurrency);
             tokio::pin!(compressed);
 
             'pack: while let Some(joined) = compressed.next().await {
-                let frames = joined.expect("compression task panicked")?;
+                // The permit goes once the frames sit in a pack buffer.
+                let (frames, _permit) = joined.expect("compression task panicked")?;
                 let mut pack_started = Instant::now();
                 for frame in frames {
                     builder.add_compressed(frame.hash, &frame.frame, frame.uncompressed_size);
                     if builder.compressed_size() >= self.pack_target_size {
-                        let sealed = std::mem::take(&mut builder).finish();
+                        let sealed = std::mem::replace(&mut builder, new_builder()).finish();
                         // Pause the pack timer across the send: a full
                         // channel blocks on upload backpressure, which must
                         // not be booked as packing time.
@@ -547,6 +571,7 @@ impl PipelineContext {
         // upload is the wall time of the whole pipelined section.
         stats.upload_ms = upload_started.elapsed().as_millis() as u64;
 
+        let mut known_chunks = Arc::into_inner(known_chunks).expect("prepare stage done");
         for (uploaded, size, pack) in uploads {
             if uploaded {
                 stats.packs_uploaded += 1;
