@@ -647,7 +647,15 @@ fn narinfo_for_entry(store_dir: &StoreDir, entry: &PathEntry, hash: &str) -> Vec
     );
     narinfo.info.url = narinfo.info.url.map(|u| u.replace(".nar?", ".nar.zst?"));
     narinfo.info.compression = Some("zstd".into());
-    format_narinfo_txt(store_dir, &narinfo)
+    // The compressed stream is stitched per request: its hash and size are
+    // not known here, and the formatter would claim the NAR's.
+    let mut txt = Vec::new();
+    for line in format_narinfo_txt(store_dir, &narinfo).split_inclusive(|b| *b == b'\n') {
+        if !line.starts_with(b"FileHash:") && !line.starts_with(b"FileSize:") {
+            txt.extend_from_slice(line);
+        }
+    }
+    txt
 }
 
 async fn narinfo(State(state): State<Arc<Substituter>>, Path(file): Path<String>) -> Response {
@@ -1315,6 +1323,10 @@ mod tests {
         );
         assert!(text.contains("Compression: zstd\n"), "narinfo:\n{text}");
         assert!(text.contains("NarSize: 100\n"), "narinfo:\n{text}");
+        assert!(
+            !text.contains("FileSize:") && !text.contains("FileHash:"),
+            "narinfo:\n{text}"
+        );
         assert!(text.contains("NarHash: sha256:"), "narinfo:\n{text}");
         assert!(
             text.contains("URL: nar/") && text.contains(&format!(".nar.zst?hash={hash}\n")),
