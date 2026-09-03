@@ -7,6 +7,9 @@
 use std::collections::BTreeMap;
 
 use minicbor::{Decode, Encode};
+use std::sync::{Arc, OnceLock};
+
+use futures_util::future::join_all;
 use reqwest::{Method, StatusCode, header};
 use serde::Deserialize;
 
@@ -86,6 +89,8 @@ pub struct Packages {
     owner: String,
     package: String,
     token: String,
+    /// `orgs` or `users`, whichever answered, so later calls skip the probe.
+    scope: Arc<OnceLock<&'static str>>,
 }
 
 impl Packages {
@@ -98,12 +103,17 @@ impl Packages {
             owner: owner.to_owned(),
             package: package.replace('/', "%2F"),
             token,
+            scope: Arc::default(),
         })
     }
 
     /// Orgs and users have different paths and the name does not say which.
     async fn call(&self, method: Method, path: &str) -> Result<Option<reqwest::Response>, Error> {
-        for scope in ["orgs", "users"] {
+        let scopes: &[&'static str] = match self.scope.get() {
+            Some(s) => &[s],
+            None => &["orgs", "users"],
+        };
+        for &scope in scopes {
             let url = format!(
                 "{}/{scope}/{}/packages/container/{}/{path}",
                 self.api, self.owner, self.package
@@ -119,7 +129,10 @@ impl Packages {
                 .await?;
             match r.status() {
                 StatusCode::NOT_FOUND => continue,
-                s if s.is_success() => return Ok(Some(r)),
+                s if s.is_success() => {
+                    let _ = self.scope.set(scope);
+                    return Ok(Some(r));
+                }
                 _ => return Err(status_error(&url, r).await),
             }
         }
@@ -135,22 +148,26 @@ impl Packages {
                 return Ok(());
             };
             let versions: Vec<ApiVersion> = r.json().await?;
-            let mut learnt = false;
-            for v in &versions {
-                if ledger.versions.contains_key(&v.id) {
-                    continue;
-                }
+            let new: Vec<&ApiVersion> = versions
+                .iter()
+                .filter(|v| !ledger.versions.contains_key(&v.id))
+                .collect();
+            let keys = join_all(new.iter().map(|v| async move {
                 let tag = v
                     .metadata
                     .as_ref()
                     .and_then(|m| m.container.as_ref())
                     .and_then(|c| c.tags.first().cloned());
-                let key = match tag {
-                    Some(t) => Some(t),
-                    None => oci.key_of(&v.name).await?,
-                };
+                match tag {
+                    Some(t) => Ok(Some(t)),
+                    None => oci.key_of(&v.name).await,
+                }
+            }))
+            .await;
+            let mut learnt = false;
+            for (v, key) in new.into_iter().zip(keys) {
                 // Not ours (no annotation): leave it alone.
-                let Some(key) = key else { continue };
+                let Some(key) = key? else { continue };
                 learnt = true;
                 ledger.versions.insert(
                     v.id,

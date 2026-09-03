@@ -471,13 +471,8 @@ pub async fn verify_packs(backend: &Backend, store: &ManifestStore, max_entries:
     }
     let listed = match backend.list("pack-", Some(max_entries)).await {
         Ok(Some(entries)) => entries,
-        Ok(None) => {
-            eprintln!(
-                "hestia substituter: more than {max_entries} pack entries in the cache; \
-                 skipping upfront pack verification"
-            );
-            return;
-        }
+        // Too many to list, or a store that cannot list packs.
+        Ok(None) => return,
         // Listing needs GITHUB_TOKEN, which build jobs may not grant. The NAR
         // handler's lazy negative cache still catches evictions.
         Err(GhaError::MissingEnv(_)) => return,
