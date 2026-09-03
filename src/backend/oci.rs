@@ -372,10 +372,12 @@ impl Oci {
                 .upload_blob(&digest, data.clone(), kind(key) == "pack")
                 .await?;
             // Also when the blob existed: heals one whose manifest never landed.
+            // The tagged kind is not deterministic, so writing it again would
+            // strand the old one untagged, still pinning the blob.
             if self.ghcr.is_some() {
                 let m = manifest(key, None, blob, None);
                 self.put_manifest(&sha256(&m), m).await?;
-            } else {
+            } else if created || self.head_size(&format!("manifests/{key}")).await?.is_none() {
                 self.put_manifest(key, manifest(key, None, blob, Some(now_unix())))
                     .await?;
             }
