@@ -30,6 +30,8 @@ const ARTIFACT_PREFIX: &str = "application/vnd.hestia.";
 const KEY_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 const TAGS_PAGE: usize = 1000;
 const TRANSIENT_RETRIES: u32 = 4;
+/// Blobs up to this size are sent with the opening POST.
+const MONOLITHIC_MAX: usize = 4 << 20;
 /// GHCR's signed blob URLs carry a longer expiry, this stays below it.
 const REDIRECT_TTL: Duration = Duration::from_secs(60);
 
@@ -260,12 +262,27 @@ impl Oci {
         if may_exist && self.blob_exists(digest).await? {
             return Ok(false);
         }
+        // Small blobs go in the opening POST, saving a round trip where the
+        // registry takes single-request uploads. Others answer 202 as for an
+        // empty POST, so packs (too big to send twice) never try.
         let url = self.v2("blobs/uploads/");
-        let r = self
-            .send(|| self.http.post(&url).header(header::CONTENT_LENGTH, 0))
-            .await?;
-        if r.status() != StatusCode::ACCEPTED {
-            return Err(status_error(&url, r).await);
+        let r = if data.len() <= MONOLITHIC_MAX {
+            let mono = format!("{url}?digest={digest}");
+            self.send(|| {
+                self.http
+                    .post(&mono)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(data.clone())
+            })
+            .await?
+        } else {
+            self.send(|| self.http.post(&url).header(header::CONTENT_LENGTH, 0))
+                .await?
+        };
+        match r.status() {
+            StatusCode::CREATED => return Ok(true),
+            StatusCode::ACCEPTED => {}
+            _ => return Err(status_error(&url, r).await),
         }
         let location = r
             .headers()

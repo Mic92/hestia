@@ -221,36 +221,62 @@ impl Snapshot {
         roots: &[String],
         previous: Option<&Snapshot>,
     ) -> Result<Snapshot, Error> {
-        let Heads { listed, view, .. } = Heads::load(&backend, &trust).await?;
-        let loaded: HashMap<SegDigest, Arc<Segment>> = previous
-            .into_iter()
-            .flat_map(|p| p.segments.iter().map(|s| (s.digest, s.clone())))
-            .collect();
-        let mut segments = Vec::new();
-        for digest in roots
-            .iter()
-            .filter_map(|r| view.roots.get(r))
-            .flat_map(|d| d.iter().rev())
-        {
-            if let Some(s) = loaded.get(digest) {
-                segments.push(s.clone());
-                continue;
-            }
-            // Evicted or corrupt: its paths miss and get pushed again.
-            let meta =
-                async { Ok::<_, Error>(Meta::open(&fetch(&backend, &meta_key(digest)).await?)?) };
-            match meta.await {
-                Ok(meta) => segments.push(Arc::new(Segment {
-                    digest: *digest,
-                    meta,
-                    tree: OnceCell::new(),
-                })),
-                Err(err) => eprintln!("hestia: skipping segment {digest}: {err}"),
-            }
-        }
         let pack_indexes = previous
             .map(|p| p.pack_indexes.lock().unwrap().clone())
             .unwrap_or_default();
+        Self::load_with(
+            backend,
+            trust,
+            roots,
+            previous.into_iter().flat_map(|p| &p.segments),
+            pack_indexes,
+        )
+        .await
+    }
+
+    /// [`Self::load`] reusing `known` segments and pack indexes.
+    async fn load_with(
+        backend: Backend,
+        trust: Trust,
+        roots: &[String],
+        known: impl Iterator<Item = &Arc<Segment>> + Send,
+        pack_indexes: HashMap<PackHash, Arc<PackIndex>>,
+    ) -> Result<Snapshot, Error> {
+        let Heads { listed, view, .. } = Heads::load(&backend, &trust).await?;
+        let loaded: HashMap<SegDigest, Arc<Segment>> =
+            known.map(|s| (s.digest, s.clone())).collect();
+        let wanted = roots
+            .iter()
+            .filter_map(|r| view.roots.get(r))
+            .flat_map(|d| d.iter().rev());
+        let segments = join_all(wanted.map(|digest| {
+            let (backend, loaded) = (&backend, &loaded);
+            async move {
+                if let Some(s) = loaded.get(digest) {
+                    return Some(s.clone());
+                }
+                let meta = match fetch(backend, &meta_key(digest)).await {
+                    Ok(bytes) => Meta::open(&bytes).map_err(Error::from),
+                    Err(err) => Err(err),
+                };
+                match meta {
+                    Ok(meta) => Some(Arc::new(Segment {
+                        digest: *digest,
+                        meta,
+                        tree: OnceCell::new(),
+                    })),
+                    // Evicted or corrupt: its paths miss and get pushed again.
+                    Err(err) => {
+                        eprintln!("hestia: skipping segment {digest}: {err}");
+                        None
+                    }
+                }
+            }
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
         Ok(Snapshot {
             backend,
             trust,
@@ -265,21 +291,22 @@ impl Snapshot {
     /// Reload, then make sure `sealed` (just published under the first
     /// root) is served even if the listing does not show its head yet.
     pub async fn refresh_with(&self, sealed: &Sealed) -> Result<Snapshot, Error> {
-        let mut next = Snapshot::load(
+        let fresh = Arc::new(Segment {
+            digest: sealed.digest(),
+            meta: Meta::open(&sealed.meta)?,
+            tree: OnceCell::new_with(Some(Tree::open(&sealed.tree)?)),
+        });
+        let pack_indexes = self.pack_indexes.lock().unwrap().clone();
+        let mut next = Snapshot::load_with(
             self.backend.clone(),
             self.trust.clone(),
             &self.roots,
-            Some(self),
+            self.segments.iter().chain([&fresh]),
+            pack_indexes,
         )
         .await?;
-        let digest = sealed.digest();
-        if !next.segments.iter().any(|s| s.digest == digest) {
-            let segment = Segment {
-                digest,
-                meta: Meta::open(&sealed.meta)?,
-                tree: OnceCell::new_with(Some(Tree::open(&sealed.tree)?)),
-            };
-            next.segments.insert(0, Arc::new(segment));
+        if !next.segments.iter().any(|s| s.digest == fresh.digest) {
+            next.segments.insert(0, fresh);
         }
         Ok(next)
     }
@@ -643,14 +670,12 @@ const COMPACT_MIN: usize = 4;
 const COMPACT_WINDOW: u64 = 60;
 
 async fn put_segment(backend: &Backend, sealed: &Sealed) -> Result<SegDigest, Error> {
-    backend
-        .put(&tree_key(&sealed.tree_digest()), sealed.tree.clone().into())
-        .await?;
-    let digest = sealed.digest();
-    backend
-        .put(&meta_key(&digest), sealed.meta.clone().into())
-        .await?;
-    Ok(digest)
+    let (tree, meta) = (tree_key(&sealed.tree_digest()), meta_key(&sealed.digest()));
+    tokio::try_join!(
+        backend.put(&tree, sealed.tree.clone().into()),
+        backend.put(&meta, sealed.meta.clone().into()),
+    )?;
+    Ok(sealed.digest())
 }
 
 pub async fn signed(trust: &Trust, record: Vec<u8>) -> Result<Vec<u8>, crate::trust::Error> {

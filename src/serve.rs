@@ -426,9 +426,7 @@ async fn load_published(
     let previous = manifest_store.snapshot();
     match Snapshot::load(backend.clone(), trust.clone(), roots, previous.as_deref()).await {
         Ok(snapshot) => manifest_store.set_snapshot(Arc::new(snapshot)),
-        Err(err) => eprintln!(
-            "hestia serve: cannot list heads, substituting nothing (grant `actions: read`): {err}"
-        ),
+        Err(err) => eprintln!("hestia serve: cannot list heads, substituting nothing: {err}"),
     }
 }
 

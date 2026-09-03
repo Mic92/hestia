@@ -313,6 +313,19 @@ async fn v2(State(state): State<AppState>, req: Request) -> Response {
 
     if let Some(digest) = rest.strip_prefix("blobs/uploads/") {
         return match method {
+            // Single-request upload, as GHCR takes it.
+            Method::POST if digest.is_empty() && param("digest").is_some() => {
+                let want = param("digest").unwrap();
+                if sha256(&body) != want {
+                    return error(StatusCode::BAD_REQUEST, "DIGEST_INVALID");
+                }
+                inner.blobs.insert(want.clone(), body);
+                (
+                    StatusCode::CREATED,
+                    [(header::LOCATION, format!("/v2/{REPO}/blobs/{want}"))],
+                )
+                    .into_response()
+            }
             Method::POST if digest.is_empty() => {
                 inner.next_upload += 1;
                 let location = format!("/v2/{REPO}/blobs/uploads/{}?state=x", inner.next_upload);
