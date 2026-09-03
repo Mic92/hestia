@@ -178,6 +178,7 @@ impl Gc {
         let prev = heads.gc.as_ref();
         if let Some(age) = prev.map(|g| now.saturating_sub(g.time))
             && age < self.policy.min_interval
+            && !self.dry_run
         {
             return Err(Error::TooSoon(age));
         }
