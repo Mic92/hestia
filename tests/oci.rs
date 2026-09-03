@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use hestia::gc::GcPolicy;
+use hestia::gc::{Gc, GcPolicy};
 use hestia::manifest::Hash32;
 use hestia::pipeline::AccessLog;
 use hestia::store::Snapshot;
@@ -308,6 +308,34 @@ async fn gc_over_ghcr_deletes_by_version_id() {
         assert_eq!(fake.versions("pack-"), 2);
         assert_eq!(fake.versions("seg-"), 1);
         sim.assert_readable(&[&a, &b]).await;
+    })
+    .await;
+}
+
+/// A plain registry cannot list blobs, so GC probes each referenced pack
+/// to notice what a registry-side GC or retention policy removed.
+#[tokio::test]
+async fn gc_over_plain_registry_notices_evicted_packs() {
+    timed(async {
+        let fake = FakeOci::start().await;
+        let http = reqwest::Client::new();
+        fake.set_clock(T0);
+        let sim = SimCache::with(fake.plain(&http), fake.clock());
+        let a = SimPath::new("a", 1, 100_000);
+        let b = SimPath::new("b", 3, 100_000);
+        sim.push("main", &[&a], &[&a]).await;
+        assert_eq!(fake.evict("pack-"), 1);
+        sim.push("main", &[&b], &[&a, &b]).await;
+        let gc = Gc {
+            dry_run: true,
+            ..sim.gc(GcPolicy::default())
+        };
+        let stats = gc.run(T0 + 2 * HOUR).await.expect("gc");
+        assert_eq!(
+            (stats.packs_evicted, stats.paths_dropped),
+            (1, 1),
+            "{stats:?}"
+        );
     })
     .await;
 }

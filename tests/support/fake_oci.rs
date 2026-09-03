@@ -564,6 +564,27 @@ impl FakeOci {
             .count()
     }
 
+    /// Drop the blobs of content objects under `prefix`, as a registry GC
+    /// or retention policy would.
+    pub fn evict(&self, prefix: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let needle = format!("\"org.opencontainers.image.ref.name\":\"{prefix}");
+        let digests: Vec<String> = inner
+            .manifests
+            .values()
+            .filter_map(|m| {
+                let m: serde_json::Value = serde_json::from_slice(m).ok()?;
+                m.to_string()
+                    .contains(&needle)
+                    .then(|| m["layers"][0]["digest"].as_str().map(str::to_owned))?
+            })
+            .collect();
+        for d in &digests {
+            inner.blobs.remove(d);
+        }
+        digests.len()
+    }
+
     pub fn api_calls(&self) -> u64 {
         self.inner.lock().unwrap().api_calls
     }
