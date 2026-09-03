@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use futures_util::future::join_all;
+use futures_util::future::{join_all, try_join_all};
 use tokio::sync::OnceCell;
 
 use crate::backend::{Backend, Listed};
@@ -349,10 +349,12 @@ impl Snapshot {
         if coin * expected.max(1.0) >= 1.0 {
             return Ok(None);
         }
-        let mut inputs = Vec::new();
-        for (_, seg) in &pending {
-            inputs.push((&seg.meta, self.tree(seg).await?));
-        }
+        let trees = try_join_all(pending.iter().map(|(_, seg)| self.tree(seg))).await?;
+        let inputs: Vec<_> = pending
+            .iter()
+            .zip(trees)
+            .map(|((_, s), t)| (&s.meta, t))
+            .collect();
         let (sealed, _) = segment::merge(&inputs, segment::in_place)?;
         let record = CompactionRecord {
             root: root.to_owned(),
