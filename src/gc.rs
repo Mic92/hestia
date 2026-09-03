@@ -6,8 +6,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::process::ExitCode;
 
-use futures_util::{StreamExt, TryStreamExt};
-
 use crate::backend::{self, Backend, Listed};
 use crate::chunker::{PackBuilder, coalesce_adjacent, extract_chunk, pack_cache_key};
 use crate::cli::GcArgs;
@@ -20,7 +18,6 @@ use crate::trust::Trust;
 
 pub const SECS_PER_HOUR: u64 = 3_600;
 pub const SECS_PER_DAY: u64 = 86_400;
-const PROBE_CONCURRENCY: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -189,11 +186,10 @@ impl Gc {
         stats.epoch = prev.map_or(0, |g| g.epoch) + 1;
 
         let objects = self.backend.list_objects().await?;
-        let stored_packs: Option<HashMap<PackHash, &Listed>> = objects.as_ref().map(|o| {
-            o.iter()
-                .filter_map(|l| Some((PackHash::from_hex(l.key.strip_prefix("pack-")?)?, l)))
-                .collect()
-        });
+        let stored_packs: HashMap<PackHash, &Listed> = objects
+            .iter()
+            .filter_map(|l| Some((PackHash::from_hex(l.key.strip_prefix("pack-")?)?, l)))
+            .collect();
 
         // Roots: a drain's segment names every path it wants kept, so once
         // any drain published, the previous GC segment is not an input.
@@ -252,27 +248,11 @@ impl Gc {
                     .add(&row.live_bits);
             }
         }
-        // Stores that cannot enumerate packs get one existence probe each.
-        let mut lost: BTreeSet<PackHash> = match &stored_packs {
-            Some(stored) => usage
-                .keys()
-                .filter(|p| !stored.contains_key(p))
-                .copied()
-                .collect(),
-            None => futures_util::stream::iter(usage.keys())
-                .map(|p| async move {
-                    self.backend
-                        .touch(&pack_cache_key(p))
-                        .await
-                        .map(|found| (!found).then_some(*p))
-                })
-                .buffer_unordered(PROBE_CONCURRENCY)
-                .try_collect::<Vec<_>>()
-                .await?
-                .into_iter()
-                .flatten()
-                .collect(),
-        };
+        let mut lost: BTreeSet<PackHash> = usage
+            .keys()
+            .filter(|p| !stored_packs.contains_key(p))
+            .copied()
+            .collect();
         stats.packs_evicted = lost.len();
         for p in &lost {
             eprintln!("hestia gc: pack {p} was evicted, dropping the paths that need it");
@@ -349,7 +329,7 @@ impl Gc {
                 sweep.extend(object_keys(d, &Meta::open(&body)?));
             }
         }
-        for l in objects.iter().flatten() {
+        for l in &objects {
             if l.created
                 .is_some_and(|c| now.saturating_sub(c) > self.policy.min_age)
             {
@@ -363,9 +343,9 @@ impl Gc {
             }
         }
 
-        if let Some(stored) = stored_packs.filter(|_| !self.dry_run) {
+        if !self.dry_run {
             for hash in &live_packs {
-                let idle = stored
+                let idle = stored_packs
                     .get(hash)
                     .and_then(|l| l.last_accessed)
                     .map_or(0, |t| now.saturating_sub(t));

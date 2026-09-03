@@ -34,8 +34,8 @@ async fn keys(b: &Backend, prefix: &str) -> Vec<String> {
     l.into_iter().map(|l| l.key).collect()
 }
 
-/// `enumerable`: plain registries cannot list blobs, so GC sweeps no orphans there.
-async fn contract(b: &Backend, enumerable: bool) {
+/// `lingers`: a registry serves a deleted key's blob until its own GC runs.
+async fn contract(b: &Backend, lingers: bool) {
     assert!(b.probe_writable().await.unwrap());
     let pack = Bytes::from(vec![7u8; 1000]);
     let pack_key = format!("pack-{}", Hash32::digest(&pack));
@@ -58,26 +58,30 @@ async fn contract(b: &Backend, enumerable: bool) {
     assert_eq!(keys(b, "h-").await, [HEAD]);
     assert!(keys(b, "c-").await.is_empty());
     let objects = b.list_objects().await.unwrap();
-    assert_eq!(objects.is_some(), enumerable);
-    if let Some(objects) = objects {
-        assert!(objects.iter().any(|l| l.key == pack_key), "{objects:?}");
-        assert!(
-            objects
-                .iter()
-                .all(|l| l.created.is_some_and(|t| t + 600 > now())),
-            "{objects:?}"
-        );
-    }
+    assert!(objects.iter().any(|l| l.key == pack_key), "{objects:?}");
+    assert!(
+        objects
+            .iter()
+            .all(|l| l.created.is_some_and(|t| t + 600 > now())),
+        "{objects:?}"
+    );
     assert!(b.delete(HEAD).await.unwrap());
     assert!(keys(b, "h-").await.is_empty());
     assert!(b.delete(&pack_key).await.unwrap());
-    // A registry keeps the blob until its own GC runs.
-    assert_eq!(b.get(&pack_key, None).await.unwrap().is_some(), !enumerable);
+    assert_eq!(b.get(&pack_key, None).await.unwrap().is_some(), lingers);
+    assert!(!b.touch(&pack_key).await.unwrap() || lingers);
+    assert!(
+        b.list_objects()
+            .await
+            .unwrap()
+            .iter()
+            .all(|l| l.key != pack_key)
+    );
 }
 
 /// Drains, an orphan, GC runs in between (`now + 2` so `min_age: 0`
 /// counts fresh objects as old), and every path still readable.
-async fn gc_round_trip(backend: Backend, enumerable: bool) {
+async fn gc_round_trip(backend: Backend, lingers: bool) {
     let sim = SimCache::with(backend, Arc::new(now));
     let a = SimPath::new("a", 1, 200_000);
     let b = SimPath::new("b", 3, 200_000);
@@ -92,7 +96,8 @@ async fn gc_round_trip(backend: Backend, enumerable: bool) {
     };
     let stats = sim.run_gc(policy.clone(), now() + 2).await;
     assert_eq!(stats.roots, 1, "{stats:?}");
-    if enumerable {
+    assert!(stats.deleted >= 1, "orphan: {stats:?}");
+    if !lingers {
         assert_eq!(sim.backend.get(&orphan, None).await.unwrap(), None);
     }
     sim.assert_readable(&[&a, &b]).await;
@@ -101,9 +106,7 @@ async fn gc_round_trip(backend: Backend, enumerable: bool) {
     let stats = sim.run_gc(policy, now() + 2).await;
     assert!(stats.deleted >= 1, "retired segment: {stats:?}");
     sim.assert_readable(&[&a, &b]).await;
-    if enumerable {
-        sim.assert_no_dangling_references().await;
-    }
+    sim.assert_no_dangling_references().await;
 }
 
 #[tokio::test]
@@ -114,8 +117,8 @@ async fn rustfs() {
             eprintln!("rustfs not on PATH, skipping");
             return;
         };
-        contract(&server.s3(&http), true).await;
-        gc_round_trip(server.s3(&http), true).await;
+        contract(&server.s3(&http), false).await;
+        gc_round_trip(server.s3(&http), false).await;
     })
     .await;
 }
@@ -128,8 +131,8 @@ async fn distribution_registry() {
             eprintln!("registry not on PATH, skipping");
             return;
         };
-        contract(&server.oci(&http), false).await;
-        gc_round_trip(server.oci(&http), false).await;
+        contract(&server.oci(&http), true).await;
+        gc_round_trip(server.oci(&http), true).await;
     })
     .await;
 }

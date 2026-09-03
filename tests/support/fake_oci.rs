@@ -582,20 +582,23 @@ impl FakeOci {
     pub fn evict(&self, prefix: &str) -> usize {
         let mut inner = self.inner.lock().unwrap();
         let needle = format!("\"org.opencontainers.image.ref.name\":\"{prefix}");
-        let digests: Vec<String> = inner
+        let hits: Vec<(String, String)> = inner
             .manifests
-            .values()
-            .filter_map(|m| {
+            .iter()
+            .filter_map(|(d, m)| {
                 let m: serde_json::Value = serde_json::from_slice(m).ok()?;
                 m.to_string()
                     .contains(&needle)
-                    .then(|| m["layers"][0]["digest"].as_str().map(str::to_owned))?
+                    .then(|| Some((d.clone(), m["layers"][0]["digest"].as_str()?.to_owned())))?
             })
             .collect();
-        for d in &digests {
-            inner.blobs.remove(d);
+        for (m, b) in &hits {
+            inner.blobs.remove(b);
+            inner.manifests.remove(m);
+            inner.versions.remove(m);
+            inner.tags.retain(|_, (d, _)| d != m);
         }
-        digests.len()
+        hits.len()
     }
 
     pub fn api_calls(&self) -> u64 {

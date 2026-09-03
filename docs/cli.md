@@ -87,8 +87,8 @@ how GC can delete:
 
 | Registry | Delete | Notes |
 |---|---|---|
-| ghcr.io | GitHub packages API by version id, `GITHUB_TOKEN` with `packages: write` | The OCI delete is refused, so gc keeps a version ledger under the `x-ledger` tag. No pull limits from Actions runners. Public packages substitute anonymously. |
-| distribution, Harbor, Quay, GitLab, zot, Gitea, ACR, Artifact Registry | `DELETE /v2/…/manifests/<digest>` | The registry's own garbage collection reclaims blob storage afterwards (self-hosted `distribution` needs `delete.enabled` and a `garbage-collect` cron). Blobs cannot be enumerated, so a drain that crashed before publishing leaves untagged manifests behind: set a retention rule for old untagged manifests. |
+| ghcr.io | GitHub packages API by version id, `GITHUB_TOKEN` with `packages: write` | The OCI delete is refused, so gc keeps a version ledger under the `x-ledger` tag; content manifests stay untagged (GHCR never reaps them). No pull limits from Actions runners. Public packages substitute anonymously. |
+| distribution, Harbor, Quay, GitLab, zot, Gitea, ACR, Artifact Registry | `DELETE /v2/…/manifests/<digest>` | Every object is tagged with its key (`pack-…`, `seg-…`, `tree-…` next to the heads), so retention rules for untagged manifests and `garbage-collect --delete-untagged` are safe to run and gc enumerates objects through `tags/list`. The registry's own garbage collection reclaims blob storage after gc deleted a manifest (self-hosted `distribution` needs `delete.enabled` and a `garbage-collect` cron). Keep tag-based retention rules away from those prefixes. |
 | AWS ECR | not supported yet (needs `BatchDeleteImage`) | Push and pull work. |
 | Docker Hub | tags only, untagged manifests are reaped by Hub | Push and pull work, but the pull rate limit (100 to 200 requests per 6 h per IP, shared by all GitHub-hosted runners) makes it unsuitable as a CI cache. |
 

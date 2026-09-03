@@ -99,9 +99,8 @@ impl Backend {
         Ok(self.list("", None).await?.expect("unbounded"))
     }
 
-    /// GC only: all `pack-`/`seg-`/`tree-` objects, `None` where the
-    /// backend cannot enumerate them.
-    pub async fn list_objects(&self) -> Result<Option<Vec<Listed>>, Error> {
+    /// GC only: all `pack-`/`seg-`/`tree-` objects with creation times.
+    pub async fn list_objects(&self) -> Result<Vec<Listed>, Error> {
         if let Backend::Oci(b) = self {
             return b.list_objects().await;
         }
@@ -109,7 +108,7 @@ impl Backend {
         for prefix in ["pack-", "seg-", "tree-"] {
             out.extend(self.list(prefix, None).await?.expect("unbounded"));
         }
-        Ok(Some(out))
+        Ok(out)
     }
 
     pub async fn delete(&self, key: &str) -> Result<bool, Error> {

@@ -241,12 +241,7 @@ impl SimCache {
     pub async fn stored_keys(&self, prefix: &str) -> BTreeSet<String> {
         let listed = match self.backend.list(prefix, None).await.expect("listing") {
             Some(heads) => heads,
-            None => self
-                .backend
-                .list_objects()
-                .await
-                .expect("objects")
-                .expect("listable"),
+            None => self.backend.list_objects().await.expect("objects"),
         };
         listed
             .into_iter()
