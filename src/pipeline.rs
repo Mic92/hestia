@@ -297,7 +297,12 @@ impl PipelineContext {
 
             let hash = info.path_hash();
 
-            if snapshot.contains(&hash) {
+            // A path whose pack the substituter saw evicted goes up again.
+            let cached = match &self.publish {
+                Some(p) => p.available(&hash).await,
+                None => snapshot.contains(&hash),
+            };
+            if cached {
                 root_paths.insert(hash);
                 stats.skipped_existing += 1;
                 continue;
