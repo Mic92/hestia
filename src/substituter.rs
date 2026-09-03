@@ -162,6 +162,12 @@ impl ManifestStore {
         Arc::clone(&self.inner.read().expect("manifest lock poisoned"))
     }
 
+    /// Stored and not known to touch an evicted pack.
+    pub async fn available(&self, hash: &PathHash) -> bool {
+        let view = self.view();
+        view.contains(hash) && view.available(hash).await
+    }
+
     /// Number of paths currently servable.
     pub fn path_count(&self) -> usize {
         self.view().snapshot.as_ref().map_or(0, |s| s.path_count())

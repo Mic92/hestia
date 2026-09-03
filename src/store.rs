@@ -404,8 +404,12 @@ impl Snapshot {
                 tree.node(i)?
                     .for_each_chunk(&mut |c| _ = packs.insert(c.pack));
             }
+            // An evicted pack has no hints to give; its paths go up again.
             for p in packs {
-                self.pack_index(&seg.meta.packs[p as usize]).await?;
+                match self.pack_index(&seg.meta.packs[p as usize]).await {
+                    Ok(_) | Err(Error::MissingPack(_)) => {}
+                    Err(err) => return Err(err),
+                }
             }
         }
         Ok(())

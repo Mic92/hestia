@@ -19,6 +19,7 @@ use std::time::Duration;
 use hestia::gc::{Gc, GcPolicy};
 use hestia::pipeline::{AccessLog, PipelineContext};
 use hestia::store::meta_key;
+use hestia::substituter::{ManifestStore, verify_packs};
 
 use support::common::{
     assert_all_chunks_locatable, load_snapshot, path_hash_of, pipeline_context, to_path_set,
@@ -164,6 +165,37 @@ async fn evicted_segment_is_skipped_not_fatal() {
     let snapshot = load_snapshot(&fake, &http).await;
     assert!(snapshot.contains(&path_hash_of(&new)));
     assert!(!snapshot.contains(&path_hash_of(&old)));
+}
+
+#[tokio::test]
+async fn path_in_an_evicted_pack_is_pushed_again() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let fixture = store.add_fixture("pack-evicted", 229);
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let publish = ManifestStore::new();
+    let ctx = PipelineContext {
+        publish: Some(publish.clone()),
+        ..context(&fake, &http, &store)
+    };
+    ctx.run(to_path_set(&[&fixture]), BTreeSet::new())
+        .await
+        .expect("first drain");
+
+    let rest = fake.rest(&http);
+    for pack in rest.list_caches("pack-").await.unwrap() {
+        rest.delete_by_key(&pack.key).await.unwrap();
+    }
+    verify_packs(&fake.backend(&http), &publish, u64::MAX).await;
+
+    let stats = ctx
+        .run(to_path_set(&[&fixture]), BTreeSet::new())
+        .await
+        .expect("second drain");
+    assert_eq!((stats.pushed, stats.skipped_existing), (1, 0));
+    assert_eq!(rest.list_caches("pack-").await.unwrap().len(), 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -167,6 +167,7 @@ impl Gc {
 
     async fn delete(&self, key: &str) -> Result<bool, Error> {
         if self.dry_run {
+            eprintln!("hestia gc: would delete {key}");
             return Ok(true);
         }
         Ok(self.backend.delete(key).await?)
