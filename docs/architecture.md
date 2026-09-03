@@ -50,7 +50,7 @@ SHA-256 of its bytes, so the same names work as OCI blob digests.
 
 The same objects go into one of three stores: the Actions cache (the
 default, evicts by LRU), an OCI registry (blobs plus one manifest each,
-heads as tags) or an S3-compatible bucket (`pack/<xx>/`, `seg/`,
+tagged with the key, untagged on GHCR where a ledger tracks them) or an S3-compatible bucket (`pack/<xx>/`, `seg/`,
 `heads/` under a prefix). The rest of this document is store-agnostic:
 a store only needs put, ranged get, list by prefix and delete.
 

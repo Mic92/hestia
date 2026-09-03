@@ -2,9 +2,14 @@
 //! `sha256:<key suffix>`, each with a one-layer manifest so registries
 //! that hide unreferenced blobs serve them. Heads are tags on a manifest
 //! whose config blob is the record, and every manifest names its key in
-//! an annotation. Listing is `tags/list`, so only heads can be listed,
-//! except on GHCR where the [`ghcr`](super::ghcr) ledger knows every
-//! object. Delete is `DELETE /manifests/<digest>`, or GHCR's packages API.
+//! an annotation. Listing is `tags/list`. On GHCR content manifests stay
+//! untagged and the [`ghcr`](super::ghcr) ledger knows every object;
+//! elsewhere they are tagged with their key, so untagged-manifest
+//! retention (Harbor, Quay, ECR, Hub, `garbage-collect --delete-untagged`)
+//! leaves them alone and GC can enumerate them. Content tags (`pack-`,
+//! `seg-`, `tree-`) sort after every head kind, so listing heads stops
+//! at the first one. Delete is `DELETE /manifests/<digest>`, or GHCR's
+//! packages API.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -12,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::{StreamExt, TryStreamExt};
 use reqwest::{RequestBuilder, Response, StatusCode, header};
 use serde::Deserialize;
 use tokio::sync::OnceCell;
@@ -19,8 +25,11 @@ use tokio::sync::OnceCell;
 use super::ghcr::{Ledger, Packages};
 use super::{Error, Listed};
 use crate::gha::blob::{is_transient, status_error};
-use crate::gha::rest::{DEFAULT_API_URL, ENV_GITHUB_API_URL, ENV_GITHUB_TOKEN};
+use crate::gha::rest::{
+    DEFAULT_API_URL, ENV_GITHUB_API_URL, ENV_GITHUB_TOKEN, format_timestamp, parse_timestamp,
+};
 use crate::manifest::Hash32;
+use crate::pipeline::now_unix;
 
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const EMPTY_TYPE: &str = "application/vnd.oci.empty.v1+json";
@@ -28,6 +37,9 @@ const EMPTY_DIGEST: &str =
     "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 const ARTIFACT_PREFIX: &str = "application/vnd.hestia.";
 const KEY_ANNOTATION: &str = "org.opencontainers.image.ref.name";
+const CREATED_ANNOTATION: &str = "org.opencontainers.image.created";
+/// GETs in flight when GC reads creation times off content manifests.
+const LIST_CONCURRENCY: usize = 16;
 const TAGS_PAGE: usize = 1000;
 const TRANSIENT_RETRIES: u32 = 4;
 /// Blobs up to this size are sent with the opening POST.
@@ -79,15 +91,24 @@ fn descriptor(media_type: &str, digest: &str, size: usize) -> serde_json::Value 
 
 /// The key annotation makes every head its own manifest, so deleting one
 /// never takes another tag with it, and tells GC which key a manifest is.
-fn manifest(key: &str, config: Option<(&str, usize)>, layer: Option<(&str, usize)>) -> Vec<u8> {
+fn manifest(
+    key: &str,
+    config: Option<(&str, usize)>,
+    layer: Option<(&str, usize)>,
+    created: Option<u64>,
+) -> Vec<u8> {
     let empty = || descriptor(EMPTY_TYPE, EMPTY_DIGEST, 2);
+    let mut annotations = serde_json::json!({KEY_ANNOTATION: key});
+    if let Some(t) = created {
+        annotations[CREATED_ANNOTATION] = format_timestamp(t).into();
+    }
     let m = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": MANIFEST_TYPE,
         "artifactType": format!("{ARTIFACT_PREFIX}{}", kind(key)),
         "config": config.map_or_else(empty, |(d, n)| descriptor("application/cbor", d, n)),
         "layers": [layer.map_or_else(empty, |(d, n)| descriptor("application/octet-stream", d, n))],
-        "annotations": {KEY_ANNOTATION: key},
+        "annotations": annotations,
     });
     serde_json::to_vec(&m).expect("json")
 }
@@ -351,32 +372,43 @@ impl Oci {
                 .upload_blob(&digest, data.clone(), kind(key) == "pack")
                 .await?;
             // Also when the blob existed: heals one whose manifest never landed.
-            let m = manifest(key, None, blob);
-            self.put_manifest(&sha256(&m), m).await?;
+            if self.ghcr.is_some() {
+                let m = manifest(key, None, blob, None);
+                self.put_manifest(&sha256(&m), m).await?;
+            } else {
+                self.put_manifest(key, manifest(key, None, blob, Some(now_unix())))
+                    .await?;
+            }
             return Ok(created);
         }
         if !data.is_empty() {
             self.upload_blob(&digest, data.clone(), false).await?;
         }
-        let m = manifest(key, blob.filter(|_| !data.is_empty()), None);
+        let m = manifest(key, blob.filter(|_| !data.is_empty()), None, None);
         self.put_manifest(key, m).await?;
         Ok(true)
     }
 
-    /// A manifest by tag or digest.
-    async fn get_manifest(&self, reference: &str) -> Result<Option<Manifest>, Error> {
+    async fn manifest_bytes(&self, reference: &str) -> Result<Option<Bytes>, Error> {
         let url = self.v2(&format!("manifests/{reference}"));
         let r = self
             .send(|| self.http.get(&url).header(header::ACCEPT, MANIFEST_TYPE))
             .await?;
         match r.status() {
             StatusCode::NOT_FOUND => Ok(None),
-            StatusCode::OK => Ok(Some(
-                serde_json::from_slice(&r.bytes().await?)
-                    .map_err(|e| Error::InvalidResponse(format!("manifest {reference}: {e}")))?,
-            )),
+            StatusCode::OK => Ok(Some(r.bytes().await?)),
             _ => Err(status_error(&url, r).await),
         }
+    }
+
+    /// A manifest by tag or digest.
+    async fn get_manifest(&self, reference: &str) -> Result<Option<Manifest>, Error> {
+        let Some(body) = self.manifest_bytes(reference).await? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&body)
+            .map(Some)
+            .map_err(|e| Error::InvalidResponse(format!("manifest {reference}: {e}")))
     }
 
     /// The hestia key a manifest was written for.
@@ -530,21 +562,56 @@ impl Oci {
     }
 
     /// GC only: every content object with its creation time, through the
-    /// GHCR ledger. Plain registries cannot enumerate blobs.
-    pub async fn list_objects(&self) -> Result<Option<Vec<Listed>>, Error> {
-        Ok(self.ledger().await?.map(|l| l.objects()))
+    /// GHCR ledger or off the content tags' manifests.
+    pub async fn list_objects(&self) -> Result<Vec<Listed>, Error> {
+        if let Some(l) = self.ledger().await? {
+            return Ok(l.objects());
+        }
+        let mut tags = Vec::new();
+        for prefix in ["pack-", "seg-", "tree-"] {
+            tags.extend(self.tags(prefix, None).await?.expect("unbounded"));
+        }
+        let listed = futures_util::stream::iter(tags)
+            .map(|key| async move {
+                let created = self
+                    .get_manifest(&key)
+                    .await?
+                    .and_then(|m| parse_timestamp(m.annotations.get(CREATED_ANNOTATION)?));
+                Ok::<_, Error>(Listed {
+                    key,
+                    created,
+                    last_accessed: None,
+                })
+            })
+            .buffer_unordered(LIST_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(listed)
     }
 
-    /// Tags only: blobs cannot be enumerated, so other prefixes give
-    /// `None`. The empty prefix lists every head kind.
+    /// The empty prefix lists every head kind. Content prefixes give
+    /// `None` on GHCR, where content manifests carry no tag.
     pub async fn list(
         &self,
         prefix: &str,
         limit: Option<u64>,
     ) -> Result<Option<Vec<Listed>>, Error> {
-        if !matches!(kind(prefix), "" | "g" | "h" | "c") {
+        if self.ghcr.is_some() && !matches!(kind(prefix), "" | "g" | "h" | "c") {
             return Ok(None);
         }
+        Ok(self.tags(prefix, limit).await?.map(|tags| {
+            tags.into_iter()
+                .map(|key| Listed {
+                    key,
+                    created: None,
+                    last_accessed: None,
+                })
+                .collect()
+        }))
+    }
+
+    async fn tags(&self, prefix: &str, limit: Option<u64>) -> Result<Option<Vec<String>>, Error> {
+        let heads = matches!(kind(prefix), "" | "g" | "h" | "c");
         let wanted = |t: &str| match prefix {
             "" => matches!(kind(t), "g" | "h" | "c"),
             p => t.starts_with(p),
@@ -566,21 +633,19 @@ impl Oci {
                 .and_then(|l| l.split(';').next())
                 .map(|u| self.absolute(u.trim().trim_start_matches('<').trim_end_matches('>')));
             let tags: Tags = r.json().await?;
+            let mut past_heads = false;
             for t in tags.tags.unwrap_or_default() {
+                past_heads |= t.as_str() > "i";
                 if wanted(&t) {
-                    out.push(Listed {
-                        key: t,
-                        created: None,
-                        last_accessed: None,
-                    });
+                    out.push(t);
                 }
             }
             if limit.is_some_and(|l| out.len() as u64 > l) {
                 return Ok(None);
             }
             match next {
-                Some(n) => url = n,
-                None => return Ok(Some(out)),
+                Some(n) if !(heads && past_heads) => url = n,
+                _ => return Ok(Some(out)),
             }
         }
     }
@@ -593,13 +658,10 @@ impl Oci {
         if let (Some(ghcr), Some(mut ledger)) = (&self.ghcr, self.ledger().await?) {
             return ghcr.delete(&mut ledger, key).await;
         }
-        // Content manifests are untagged but follow from key and blob size.
-        let reference = match content_digest(key) {
-            Some(blob) => match self.head_size(&format!("blobs/{blob}")).await? {
-                Some(size) => sha256(&manifest(key, None, Some((&blob, size)))),
-                None => return Ok(false),
-            },
-            None => key.to_owned(),
+        // Every key is a tag here. Deleting by digest takes the tag along,
+        // deleting by tag is an API registries may not offer.
+        let Some(reference) = self.manifest_bytes(key).await?.map(|b| sha256(&b)) else {
+            return Ok(false);
         };
         let url = self.v2(&format!("manifests/{reference}"));
         let r = self.send(|| self.http.delete(&url)).await?;
