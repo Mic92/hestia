@@ -185,6 +185,19 @@ async fn pull_only_credentials_read_but_cannot_write() {
     .await;
 }
 
+/// htpasswd registries (distribution, Nexus) challenge with Basic and
+/// have no token service.
+#[tokio::test]
+async fn basic_challenge_uses_the_credentials_directly() {
+    let fake = FakeOci::start().await;
+    let http = reqwest::Client::new();
+    fake.basic_only();
+    let sim = SimCache::with(fake.plain(&http), fake.clock());
+    let a = SimPath::new("a", 1, 10_000);
+    sim.push("main", &[&a], &[&a]).await;
+    sim.assert_readable(&[&a]).await;
+}
+
 #[tokio::test]
 async fn drain_and_nix_copy_over_oci() {
     timed(async {

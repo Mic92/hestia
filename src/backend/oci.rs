@@ -50,7 +50,9 @@ pub struct Oci {
     /// `owner/repo/hestia`
     name: String,
     basic: Option<(String, String)>,
-    token: Arc<Mutex<Option<String>>>,
+    /// What answered the last challenge: a bearer token, or the basic
+    /// credentials themselves for registries that challenge with Basic.
+    auth: Arc<Mutex<Option<Auth>>>,
     empty_pushed: Arc<OnceCell<bool>>,
     ghcr: Option<Packages>,
     /// Loaded and synced on first use, written back by [`Oci::flush`].
@@ -111,6 +113,12 @@ struct Tags {
 }
 
 /// `Bearer realm="…",service="…",scope="…"` → those three.
+#[derive(Clone)]
+enum Auth {
+    Bearer(String),
+    Basic,
+}
+
 fn parse_challenge(h: &str) -> Option<(String, Option<String>)> {
     let params = h.strip_prefix("Bearer ")?;
     let mut realm = None;
@@ -162,7 +170,7 @@ impl Oci {
             registry: format!("{scheme}://{host}"),
             name: name.to_owned(),
             basic,
-            token: Default::default(),
+            auth: Default::default(),
             empty_pushed: Default::default(),
             ledger: Default::default(),
         })
@@ -192,7 +200,10 @@ impl Oci {
         }
     }
 
-    async fn fetch_token(&self, challenge: &str) -> Result<String, Error> {
+    async fn answer(&self, challenge: &str) -> Result<Auth, Error> {
+        if challenge.starts_with("Basic ") && self.basic.is_some() {
+            return Ok(Auth::Basic);
+        }
         let (realm, service) = parse_challenge(challenge)
             .ok_or_else(|| Error::InvalidResponse(format!("WWW-Authenticate: {challenge}")))?;
         let mut q = vec![("scope", format!("repository:{}:pull,push", self.name))];
@@ -210,6 +221,7 @@ impl Oci {
         let t: Token = r.json().await?;
         t.token
             .or(t.access_token)
+            .map(Auth::Bearer)
             .ok_or_else(|| Error::InvalidResponse("token response without token".into()))
     }
 
@@ -220,9 +232,12 @@ impl Oci {
         let mut delay = Duration::from_millis(200);
         loop {
             let mut req = build();
-            if let Some(t) = self.token.lock().unwrap().clone() {
-                req = req.bearer_auth(t);
-            }
+            let auth = self.auth.lock().unwrap().clone();
+            req = match (auth, &self.basic) {
+                (Some(Auth::Bearer(t)), _) => req.bearer_auth(t),
+                (Some(Auth::Basic), Some((u, p))) => req.basic_auth(u, Some(p)),
+                _ => req,
+            };
             let result = req.send().await.map_err(Error::Http);
             let transient = match &result {
                 Ok(r) if r.status() == StatusCode::UNAUTHORIZED && !authed => {
@@ -233,8 +248,7 @@ impl Oci {
                         .unwrap_or("")
                         .to_owned();
                     authed = true;
-                    let token = self.fetch_token(&challenge).await?;
-                    *self.token.lock().unwrap() = Some(token);
+                    *self.auth.lock().unwrap() = Some(self.answer(&challenge).await?);
                     continue;
                 }
                 Ok(r) => {

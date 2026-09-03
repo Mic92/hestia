@@ -53,6 +53,8 @@ struct Inner {
     requests: u64,
     tag_lag: u64,
     deny_push: bool,
+    /// htpasswd-style registry: Basic challenge, no token service.
+    basic_only: bool,
     /// Every blob GET as (digest, Range header).
     blob_gets: Vec<(String, Option<String>)>,
 }
@@ -172,13 +174,27 @@ fn error(status: StatusCode, code: &str) -> Response {
         .into_response()
 }
 
-fn challenge(base: &str) -> Response {
+fn basic_ok(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            use base64::Engine;
+            let want =
+                base64::engine::general_purpose::STANDARD.encode(format!("{USER}:{PASSWORD}"));
+            v == format!("Basic {want}")
+        })
+}
+
+fn challenge(base: &str, basic: bool) -> Response {
+    let value = if basic {
+        r#"Basic realm="fake""#.to_owned()
+    } else {
+        format!(r#"Bearer realm="{base}/token",service="fake",scope="repository:{REPO}:pull""#)
+    };
     (
         StatusCode::UNAUTHORIZED,
-        [(
-            header::WWW_AUTHENTICATE,
-            format!(r#"Bearer realm="{base}/token",service="fake",scope="repository:{REPO}:pull""#),
-        )],
+        [(header::WWW_AUTHENTICATE, value)],
         Json(json!({"errors": [{"code": "UNAUTHORIZED"}]})),
     )
         .into_response()
@@ -195,15 +211,7 @@ async fn token(
     Query(q): Query<TokenQuery>,
 ) -> Response {
     let wants_push = q.scope.as_deref().is_some_and(|s| s.contains("push"));
-    let authed = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            use base64::Engine;
-            let want =
-                base64::engine::general_purpose::STANDARD.encode(format!("{USER}:{PASSWORD}"));
-            v == format!("Basic {want}")
-        });
+    let authed = basic_ok(&headers);
     let deny = state.inner.lock().unwrap().deny_push;
     // Like registries do: grant the subset the caller is entitled to.
     let t = if wants_push && authed && !deny {
@@ -280,16 +288,21 @@ async fn v2(State(state): State<AppState>, req: Request) -> Response {
     let query = req.uri().query().unwrap_or("").to_owned();
     let method = req.method().clone();
     let headers = req.headers().clone();
-    let access = access(&headers);
+    let basic = state.inner.lock().unwrap().basic_only;
+    let access = match basic {
+        true if basic_ok(&headers) => Access::Push,
+        true => Access::None,
+        false => access(&headers),
+    };
     if matches!(access, Access::None) {
-        return challenge(&state.base_url);
+        return challenge(&state.base_url, basic);
     }
     let write = matches!(
         method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
     if write && !matches!(access, Access::Push) {
-        return challenge(&state.base_url);
+        return challenge(&state.base_url, basic);
     }
     let body = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
@@ -592,6 +605,10 @@ impl FakeOci {
     /// New tags stay out of `tags/list` for this many further requests.
     pub fn set_tag_lag(&self, requests: u64) {
         self.inner.lock().unwrap().tag_lag = requests;
+    }
+
+    pub fn basic_only(&self) {
+        self.inner.lock().unwrap().basic_only = true;
     }
 
     /// Token endpoint hands out pull-only tokens whatever the credentials.
