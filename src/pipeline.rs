@@ -228,18 +228,21 @@ impl PipelineContext {
         }
 
         let load_started = std::time::Instant::now();
-        let snapshot = match self.publish.as_ref().and_then(ManifestStore::snapshot) {
-            Some(s) => s,
-            None => Arc::new(
-                Snapshot::load(
-                    self.backend.clone(),
-                    self.trust.clone(),
-                    std::slice::from_ref(&self.root_key),
-                    None,
-                )
-                .await?,
-            ),
-        };
+        // Relisted every drain: a GC since the last one may have retired
+        // segments the served snapshot still names. Their bodies are reused.
+        let previous = self.publish.as_ref().and_then(ManifestStore::snapshot);
+        let roots = previous
+            .as_ref()
+            .map_or_else(|| vec![self.root_key.clone()], |p| p.roots.clone());
+        let snapshot = Arc::new(
+            Snapshot::load(
+                self.backend.clone(),
+                self.trust.clone(),
+                &roots,
+                previous.as_deref(),
+            )
+            .await?,
+        );
         // Blocking sqlite I/O happens off the async runtime.
         let store = self.store.clone();
         let expand_closure = self.expand_closure;

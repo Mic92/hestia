@@ -198,6 +198,51 @@ async fn path_in_an_evicted_pack_is_pushed_again() {
     assert_eq!(rest.list_caches("pack-").await.unwrap().len(), 1);
 }
 
+/// Two GC epochs inside one job retire and then sweep the segment the
+/// daemon published earlier. Its next drain must not work from that view.
+#[tokio::test]
+async fn drain_after_two_gc_epochs_relists() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let first = store.add_fixture("gc-between-a", 211);
+    let second = store.add_fixture("gc-between-b", 213);
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let ctx = PipelineContext {
+        publish: Some(ManifestStore::new()),
+        ..context(&fake, &http, &store)
+    };
+    fake.set_clock(1_700_000_000);
+    ctx.run(to_path_set(&[&first]), BTreeSet::new())
+        .await
+        .expect("first drain");
+    for hours in [2, 4] {
+        let now = 1_700_000_000 + hours * 3600;
+        fake.set_clock(now);
+        Gc {
+            backend: fake.backend(&http),
+            trust: hestia::trust::Trust::open(),
+            policy: GcPolicy::default(),
+            dry_run: false,
+        }
+        .run(now)
+        .await
+        .expect("gc");
+    }
+    let stats = ctx
+        .run(
+            to_path_set(&[&second]),
+            BTreeSet::from([path_hash_of(&first)]),
+        )
+        .await
+        .expect("drain after gc");
+    assert_eq!(stats.pushed, 1);
+    let snapshot = load_snapshot(&fake, &http).await;
+    assert!(snapshot.contains(&path_hash_of(&first)));
+    assert!(snapshot.contains(&path_hash_of(&second)));
+}
+
 // ---------------------------------------------------------------------------
 // Concurrent serve daemons (matrix jobs)
 // ---------------------------------------------------------------------------
