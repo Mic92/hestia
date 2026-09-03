@@ -64,11 +64,14 @@ pub struct Resolved {
 pub struct Snapshot {
     backend: Backend,
     trust: Trust,
-    roots: Vec<String>,
+    pub roots: Vec<String>,
     listed: Vec<Listed>,
     pub view: View,
     /// In lookup priority: served roots in order, newest segment first.
     segments: Vec<Arc<Segment>>,
+    /// Published by this process under the first root and served even
+    /// while the listing lags behind, until a GC moves the epoch on.
+    published: Vec<(u64, Arc<Segment>)>,
     pack_indexes: Mutex<HashMap<PackHash, Arc<PackIndex>>>,
 }
 
@@ -215,41 +218,45 @@ impl Heads {
 }
 
 impl Snapshot {
+    /// List the heads and open what `roots` publish, reusing segment
+    /// bodies and pack indexes of `previous`.
     pub async fn load(
         backend: Backend,
         trust: Trust,
         roots: &[String],
         previous: Option<&Snapshot>,
     ) -> Result<Snapshot, Error> {
-        let pack_indexes = previous
-            .map(|p| p.pack_indexes.lock().unwrap().clone())
-            .unwrap_or_default();
-        Self::load_with(
-            backend,
-            trust,
-            roots,
-            previous.into_iter().flat_map(|p| &p.segments),
-            pack_indexes,
-        )
-        .await
+        Self::load_with(backend, trust, roots, previous, None).await
     }
 
-    /// [`Self::load`] reusing `known` segments and pack indexes.
     async fn load_with(
         backend: Backend,
         trust: Trust,
         roots: &[String],
-        known: impl Iterator<Item = &Arc<Segment>> + Send,
-        pack_indexes: HashMap<PackHash, Arc<PackIndex>>,
+        previous: Option<&Snapshot>,
+        fresh: Option<(u64, Arc<Segment>)>,
     ) -> Result<Snapshot, Error> {
         let Heads { listed, view, .. } = Heads::load(&backend, &trust).await?;
-        let loaded: HashMap<SegDigest, Arc<Segment>> =
-            known.map(|s| (s.digest, s.clone())).collect();
+        let published: Vec<(u64, Arc<Segment>)> = fresh
+            .into_iter()
+            .chain(
+                previous
+                    .into_iter()
+                    .flat_map(|p| p.published.iter().cloned()),
+            )
+            .filter(|(epoch, _)| *epoch == view.epoch)
+            .collect();
+        let loaded: HashMap<SegDigest, Arc<Segment>> = previous
+            .into_iter()
+            .flat_map(|p| &p.segments)
+            .chain(published.iter().map(|(_, s)| s))
+            .map(|s| (s.digest, s.clone()))
+            .collect();
         let wanted = roots
             .iter()
             .filter_map(|r| view.roots.get(r))
             .flat_map(|d| d.iter().rev());
-        let segments = join_all(wanted.map(|digest| {
+        let mut segments: Vec<Arc<Segment>> = join_all(wanted.map(|digest| {
             let (backend, loaded) = (&backend, &loaded);
             async move {
                 if let Some(s) = loaded.get(digest) {
@@ -277,6 +284,14 @@ impl Snapshot {
         .into_iter()
         .flatten()
         .collect();
+        for (_, s) in published.iter().rev() {
+            if !segments.iter().any(|x| x.digest == s.digest) {
+                segments.insert(0, s.clone());
+            }
+        }
+        let pack_indexes = previous
+            .map(|p| p.pack_indexes.lock().unwrap().clone())
+            .unwrap_or_default();
         Ok(Snapshot {
             backend,
             trust,
@@ -284,31 +299,26 @@ impl Snapshot {
             listed,
             view,
             segments,
+            published,
             pack_indexes: Mutex::new(pack_indexes),
         })
     }
 
-    /// Reload, then make sure `sealed` (just published under the first
-    /// root) is served even if the listing does not show its head yet.
+    /// Reload after publishing `sealed` under the first root.
     pub async fn refresh_with(&self, sealed: &Sealed) -> Result<Snapshot, Error> {
         let fresh = Arc::new(Segment {
             digest: sealed.digest(),
             meta: Meta::open(&sealed.meta)?,
             tree: OnceCell::new_with(Some(Tree::open(&sealed.tree)?)),
         });
-        let pack_indexes = self.pack_indexes.lock().unwrap().clone();
-        let mut next = Snapshot::load_with(
+        Snapshot::load_with(
             self.backend.clone(),
             self.trust.clone(),
             &self.roots,
-            self.segments.iter().chain([&fresh]),
-            pack_indexes,
+            Some(self),
+            Some((self.view.epoch, fresh)),
         )
-        .await?;
-        if !next.segments.iter().any(|s| s.digest == fresh.digest) {
-            next.segments.insert(0, fresh);
-        }
-        Ok(next)
+        .await
     }
 
     /// Fold `root`'s pending segments into one `c-*` when this drain
