@@ -6,6 +6,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::process::ExitCode;
 
+use futures_util::{StreamExt, TryStreamExt};
+
 use crate::backend::{self, Backend, Listed};
 use crate::chunker::{PackBuilder, coalesce_adjacent, extract_chunk, pack_cache_key};
 use crate::cli::GcArgs;
@@ -18,6 +20,7 @@ use crate::trust::Trust;
 
 pub const SECS_PER_HOUR: u64 = 3_600;
 pub const SECS_PER_DAY: u64 = 86_400;
+const PROBE_CONCURRENCY: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -249,13 +252,26 @@ impl Gc {
                     .add(&row.live_bits);
             }
         }
+        // Stores that cannot enumerate packs get one existence probe each.
         let mut lost: BTreeSet<PackHash> = match &stored_packs {
             Some(stored) => usage
                 .keys()
                 .filter(|p| !stored.contains_key(p))
                 .copied()
                 .collect(),
-            None => BTreeSet::new(),
+            None => futures_util::stream::iter(usage.keys())
+                .map(|p| async move {
+                    self.backend
+                        .touch(&pack_cache_key(p))
+                        .await
+                        .map(|found| (!found).then_some(*p))
+                })
+                .buffer_unordered(PROBE_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?
+                .into_iter()
+                .flatten()
+                .collect(),
         };
         stats.packs_evicted = lost.len();
         for p in &lost {
