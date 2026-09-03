@@ -611,6 +611,8 @@ impl Oci {
     }
 
     async fn tags(&self, prefix: &str, limit: Option<u64>) -> Result<Option<Vec<String>>, Error> {
+        // Lexical order (the spec's, checked per page since GHCR for one
+        // lists by creation) lets a head listing stop at the first content tag.
         let heads = matches!(kind(prefix), "" | "g" | "h" | "c");
         let wanted = |t: &str| match prefix {
             "" => matches!(kind(t), "g" | "h" | "c"),
@@ -633,13 +635,9 @@ impl Oci {
                 .and_then(|l| l.split(';').next())
                 .map(|u| self.absolute(u.trim().trim_start_matches('<').trim_end_matches('>')));
             let tags: Tags = r.json().await?;
-            let mut past_heads = false;
-            for t in tags.tags.unwrap_or_default() {
-                past_heads |= t.as_str() > "i";
-                if wanted(&t) {
-                    out.push(t);
-                }
-            }
+            let page = tags.tags.unwrap_or_default();
+            let past_heads = page.is_sorted() && page.last().is_some_and(|t| t.as_str() > "i");
+            out.extend(page.into_iter().filter(|t| wanted(t)));
             if limit.is_some_and(|l| out.len() as u64 > l) {
                 return Ok(None);
             }
