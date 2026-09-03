@@ -16,12 +16,20 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
+use futures_util::stream;
+use futures_util::{StreamExt as _, TryStreamExt as _};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::spawn_blocking;
 
 use crate::backend::Backend;
-use crate::chunker::{self, PackBuilder, chunk_path, compress_chunks, nar_hash_from_chunks};
+use crate::chunker::{
+    self, Chunk, ChunkedPath, Pack, PackBuilder, chunk_path, compress_chunks, nar_hash_from_chunks,
+};
 use crate::gha::Error as GhaError;
-use crate::manifest::{PathEntry, PathHash};
+use crate::manifest::{ChunkHash, NarHash, PathEntry, PathHash};
 use crate::pathinfo::{Error as PathInfoError, Lookup, PathInfo, StoreDatabase};
 use crate::protocol::DrainStats;
 use crate::refnorm::RefTable;
@@ -30,7 +38,6 @@ use crate::store::{self, Snapshot};
 use crate::substituter::ManifestStore;
 use crate::trust::Trust;
 use crate::upstream::UpstreamFilter;
-use futures_util::{StreamExt as _, TryStreamExt as _};
 
 /// Compressed bytes per pack before a new pack is started.
 pub const PACK_TARGET_SIZE: u64 = 64 * 1024 * 1024;
@@ -42,11 +49,8 @@ const UPLOAD_CONCURRENCY: usize = 4;
 /// width is capped at the CPU count.
 const CHUNK_CONCURRENCY: usize = 32;
 
-/// Upper bound on the summed NAR size of paths chunked and verified
-/// concurrently. The path-count cap alone does not bound memory: a few
-/// multi-hundred-MiB paths in flight at once would stack their buffers.
-/// Large paths serialize against this budget instead; small paths are
-/// unaffected.
+/// Upper bound on the summed NAR size of paths whose raw chunks are in
+/// memory, from chunking until compressed.
 const CHUNK_INFLIGHT_NAR_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Semaphore permits for one path's chunk-and-verify stage: its NAR size,
@@ -141,7 +145,7 @@ pub fn now_unix() -> u64 {
 /// are content-addressed, so an existing entry holds identical content.
 /// That case touches the existing pack so its LRU clock and GC's age
 /// guard see this writer's dependency before the head lands.
-pub async fn upload_pack(backend: &Backend, pack: &chunker::Pack) -> Result<bool, GhaError> {
+pub async fn upload_pack(backend: &Backend, pack: &Pack) -> Result<bool, GhaError> {
     let key = pack.cache_key();
     let created = backend.put(&key, pack.data.clone()).await?;
     if !created {
@@ -190,10 +194,12 @@ pub fn system_clock() -> Clock {
 /// A path that chunked and passed NAR verification.
 struct ReadyPath {
     info: PathInfo,
-    chunked: chunker::ChunkedPath,
-    nar_hash: crate::manifest::NarHash,
+    chunked: ChunkedPath,
+    nar_hash: NarHash,
     nar_size: u64,
-    elapsed: std::time::Duration,
+    elapsed: Duration,
+    /// Released once the chunks are compressed.
+    permit: OwnedSemaphorePermit,
 }
 
 /// Result of the concurrent chunk-and-verify stage for one path.
@@ -227,7 +233,7 @@ impl PipelineContext {
             return Ok(stats);
         }
 
-        let load_started = std::time::Instant::now();
+        let load_started = Instant::now();
         // Relisted every drain: a GC since the last one may have retired
         // segments the served snapshot still names. Their bodies are reused.
         let previous = self.publish.as_ref().and_then(ManifestStore::snapshot);
@@ -247,7 +253,7 @@ impl PipelineContext {
         let store = self.store.clone();
         let expand_closure = self.expand_closure;
         let filter_drv_closures = self.filter_drv_closures;
-        let (lookups, upstream_filter_bypass) = tokio::task::spawn_blocking(move || {
+        let (lookups, upstream_filter_bypass) = spawn_blocking(move || {
             let bypass_roots: BTreeSet<String> = if expand_closure && !filter_drv_closures {
                 paths
                     .iter()
@@ -333,18 +339,19 @@ impl PipelineContext {
             .map(|n| n.get())
             .unwrap_or(4)
             .min(CHUNK_CONCURRENCY);
-        let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Vec<chunker::Chunk>>(concurrency);
-        let (pack_tx, pack_rx) = tokio::sync::mpsc::channel::<chunker::Pack>(2);
+        let (chunks_tx, chunks_rx) =
+            mpsc::channel::<(Vec<Chunk>, OwnedSemaphorePermit)>(concurrency);
+        let (pack_tx, pack_rx) = mpsc::channel::<Pack>(2);
 
         let prepare = async {
             let mut prepared: Vec<PathEntry> = Vec::new();
             // Summed as a Duration, converted once: per-path as_millis()
             // truncation would underreport drains of many small paths.
-            let mut chunk_time = std::time::Duration::ZERO;
+            let mut chunk_time = Duration::ZERO;
             let mut failed_chunking = 0usize;
             let mut failed_verification = 0usize;
             // Chunks already emitted for this batch (cross-path dedup).
-            let mut batch_chunks: BTreeSet<crate::manifest::ChunkHash> = BTreeSet::new();
+            let mut batch_chunks: BTreeSet<ChunkHash> = BTreeSet::new();
 
             // Per-path work is single-threaded, so running several at once
             // is what fills the cores. Chunking or verification failures are
@@ -352,18 +359,16 @@ impl PipelineContext {
             // whole batch, and a deterministic failure would then keep every
             // later drain (including the shutdown drain) from caching
             // anything.
-            let inflight = Arc::new(tokio::sync::Semaphore::new(
-                CHUNK_INFLIGHT_NAR_BYTES as usize,
-            ));
-            let mut verified = futures_util::stream::iter(to_push)
+            let inflight = Arc::new(Semaphore::new(CHUNK_INFLIGHT_NAR_BYTES as usize));
+            let mut verified = stream::iter(to_push)
                 .map(|(path, info)| {
                     let inflight = inflight.clone();
                     tokio::spawn(async move {
-                        let _permit = inflight
-                            .acquire_many(chunk_permits(info.nar_size))
+                        let permit = inflight
+                            .acquire_many_owned(chunk_permits(info.nar_size))
                             .await
                             .expect("in-flight NAR byte semaphore is never closed");
-                        let started = std::time::Instant::now();
+                        let started = Instant::now();
                         // The path's own references drive both normalization
                         // (so chunks stay stable across dependency-hash
                         // changes) and the read-side restore.
@@ -404,6 +409,7 @@ impl PipelineContext {
                             nar_hash,
                             nar_size,
                             elapsed: started.elapsed(),
+                            permit,
                         }))
                     })
                 })
@@ -427,10 +433,11 @@ impl PipelineContext {
                     nar_hash,
                     nar_size,
                     elapsed,
+                    permit,
                 } = *ready;
                 chunk_time += elapsed;
 
-                let new_chunks: Vec<chunker::Chunk> = chunked
+                let new_chunks: Vec<Chunk> = chunked
                     .chunks
                     .into_iter()
                     .filter(|chunk| {
@@ -453,7 +460,7 @@ impl PipelineContext {
                     tree: chunked.tree,
                 });
 
-                if !new_chunks.is_empty() && chunks_tx.send(new_chunks).await.is_err() {
+                if !new_chunks.is_empty() && chunks_tx.send((new_chunks, permit)).await.is_err() {
                     // Packer gone: it failed, and try_join below reports its
                     // error; stop producing.
                     break;
@@ -464,21 +471,27 @@ impl PipelineContext {
         };
 
         let pack = async {
-            let mut pack_time = std::time::Duration::ZERO;
+            let mut pack_time = Duration::ZERO;
             let mut builder = PackBuilder::new();
             // Compress paths' new-chunk sets concurrently; frames arrive out
             // of order, which is fine -- packs are content-addressed.
-            let chunk_stream = futures_util::stream::unfold(chunks_rx, |mut rx| async move {
+            let chunk_stream = stream::unfold(chunks_rx, |mut rx| async move {
                 rx.recv().await.map(|chunks| (chunks, rx))
             });
             let compressed = chunk_stream
-                .map(|new_chunks| tokio::task::spawn_blocking(move || compress_chunks(new_chunks)))
+                .map(|(new_chunks, permit)| {
+                    spawn_blocking(move || {
+                        let frames = compress_chunks(new_chunks);
+                        drop(permit);
+                        frames
+                    })
+                })
                 .buffer_unordered(concurrency);
             tokio::pin!(compressed);
 
             'pack: while let Some(joined) = compressed.next().await {
                 let frames = joined.expect("compression task panicked")?;
-                let mut pack_started = std::time::Instant::now();
+                let mut pack_started = Instant::now();
                 for frame in frames {
                     builder.add_compressed(frame.hash, &frame.frame, frame.uncompressed_size);
                     if builder.compressed_size() >= self.pack_target_size {
@@ -490,7 +503,7 @@ impl PipelineContext {
                         if pack_tx.send(sealed).await.is_err() {
                             break 'pack;
                         }
-                        pack_started = std::time::Instant::now();
+                        pack_started = Instant::now();
                     }
                 }
                 pack_time += pack_started.elapsed();
@@ -503,9 +516,9 @@ impl PipelineContext {
             Ok::<_, Error>(pack_time)
         };
 
-        let upload_started = std::time::Instant::now();
+        let upload_started = Instant::now();
         let consumer = async {
-            let pack_stream = futures_util::stream::unfold(pack_rx, |mut rx| async move {
+            let pack_stream = stream::unfold(pack_rx, |mut rx| async move {
                 rx.recv().await.map(|pack| (pack, rx))
             });
             pack_stream
@@ -516,11 +529,11 @@ impl PipelineContext {
                     // instead of growing with the drain's total compressed
                     // size.
                     let size = pack.data.len() as u64;
-                    pack.data = bytes::Bytes::new();
+                    pack.data = Bytes::new();
                     Ok::<_, Error>((uploaded, size, pack))
                 })
                 .buffer_unordered(UPLOAD_CONCURRENCY)
-                .try_collect::<Vec<(bool, u64, chunker::Pack)>>()
+                .try_collect::<Vec<(bool, u64, Pack)>>()
                 .await
         };
 
@@ -560,7 +573,7 @@ impl PipelineContext {
         if writer.is_empty() {
             return Ok(stats);
         }
-        let commit_started = std::time::Instant::now();
+        let commit_started = Instant::now();
         let sealed = writer.seal().map_err(store::Error::from)?;
         let now = (self.clock)();
         stats.head = Some(
