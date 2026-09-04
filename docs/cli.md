@@ -115,7 +115,9 @@ An AWS bucket policy is therefore just:
 ```
 
 which also covers stores whose public endpoint cannot list at all, such as
-Cloudflare R2 and Backblaze B2. Behind a CDN, cache `pack/`, `seg/` and the
-NAR responses forever (they are content-addressed) and give `index` and
-`heads/` a short TTL: they are the only mutable objects, and a stale copy
-means readers miss recently pushed paths until it expires.
+Cloudflare R2 and Backblaze B2.
+
+Writes carry the `Cache-Control` a CDN in front of the bucket should honour:
+content-addressed objects are `immutable` for a year, `index` and the heads
+`max-age=30`, since a stale copy of those means readers miss recently pushed
+paths until it expires.

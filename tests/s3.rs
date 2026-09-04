@@ -253,6 +253,24 @@ async fn a_junk_index_yields_no_heads() {
     .await;
 }
 
+/// A CDN must keep content-addressed objects and recheck the mutable ones.
+#[tokio::test]
+async fn writes_tell_a_cdn_what_it_may_cache() {
+    timed(async {
+        let fake = FakeS3::start().await;
+        let rw = fake.backend();
+        let pack = Bytes::from_static(b"frames");
+        rw.put(&key("pack", &pack), pack).await.unwrap();
+        rw.put(HEAD, Bytes::from_static(b"head")).await.unwrap();
+        rw.flush().await.unwrap();
+
+        assert!(fake.cache_control("pack-").contains("immutable"));
+        assert_eq!(fake.cache_control(HEAD), "public, max-age=30");
+        assert_eq!(fake.cache_control("index"), "public, max-age=30");
+    })
+    .await;
+}
+
 /// A store nobody can write to says why in its own terms.
 #[tokio::test]
 async fn read_only_http_stores_do_not_blame_github_tokens() {

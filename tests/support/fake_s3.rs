@@ -42,6 +42,8 @@ struct Inner {
     read_only: bool,
     missing_status: StatusCode,
     ignore_ranges: bool,
+    /// key → what the writer asked a CDN to do with it
+    cache_control: BTreeMap<String, String>,
 }
 
 impl Default for Inner {
@@ -55,6 +57,7 @@ impl Default for Inner {
             read_only: false,
             missing_status: StatusCode::NOT_FOUND,
             ignore_ranges: false,
+            cache_control: BTreeMap::default(),
         }
     }
 }
@@ -141,6 +144,12 @@ async fn handle(
     }
     match method {
         Method::PUT => {
+            let cache = req
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
             let conditional = req
                 .headers()
                 .get(header::IF_MATCH)
@@ -162,6 +171,7 @@ async fn handle(
                 }
             }
             let (clock, requests) = (inner.clock, inner.requests);
+            inner.cache_control.insert(key.clone(), cache);
             inner.objects.insert(key, (body, clock, requests));
             StatusCode::OK.into_response()
         }
@@ -344,6 +354,16 @@ impl FakeS3 {
     /// A proxy that serves the whole object for a ranged request.
     pub fn set_ignore_ranges(&self, ignore: bool) {
         self.inner.lock().unwrap().ignore_ranges = ignore;
+    }
+
+    pub fn cache_control(&self, key: &str) -> String {
+        let inner = self.inner.lock().unwrap();
+        let (path, _) = inner
+            .cache_control
+            .iter()
+            .find(|(p, _)| p.contains(key))
+            .expect("object was written");
+        inner.cache_control[path].clone()
     }
 
     /// The head index as some other writer left it.

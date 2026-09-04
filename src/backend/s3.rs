@@ -30,6 +30,10 @@ const TRANSIENT_RETRIES: u32 = 4;
 
 /// Head names for readers that cannot list, one per line.
 const INDEX: &str = "index";
+/// What a CDN in front of the bucket may cache, and for how long. Only
+/// heads and the index ever change.
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+const MUTABLE: &str = "public, max-age=30";
 const INDEX_ATTEMPTS: u32 = 3;
 
 #[derive(Clone)]
@@ -62,6 +66,15 @@ fn object(key: &str) -> String {
 
 fn key_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Content-addressed objects never change, so a CDN may keep them; the
+/// index and the heads are the only things a reader must see move.
+fn cache_control(key: &str) -> &'static str {
+    match is_head(key) || key == INDEX {
+        true => MUTABLE,
+        false => IMMUTABLE,
+    }
 }
 
 /// A GC record, a drain head or a compaction head.
@@ -186,6 +199,7 @@ impl S3 {
                 if method == Method::PUT {
                     b = b
                         .header(header::CONTENT_LENGTH, body.len())
+                        .header(header::CACHE_CONTROL, cache_control(key))
                         .body(body.clone());
                 }
                 if let Some(r) = range {
@@ -333,6 +347,7 @@ impl S3 {
                             .http
                             .put(u.clone())
                             .header(header::CONTENT_LENGTH, body.len())
+                            .header(header::CACHE_CONTROL, MUTABLE)
                             .body(body.clone());
                         if let Some((name, value)) = &precondition {
                             b = b.header(name.clone(), value.clone());
