@@ -74,7 +74,7 @@ Always exits 0 (a failing post-build-hook would fail the build).
 | `HESTIA_S3` | serve, gc | `s3://<bucket>/<prefix>`: store in an S3-compatible bucket. Credentials from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, region from `AWS_REGION` (default `us-east-1`). Without credentials access is anonymous and read-only. Takes precedence over `HESTIA_OCI`. `https://<host>/<prefix>` reads the same layout over plain HTTP, see [Public buckets and CDNs](#public-buckets-and-cdns). |
 | `HESTIA_S3_ENDPOINT` | serve, gc | Endpoint URL for non-AWS stores, addressed path-style. Without it `https://s3.<region>.amazonaws.com`, virtual-hosted style. |
 | `HESTIA_TRUST` | serve, gc | Head policy, one `<root glob \| @gc> <cosign \| gh> <args…>` per line: a head counts only if a row for its root (first matching glob, `@gc` for GC records) verifies its bundle with `cosign verify-blob-attestation <args>` or `gh attestation verify <args>`. Unset accepts everything. |
-| `HESTIA_SIGN` | serve, gc | `cosign attest-blob` arguments for published heads (empty: keyless). Unset publishes unsigned. |
+| `HESTIA_SIGN` | serve, gc | `cosign attest-blob` arguments for published heads (empty: keyless). Unset publishes unsigned. See [signing](signing.md). |
 | `HESTIA_LISTEN` | prefetch | Address exported by the action for the running Hestia server. |
 | `OUT_PATHS` | hook | Set by Nix when invoking the post-build-hook. |
 

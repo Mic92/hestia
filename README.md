@@ -234,7 +234,8 @@ The `matrix` subaction has its own inputs (`flake`, `nix-eval-jobs`,
 
 Running the `hestia` binary yourself instead of using the action? See the
 [CLI reference](docs/cli.md). Storing the cache in Cloudflare R2, public and
-free to read: [R2 tutorial](docs/r2.md). How it all works under the hood:
+free to read: [R2 tutorial](docs/r2.md). Deciding whose heads a reader
+believes: [signing](docs/signing.md). How it all works under the hood:
 [architecture](docs/architecture.md).
 
 ## Eval once, build by drv path
@@ -314,7 +315,7 @@ ignore heads whose signer the policy does not list for that root. A PR
 job can then still fill its own root and waste space, but cannot put a
 path into a `main` build or hide one from it. Keys instead of OIDC
 (`sign: --key awskms://...`, a Hydra pushing with a file key) are extra
-`trust-rows`. On GitHub verification uses the preinstalled `gh`, signing jobs get cosign from the action.
+`trust-rows`, see [signing](docs/signing.md). On GitHub verification uses the preinstalled `gh`, signing jobs get cosign from the action.
 
 ### What hestia itself enforces
 
