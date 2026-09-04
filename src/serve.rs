@@ -715,9 +715,9 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
                 Ok(false) => {
                     read_only.store(true, Ordering::Relaxed);
                     eprintln!(
-                        "hestia serve: the runtime token is read-only (expected for check_run \
-                         and fork pull_request events); paths built this job will not be \
-                         cached, but reads from the cache still work"
+                        "hestia serve: {}; paths built this job will not be cached, but reads \
+                         from the cache still work",
+                        backend.read_only_hint()
                     );
                 }
                 Ok(true) => {}

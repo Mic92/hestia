@@ -253,6 +253,17 @@ async fn a_junk_index_yields_no_heads() {
     .await;
 }
 
+/// A store nobody can write to says why in its own terms.
+#[tokio::test]
+async fn read_only_http_stores_do_not_blame_github_tokens() {
+    timed(async {
+        let fake = FakeS3::start().await;
+        assert!(fake.cdn().read_only_hint().contains("http"));
+        assert!(fake.anonymous().read_only_hint().contains("bucket"));
+    })
+    .await;
+}
+
 /// GC needs to enumerate packs, which a read-only http store cannot do.
 #[tokio::test]
 async fn gc_over_an_http_store_fails_instead_of_panicking() {

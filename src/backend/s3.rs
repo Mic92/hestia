@@ -231,6 +231,10 @@ impl S3 {
         }
     }
 
+    pub fn is_http(&self) -> bool {
+        matches!(self.origin, Origin::Http(_))
+    }
+
     fn writable(&self) -> Result<(), Error> {
         match self.origin {
             Origin::Bucket(..) => Ok(()),

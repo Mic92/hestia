@@ -123,6 +123,19 @@ impl Backend {
         }
     }
 
+    /// Why writes are refused, for the message a read-only serve prints.
+    pub fn read_only_hint(&self) -> &'static str {
+        match self {
+            Backend::Gha(_) => {
+                "the runtime token is read-only (expected for check_run and fork pull_request \
+                 events)"
+            }
+            Backend::Oci(_) => "the registry credentials are missing or grant no push access",
+            Backend::S3(b) if b.is_http() => "an http(s):// store can only be read",
+            Backend::S3(_) => "the bucket credentials are missing or grant no write access",
+        }
+    }
+
     pub async fn probe_writable(&self) -> Result<bool, Error> {
         match self {
             Backend::Gha(b) => b.probe_writable().await,
