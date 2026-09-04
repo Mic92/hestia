@@ -75,6 +75,34 @@ $ hestia serve --branch main
 expects a transparency log entry. KMS keys work the same way,
 `--key awskms:///arn:aws:kms:...` to sign, the public key to verify.
 
+## Several tenants in one store
+
+Rows are matched per root, so tenants with their own keys can share a bucket
+as long as they own disjoint roots (a root is `<branch>-<system>`):
+
+```
+teama-* cosign --key a.pub --insecure-ignore-tlog=true
+teamb-* cosign --key b.pub --insecure-ignore-tlog=true
+@gc     cosign --key gc.pub --insecure-ignore-tlog=true
+```
+
+Each tenant signs with its own key, every reader carries all the public
+halves. A head that team B signs into `teama-*` is ignored, the same as any
+other untrusted head. Tenants pushing the same branch name share one root and
+one row, so that separation disappears.
+
+What stays shared:
+
+* **GC.** A run deletes for every root in the store and is checked against
+  the single `@gc` row, so the key behind it must be an authority all tenants
+  trust rather than one of them.
+* **Write access.** Signing decides who is believed, not who can write.
+  Anyone holding the store credentials can delete objects or overwrite the
+  index, which costs availability, not integrity: content addressed data
+  cannot be forged and the index is rebuilt by the next push. Where that
+  matters, give each tenant its own prefix and prefix scoped credentials, at
+  the cost of cross tenant deduplication and one GC run each.
+
 ## Rejected heads
 
 A head no row accepts counts as not listed. Nothing fails, the data behind it
