@@ -61,6 +61,10 @@ impl Drop for FakeS3 {
     }
 }
 
+fn etag(body: &Bytes) -> String {
+    format!("\"{}\"", hestia::manifest::Hash32::digest(body))
+}
+
 fn xml(status: StatusCode, body: String) -> Response {
     (status, [(header::CONTENT_TYPE, "application/xml")], body).into_response()
 }
@@ -78,19 +82,19 @@ fn escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Path style under `/ci-cache/`, and the bucket again at the root as a
+/// CDN in front of it would serve it.
 async fn handle(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    path: Option<Path<String>>,
     Query(q): Query<BTreeMap<String, String>>,
     req: Request,
 ) -> Response {
-    let Some(key) = path
-        .strip_prefix(BUCKET)
-        .and_then(|k| k.strip_prefix('/').or(k.is_empty().then_some("")))
-    else {
-        return error(StatusCode::NOT_FOUND, "NoSuchBucket");
+    let path = path.map(|p| p.0).unwrap_or_default();
+    let key = match path.strip_prefix(BUCKET) {
+        Some(k) => k.trim_start_matches('/').to_owned(),
+        None => path,
     };
-    let key = key.to_owned();
     let method = req.method().clone();
     let range = req
         .headers()
@@ -105,7 +109,8 @@ async fn handle(
         let mut inner = state.inner.lock().unwrap();
         inner.requests += 1;
         let allowed = match method {
-            Method::GET | Method::HEAD => signed || inner.public,
+            // A public bucket serves objects, never listings.
+            Method::GET | Method::HEAD => signed || (inner.public && !key.is_empty()),
             _ => signed && !inner.read_only,
         };
         if !allowed {
@@ -120,10 +125,26 @@ async fn handle(
     }
     match method {
         Method::PUT => {
+            let conditional = req
+                .headers()
+                .get(header::IF_MATCH)
+                .or_else(|| req.headers().get(header::IF_NONE_MATCH))
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
             let body = axum::body::to_bytes(req.into_body(), usize::MAX)
                 .await
                 .unwrap();
             let mut inner = state.inner.lock().unwrap();
+            if let Some(want) = conditional {
+                let current = inner.objects.get(&key).map(|(b, ..)| etag(b));
+                let ok = match want.as_str() {
+                    "*" => current.is_none(),
+                    want => current.as_deref() == Some(want),
+                };
+                if !ok {
+                    return error(StatusCode::PRECONDITION_FAILED, "PreconditionFailed");
+                }
+            }
             let (clock, requests) = (inner.clock, inner.requests);
             inner.objects.insert(key, (body, clock, requests));
             StatusCode::OK.into_response()
@@ -133,11 +154,14 @@ async fn handle(
                 return error(StatusCode::NOT_FOUND, "NoSuchKey");
             };
             if method == Method::HEAD {
-                let len = [(header::CONTENT_LENGTH, body.len().to_string())];
-                return (StatusCode::OK, len).into_response();
+                let headers = [
+                    (header::CONTENT_LENGTH, body.len().to_string()),
+                    (header::ETAG, etag(&body)),
+                ];
+                return (StatusCode::OK, headers).into_response();
             }
             let Some(spec) = range else {
-                return (StatusCode::OK, body).into_response();
+                return (StatusCode::OK, [(header::ETAG, etag(&body))], body).into_response();
             };
             let parse = || -> Option<(usize, usize)> {
                 let (s, e) = spec.strip_prefix("bytes=")?.split_once('-')?;
@@ -244,6 +268,7 @@ impl FakeS3 {
         let net = Arc::new(super::net::Net::default());
         let router = net.layer(
             Router::new()
+                .route("/", axum::routing::any(handle))
                 .route("/{*path}", axum::routing::any(handle))
                 .with_state(AppState {
                     inner: inner.clone(),
@@ -282,6 +307,21 @@ impl FakeS3 {
     /// No credentials: reads work once the bucket is `set_public`.
     pub fn anonymous(&self) -> Backend {
         self.s3(None)
+    }
+
+    /// The public bucket through plain HTTP, as behind a CDN.
+    pub fn cdn(&self) -> Backend {
+        let url = format!("{}/{PREFIX}", self.base_url);
+        Backend::S3(S3::new(&url, None, REGION, None, reqwest::Client::new()).expect("http store"))
+    }
+
+    pub fn set_rtt(&self, rtt: std::time::Duration) {
+        self.net.set_rtt(rtt);
+    }
+
+    /// `METHOD /path` of every request since the last call.
+    pub fn take_requests(&self) -> Vec<String> {
+        self.net.take()
     }
 
     pub fn set_clock(&self, t: u64) {

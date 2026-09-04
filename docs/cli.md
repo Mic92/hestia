@@ -71,7 +71,7 @@ Always exits 0 (a failing post-build-hook would fail the build).
 | `GITHUB_RUN_ID` | serve | Roots written by the same workflow run merge by union (matrix legs); different runs replace each other's root. |
 | `HESTIA_OCI` | serve, gc | `<registry>/<repository>`: store in an OCI registry instead of the Actions cache, see [OCI registries](#oci-registries). |
 | `HESTIA_OCI_USER`, `HESTIA_OCI_PASSWORD` | serve, gc | Registry credentials. On ghcr.io `GITHUB_TOKEN` is used when unset. Without any, access is anonymous and read-only. |
-| `HESTIA_S3` | serve, gc | `s3://<bucket>/<prefix>`: store in an S3-compatible bucket. Credentials from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, region from `AWS_REGION` (default `us-east-1`). Without credentials access is anonymous and read-only. Takes precedence over `HESTIA_OCI`. |
+| `HESTIA_S3` | serve, gc | `s3://<bucket>/<prefix>`: store in an S3-compatible bucket. Credentials from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, region from `AWS_REGION` (default `us-east-1`). Without credentials access is anonymous and read-only. Takes precedence over `HESTIA_OCI`. `https://<host>/<prefix>` reads the same layout over plain HTTP, see [Public buckets and CDNs](#public-buckets-and-cdns). |
 | `HESTIA_S3_ENDPOINT` | serve, gc | Endpoint URL for non-AWS stores, addressed path-style. Without it `https://s3.<region>.amazonaws.com`, virtual-hosted style. |
 | `HESTIA_TRUST` | serve, gc | Head policy, one `<root glob \| @gc> <cosign \| gh> <args…>` per line: a head counts only if a row for its root (first matching glob, `@gc` for GC records) verifies its bundle with `cosign verify-blob-attestation <args>` or `gh attestation verify <args>`. Unset accepts everything. |
 | `HESTIA_SIGN` | serve, gc | `cosign attest-blob` arguments for published heads (empty: keyless). Unset publishes unsigned. |
@@ -92,3 +92,30 @@ how GC can delete:
 | AWS ECR | not supported yet (needs `BatchDeleteImage`) | Push and pull work. |
 | Docker Hub | tags only, untagged manifests are reaped by Hub | Push and pull work, but the pull rate limit (100 to 200 requests per 6 h per IP, shared by all GitHub-hosted runners) makes it unsuitable as a CI cache. |
 
+
+## Public buckets and CDNs
+
+`HESTIA_S3=https://cache.example.org/hestia` reads a bucket through anything
+that serves its objects over HTTP: the bucket's own public endpoint, a website
+endpoint, or a CDN in front of it. The URL is the bucket root plus an optional
+key prefix, and the store is read-only: `gc` and pushing need `s3://`.
+
+Only `GetObject` has to be public. Heads are not discovered by listing but
+read from `<prefix>/index`, a newline-separated list of head names that every
+writer rewrites when it publishes or deletes a head (a GET for the current
+`ETag`, then a conditional PUT, retried if another writer won). Anonymous
+listing would let anyone enumerate and page through the whole bucket, which is
+both a disclosure and a bill, so hestia never asks for it.
+
+An AWS bucket policy is therefore just:
+
+```json
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",
+  "Action":"s3:GetObject","Resource":"arn:aws:s3:::my-cache/hestia/*"}]}
+```
+
+which also covers stores whose public endpoint cannot list at all, such as
+Cloudflare R2 and Backblaze B2. Behind a CDN, cache `pack/`, `seg/` and the
+NAR responses forever (they are content-addressed) and give `index` and
+`heads/` a short TTL: they are the only mutable objects, and a stale copy
+means readers miss recently pushed paths until it expires.

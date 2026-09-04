@@ -127,6 +127,31 @@ async fn anonymous_and_read_only_credentials() {
             data
         );
 
+        // Reads through a CDN: objects by name, heads from the index, never
+        // a listing (the fake denies anonymous ones).
+        let cdn = fake.cdn();
+        assert_eq!(
+            cdn.get(&key("seg", &data), None).await.unwrap().unwrap(),
+            data
+        );
+        assert_eq!(cdn.list_heads().await.unwrap(), vec![]);
+        rw.put(HEAD, Bytes::from_static(b"head")).await.unwrap();
+        rw.flush().await.unwrap();
+        assert_eq!(listed(&cdn, "h-").await, [HEAD]);
+        assert_eq!(listed(&cdn, "c-").await, Vec::<String>::new());
+        assert_eq!(
+            cdn.list("pack-", None).await.unwrap(),
+            None,
+            "the index knows nothing about packs"
+        );
+        assert!(rw.delete(HEAD).await.unwrap());
+        rw.flush().await.unwrap();
+        assert_eq!(listed(&cdn, "h-").await, Vec::<String>::new());
+
+        assert!(!cdn.probe_writable().await.unwrap());
+        let err = cdn.put(&key("tree", b"x"), Bytes::from_static(b"x")).await;
+        assert!(err.unwrap_err().to_string().contains("read-only"));
+
         fake.set_read_only(true);
         assert!(!rw.probe_writable().await.unwrap());
         let err = rw
@@ -134,6 +159,34 @@ async fn anonymous_and_read_only_credentials() {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"), "{err}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn concurrent_head_writers_keep_both_in_the_index() {
+    timed(async {
+        let fake = FakeS3::start().await;
+        let (a, b) = (fake.backend(), fake.backend());
+        let other = HEAD.replace("-y", "-z");
+        a.put(HEAD, Bytes::from_static(b"a")).await.unwrap();
+        b.put(&other, Bytes::from_static(b"b")).await.unwrap();
+        // Slow enough that both writers read the index before either writes.
+        fake.set_rtt(Duration::from_millis(50));
+        fake.take_requests();
+        tokio::try_join!(a.flush(), b.flush()).unwrap();
+        let puts = fake
+            .take_requests()
+            .into_iter()
+            .filter(|r| r.starts_with("PUT") && r.ends_with("/index"))
+            .count();
+        assert_eq!(puts, 3, "one writer loses the compare and swap and retries");
+        fake.set_rtt(Duration::ZERO);
+
+        fake.set_public(true);
+        let mut heads = listed(&fake.cdn(), "h-").await;
+        heads.sort();
+        assert_eq!(heads, [HEAD.to_owned(), other]);
     })
     .await;
 }
@@ -159,7 +212,7 @@ async fn drain_and_nix_copy_over_s3() {
         assert_eq!((again.pushed, again.packs_uploaded), (0, 0));
 
         fake.set_public(true);
-        let backend = fake.anonymous();
+        let backend = fake.cdn();
         let snapshot = Snapshot::load(
             backend.clone(),
             hestia::trust::Trust::open(),
