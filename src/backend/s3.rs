@@ -8,9 +8,9 @@
 //! heads come from `<prefix>/index`, which writers keep up to date, so a
 //! public bucket never has to allow anonymous listing.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -37,8 +37,9 @@ pub struct S3 {
     http: reqwest::Client,
     origin: Origin,
     prefix: String,
-    /// Set when a head was written or deleted, cleared by `flush`.
-    stale_index: Arc<AtomicBool>,
+    /// Heads this backend wrote or deleted since the last `flush`, and
+    /// whether they still exist.
+    own_heads: Arc<Mutex<BTreeMap<String, bool>>>,
 }
 
 #[derive(Clone)]
@@ -63,9 +64,9 @@ fn key_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Heads are the only keys without a content-addressed kind prefix.
+/// A GC record, a drain head or a compaction head.
 fn is_head(key: &str) -> bool {
-    !matches!(key.split_once('-'), Some(("pack" | "seg" | "tree", _))) && key != INDEX
+    matches!(key.split_once('-'), Some(("g" | "h" | "c", rest)) if !rest.is_empty())
 }
 
 impl S3 {
@@ -91,7 +92,7 @@ impl S3 {
                 http,
                 origin: Origin::Http(root),
                 prefix,
-                stale_index: Arc::default(),
+                own_heads: Arc::default(),
             });
         }
         let rest = url
@@ -115,7 +116,7 @@ impl S3 {
             http,
             origin: Origin::Bucket(Box::new(bucket), credentials),
             prefix: prefix.trim_matches('/').to_owned(),
-            stale_index: Arc::default(),
+            own_heads: Arc::default(),
         })
     }
 
@@ -217,8 +218,17 @@ impl S3 {
         self.writable()?;
         self.object(Method::PUT, key, data, None, &[StatusCode::OK])
             .await?;
-        self.stale_index.fetch_or(is_head(key), Ordering::Relaxed);
+        self.remember_head(key, true);
         Ok(true)
+    }
+
+    fn remember_head(&self, key: &str, exists: bool) {
+        if is_head(key) {
+            self.own_heads
+                .lock()
+                .unwrap()
+                .insert(key.to_owned(), exists);
+        }
     }
 
     fn writable(&self) -> Result<(), Error> {
@@ -235,25 +245,40 @@ impl S3 {
         if range.as_ref().is_some_and(|r| r.is_empty()) {
             return Ok(self.exists(key).await?.then(Bytes::new));
         }
-        let ok = [
+        let mut ok = self.absent_statuses();
+        ok.extend([
             StatusCode::OK,
             StatusCode::PARTIAL_CONTENT,
-            StatusCode::NOT_FOUND,
             // A range starting at or past the end of an existing object.
             StatusCode::RANGE_NOT_SATISFIABLE,
-        ];
+        ]);
         let r = self
             .object(Method::GET, key, Bytes::new(), range.as_ref(), &ok)
             .await?;
         match r.status() {
-            StatusCode::NOT_FOUND => Ok(None),
             StatusCode::RANGE_NOT_SATISFIABLE => Ok(Some(Bytes::new())),
+            // A proxy that drops the Range header hands out the whole
+            // object, which callers would read as the range they asked for.
+            StatusCode::OK if range.is_some() => Err(Error::InvalidResponse(format!(
+                "{key}: a ranged GET was answered with the whole object"
+            ))),
+            s if self.absent_statuses().contains(&s) => Ok(None),
             _ => Ok(Some(r.bytes().await?)),
         }
     }
 
+    /// A bucket that grants only GetObject answers 403 for keys that are
+    /// not there: telling the two apart would leak whether they exist.
+    fn absent_statuses(&self) -> Vec<StatusCode> {
+        match self.origin {
+            Origin::Bucket(..) => vec![StatusCode::NOT_FOUND],
+            Origin::Http(_) => vec![StatusCode::NOT_FOUND, StatusCode::FORBIDDEN],
+        }
+    }
+
     pub async fn exists(&self, key: &str) -> Result<bool, Error> {
-        let ok = [StatusCode::OK, StatusCode::NOT_FOUND];
+        let mut ok = self.absent_statuses();
+        ok.push(StatusCode::OK);
         let r = self
             .object(Method::HEAD, key, Bytes::new(), None, &ok)
             .await?;
@@ -271,36 +296,52 @@ impl S3 {
         let r = self
             .object(Method::DELETE, key, Bytes::new(), None, &ok)
             .await?;
-        self.stale_index.fetch_or(is_head(key), Ordering::Relaxed);
+        self.remember_head(key, false);
         Ok(r.status() != StatusCode::NOT_FOUND)
     }
 
     /// Rewrite the head index if this backend changed a head. The body is
     /// a fresh listing, so a lost update only costs the writers a retry:
-    /// whoever wins last has listed everything the losers wrote.
+    /// whoever wins last has listed everything the losers wrote. Listings
+    /// lag on some stores, so our own writes are merged over it.
     pub async fn flush(&self) -> Result<(), Error> {
-        if !self.stale_index.swap(false, Ordering::Relaxed) {
+        let own = self.own_heads.lock().unwrap().clone();
+        if own.is_empty() {
             return Ok(());
         }
         for _ in 0..INDEX_ATTEMPTS {
             let precondition = self.index_precondition().await?;
-            let heads = self.list("", None).await?.expect("unbounded");
-            let body: String = heads.iter().map(|h| format!("{}\n", h.key)).collect();
+            let listed = self.list("", None).await?.expect("unbounded");
+            let mut heads: BTreeMap<&str, bool> =
+                listed.iter().map(|l| (l.key.as_str(), true)).collect();
+            heads.extend(own.iter().map(|(key, exists)| (key.as_str(), *exists)));
+            let body: String = heads
+                .iter()
+                .filter(|(_, exists)| **exists)
+                .map(|(key, _)| format!("{key}\n"))
+                .collect();
             let url = self.url(&Method::PUT, INDEX);
             let r = self
                 .send(
                     url,
                     |u| {
-                        self.http
+                        let mut b = self
+                            .http
                             .put(u.clone())
-                            .header(precondition.0.clone(), precondition.1.clone())
                             .header(header::CONTENT_LENGTH, body.len())
-                            .body(body.clone())
+                            .body(body.clone());
+                        if let Some((name, value)) = &precondition {
+                            b = b.header(name.clone(), value.clone());
+                        }
+                        b
                     },
                     &[StatusCode::OK, StatusCode::PRECONDITION_FAILED],
                 )
                 .await?;
             if r.status() == StatusCode::OK {
+                // Whatever a concurrent writer added meanwhile stays.
+                let mut pending = self.own_heads.lock().unwrap();
+                pending.retain(|key, exists| own.get(key) != Some(exists));
                 break;
             }
         }
@@ -310,19 +351,19 @@ impl S3 {
     /// What the index must still look like for our rewrite of it to count.
     /// A store that answers without an `ETag` cannot compare and swap, so
     /// there the last writer simply wins.
-    async fn index_precondition(&self) -> Result<(HeaderName, String), Error> {
+    async fn index_precondition(&self) -> Result<Option<(HeaderName, String)>, Error> {
         let ok = [StatusCode::OK, StatusCode::NOT_FOUND];
         let current = self
             .object(Method::HEAD, INDEX, Bytes::new(), None, &ok)
             .await?;
-        let etag = current
+        if current.status() == StatusCode::NOT_FOUND {
+            return Ok(Some((header::IF_NONE_MATCH, "*".to_owned())));
+        }
+        Ok(current
             .headers()
             .get(header::ETAG)
-            .and_then(|e| e.to_str().ok());
-        Ok(match etag.filter(|_| current.status() == StatusCode::OK) {
-            Some(etag) => (header::IF_MATCH, etag.to_owned()),
-            None => (header::IF_NONE_MATCH, "*".to_owned()),
-        })
+            .and_then(|e| e.to_str().ok())
+            .map(|etag| (header::IF_MATCH, etag.to_owned())))
     }
 
     /// The empty prefix lists `heads/`.
@@ -380,7 +421,7 @@ impl S3 {
     /// Heads from the index. Other kinds are unknown to it, which is what
     /// `None` says: a listing that cannot prove absence.
     async fn list_index(&self, prefix: &str) -> Result<Option<Vec<Listed>>, Error> {
-        if !prefix.is_empty() && !is_head(prefix) {
+        if !prefix.is_empty() && !matches!(prefix, "g-" | "h-" | "c-") {
             return Ok(None);
         }
         let Some(body) = self.get(INDEX, None).await? else {
@@ -390,7 +431,7 @@ impl S3 {
             .map_err(|e| Error::InvalidResponse(format!("head index: {e}")))?;
         Ok(Some(
             body.lines()
-                .filter(|key| key.starts_with(prefix))
+                .filter(|key| key.starts_with(prefix) && is_head(key))
                 .map(|key| Listed {
                     key: key.to_owned(),
                     created: None,

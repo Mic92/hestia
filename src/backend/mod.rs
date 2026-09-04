@@ -106,7 +106,11 @@ impl Backend {
         }
         let mut out = Vec::new();
         for prefix in ["pack-", "seg-", "tree-"] {
-            out.extend(self.list(prefix, None).await?.expect("unbounded"));
+            let listed = self.list(prefix, None).await?.ok_or(Error::InvalidEnv {
+                name: ENV_S3,
+                reason: "an http(s):// store is read-only and cannot be collected".into(),
+            })?;
+            out.extend(listed);
         }
         Ok(out)
     }

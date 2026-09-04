@@ -32,7 +32,6 @@ pub const ACCESS_KEY: &str = "AKIAFAKE";
 pub const SECRET_KEY: &str = "fake-secret";
 pub const REGION: &str = "garage";
 
-#[derive(Default)]
 struct Inner {
     /// key → (body, written at clock, written at request count)
     objects: BTreeMap<String, (Bytes, u64, u64)>,
@@ -41,6 +40,23 @@ struct Inner {
     list_lag: u64,
     public: bool,
     read_only: bool,
+    missing_status: StatusCode,
+    ignore_ranges: bool,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            objects: BTreeMap::default(),
+            clock: 0,
+            requests: 0,
+            list_lag: 0,
+            public: false,
+            read_only: false,
+            missing_status: StatusCode::NOT_FOUND,
+            ignore_ranges: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -150,8 +166,12 @@ async fn handle(
             StatusCode::OK.into_response()
         }
         Method::GET | Method::HEAD => {
+            let (missing, ignore_ranges) = {
+                let inner = state.inner.lock().unwrap();
+                (inner.missing_status, inner.ignore_ranges)
+            };
             let Some((body, _, _)) = state.inner.lock().unwrap().objects.get(&key).cloned() else {
-                return error(StatusCode::NOT_FOUND, "NoSuchKey");
+                return error(missing, "NoSuchKey");
             };
             if method == Method::HEAD {
                 let headers = [
@@ -160,7 +180,7 @@ async fn handle(
                 ];
                 return (StatusCode::OK, headers).into_response();
             }
-            let Some(spec) = range else {
+            let Some(spec) = range.filter(|_| !ignore_ranges) else {
                 return (StatusCode::OK, [(header::ETAG, etag(&body))], body).into_response();
             };
             let parse = || -> Option<(usize, usize)> {
@@ -313,6 +333,27 @@ impl FakeS3 {
     pub fn cdn(&self) -> Backend {
         let url = format!("{}/{PREFIX}", self.base_url);
         Backend::S3(S3::new(&url, None, REGION, None, reqwest::Client::new()).expect("http store"))
+    }
+
+    /// What a GET of an absent key answers: a bucket that grants only
+    /// GetObject cannot distinguish missing from forbidden.
+    pub fn set_missing_status(&self, status: StatusCode) {
+        self.inner.lock().unwrap().missing_status = status;
+    }
+
+    /// A proxy that serves the whole object for a ranged request.
+    pub fn set_ignore_ranges(&self, ignore: bool) {
+        self.inner.lock().unwrap().ignore_ranges = ignore;
+    }
+
+    /// The head index as some other writer left it.
+    pub fn set_index(&self, body: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let clock = inner.clock;
+        inner.objects.insert(
+            format!("{PREFIX}/index"),
+            (Bytes::from(body.to_owned()), clock, 0),
+        );
     }
 
     pub fn set_rtt(&self, rtt: std::time::Duration) {
