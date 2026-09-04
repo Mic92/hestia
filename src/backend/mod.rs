@@ -106,7 +106,11 @@ impl Backend {
         }
         let mut out = Vec::new();
         for prefix in ["pack-", "seg-", "tree-"] {
-            out.extend(self.list(prefix, None).await?.expect("unbounded"));
+            let listed = self.list(prefix, None).await?.ok_or(Error::InvalidEnv {
+                name: ENV_S3,
+                reason: "an http(s):// store is read-only and cannot be collected".into(),
+            })?;
+            out.extend(listed);
         }
         Ok(out)
     }
@@ -127,10 +131,11 @@ impl Backend {
         }
     }
 
-    /// Persist backend bookkeeping (the GHCR ledger) at the end of a GC run.
+    /// Persist backend bookkeeping: the GHCR ledger, the S3 head index.
     pub async fn flush(&self) -> Result<(), Error> {
         match self {
-            Backend::Gha(_) | Backend::S3(_) => Ok(()),
+            Backend::Gha(_) => Ok(()),
+            Backend::S3(b) => b.flush().await,
             Backend::Oci(b) => b.flush().await,
         }
     }

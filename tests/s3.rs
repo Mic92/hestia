@@ -13,6 +13,7 @@ use hestia::manifest::Hash32;
 use hestia::pipeline::AccessLog;
 use hestia::store::Snapshot;
 use hestia::substituter::{ManifestStore, Substituter};
+use reqwest::StatusCode;
 use support::common::{TEST_ROOT_KEY, pipeline_context_with, to_path_set};
 use support::fake_s3::{FakeS3, PREFIX};
 use support::sim::{SimCache, SimPath};
@@ -132,6 +133,31 @@ async fn anonymous_and_read_only_credentials() {
             data
         );
 
+        // Reads through a CDN: objects by name, heads from the index, never
+        // a listing (the fake denies anonymous ones).
+        let cdn = fake.cdn();
+        assert_eq!(
+            cdn.get(&key("seg", &data), None).await.unwrap().unwrap(),
+            data
+        );
+        assert_eq!(cdn.list_heads().await.unwrap(), vec![]);
+        rw.put(HEAD, Bytes::from_static(b"head")).await.unwrap();
+        rw.flush().await.unwrap();
+        assert_eq!(listed(&cdn, "h-").await, [HEAD]);
+        assert_eq!(listed(&cdn, "c-").await, Vec::<String>::new());
+        assert_eq!(
+            cdn.list("pack-", None).await.unwrap(),
+            None,
+            "the index knows nothing about packs"
+        );
+        assert!(rw.delete(HEAD).await.unwrap());
+        rw.flush().await.unwrap();
+        assert_eq!(listed(&cdn, "h-").await, Vec::<String>::new());
+
+        assert!(!cdn.probe_writable().await.unwrap());
+        let err = cdn.put(&key("tree", b"x"), Bytes::from_static(b"x")).await;
+        assert!(err.unwrap_err().to_string().contains("read-only"));
+
         fake.set_read_only(true);
         assert!(!rw.probe_writable().await.unwrap());
         let err = rw
@@ -139,6 +165,165 @@ async fn anonymous_and_read_only_credentials() {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"), "{err}");
+    })
+    .await;
+}
+
+/// A bucket that only grants GetObject cannot say "no such key" without
+/// leaking whether it exists, so it answers 403, and a CDN in front may
+/// serve a whole object for a ranged request.
+#[tokio::test]
+async fn http_stores_survive_hostile_but_legal_answers() {
+    timed(async {
+        let fake = FakeS3::start().await;
+        let rw = fake.backend();
+        let data = Bytes::from(vec![3u8; 4096]);
+        let seg = key("seg", &data);
+        rw.put(&seg, data.clone()).await.unwrap();
+        fake.set_public(true);
+        let cdn = fake.cdn();
+
+        fake.set_missing_status(StatusCode::FORBIDDEN);
+        assert_eq!(cdn.get(&key("seg", b"absent"), None).await.unwrap(), None);
+        assert_eq!(cdn.list_heads().await.unwrap(), vec![]);
+        fake.set_missing_status(StatusCode::NOT_FOUND);
+
+        fake.set_ignore_ranges(true);
+        let err = cdn.get(&seg, Some(10..20)).await.unwrap_err();
+        assert!(err.to_string().contains("range"), "{err}");
+    })
+    .await;
+}
+
+/// Bucket listings lag on B2, Wasabi and Garage, so a writer that rebuilt
+/// the index from a listing alone would drop the head it just wrote.
+#[tokio::test]
+async fn a_lagging_listing_does_not_drop_the_head_just_written() {
+    timed(async {
+        let fake = FakeS3::start().await;
+        let rw = fake.backend();
+        fake.set_list_lag(10);
+        rw.put(HEAD, Bytes::from_static(b"head")).await.unwrap();
+        rw.flush().await.unwrap();
+
+        fake.set_public(true);
+        assert_eq!(listed(&fake.cdn(), "h-").await, [HEAD]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn concurrent_head_writers_keep_both_in_the_index() {
+    timed(async {
+        let fake = FakeS3::start().await;
+        let (a, b) = (fake.backend(), fake.backend());
+        let other = HEAD.replace("-y", "-z");
+        a.put(HEAD, Bytes::from_static(b"a")).await.unwrap();
+        b.put(&other, Bytes::from_static(b"b")).await.unwrap();
+        // Slow enough that both writers read the index before either writes.
+        fake.set_rtt(Duration::from_millis(50));
+        fake.take_requests();
+        tokio::try_join!(a.flush(), b.flush()).unwrap();
+        let puts = fake
+            .take_requests()
+            .into_iter()
+            .filter(|r| r.starts_with("PUT") && r.ends_with("/index"))
+            .count();
+        assert_eq!(puts, 3, "one writer loses the compare and swap and retries");
+        fake.set_rtt(Duration::ZERO);
+
+        fake.set_public(true);
+        let mut heads = listed(&fake.cdn(), "h-").await;
+        heads.sort();
+        assert_eq!(heads, [HEAD.to_owned(), other]);
+    })
+    .await;
+}
+
+/// The index is fetched from wherever the bucket is published, so lines
+/// that are not head names are ignored rather than fetched.
+#[tokio::test]
+async fn a_junk_index_yields_no_heads() {
+    timed(async {
+        let fake = FakeS3::start().await;
+        fake.set_index("\n../../etc/passwd\npack-0000\nseg-0000\n  \nh-bogus\n");
+        fake.set_public(true);
+        assert_eq!(fake.cdn().list_heads().await.unwrap().len(), 1);
+        assert_eq!(fake.take_requests().len(), 1, "no key is fetched blindly");
+    })
+    .await;
+}
+
+/// A CDN must keep content-addressed objects and recheck the mutable ones.
+#[tokio::test]
+async fn writes_tell_a_cdn_what_it_may_cache() {
+    timed(async {
+        let fake = FakeS3::start().await;
+        let rw = fake.backend();
+        let pack = Bytes::from_static(b"frames");
+        rw.put(&key("pack", &pack), pack).await.unwrap();
+        rw.put(HEAD, Bytes::from_static(b"head")).await.unwrap();
+        rw.flush().await.unwrap();
+
+        assert!(fake.cache_control("pack-").contains("immutable"));
+        assert_eq!(fake.cache_control(HEAD), "public, max-age=30");
+        assert_eq!(fake.cache_control("index"), "public, max-age=30");
+    })
+    .await;
+}
+
+/// GC needs to enumerate packs, which a read-only http store cannot do.
+#[tokio::test]
+async fn gc_over_an_http_store_fails_instead_of_panicking() {
+    timed(async {
+        let fake = FakeS3::start().await;
+        fake.set_public(true);
+        let err = fake.cdn().list_objects().await.unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
+    })
+    .await;
+}
+
+/// The index is a hint: heads it names may already be gone, and heads it
+/// misses simply are not seen.
+#[tokio::test]
+async fn readers_tolerate_an_index_naming_a_deleted_head() {
+    timed(async {
+        let Some(store) = ScratchStore::create() else {
+            return;
+        };
+        let (top, dep) = store.add_paths_with_reference("s3stale");
+        let fake = FakeS3::start().await;
+        let rw = fake.backend();
+        let stats = pipeline_context_with(rw.clone(), store.database())
+            .run(to_path_set(&[&top, &dep]), BTreeSet::new())
+            .await
+            .expect("pipeline run");
+        let head = stats.head.expect("published head");
+
+        // Deleted behind the index's back: another writer's GC, or a CDN
+        // still serving the previous copy.
+        let gone = HEAD.to_owned();
+        rw.put(&gone, Bytes::from_static(b"x")).await.unwrap();
+        rw.flush().await.unwrap();
+        rw.delete(&gone).await.unwrap();
+        fake.set_public(true);
+        let cdn = fake.cdn();
+        assert!(listed(&cdn, "h-").await.contains(&gone));
+
+        let snapshot = Snapshot::load(
+            cdn,
+            hestia::trust::Trust::open(),
+            &[TEST_ROOT_KEY.to_string()],
+            None,
+        )
+        .await
+        .expect("a stale index must not fail the load");
+        assert_eq!(
+            snapshot.path_count(),
+            2,
+            "the live head {head} still counts"
+        );
     })
     .await;
 }
@@ -164,7 +349,7 @@ async fn drain_and_nix_copy_over_s3() {
         assert_eq!((again.pushed, again.packs_uploaded), (0, 0));
 
         fake.set_public(true);
-        let backend = fake.anonymous();
+        let backend = fake.cdn();
         let snapshot = Snapshot::load(
             backend.clone(),
             hestia::trust::Trust::open(),

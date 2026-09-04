@@ -612,6 +612,10 @@ impl PipelineContext {
             )
             .await?,
         );
+        // Readers that cannot list need the head index to name this head.
+        if let Err(err) = self.backend.flush().await {
+            eprintln!("hestia: cannot update the head index: {err}");
+        }
         stats.commit_ms = commit_started.elapsed().as_millis() as u64;
         let next = match snapshot.refresh_with(&sealed).await {
             Ok(next) => next,
