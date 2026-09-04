@@ -117,6 +117,11 @@ An AWS bucket policy is therefore just:
 which also covers stores whose public endpoint cannot list at all, such as
 Cloudflare R2 and Backblaze B2.
 
+Whoever serves the bucket can withhold heads (an old `index`, a missing
+object) but cannot forge them: heads carry signatures checked against
+`HESTIA_TRUST`, and everything they name is content-addressed and verified
+on read. A stale or hostile mirror therefore costs cache misses, not trust.
+
 Writes carry the `Cache-Control` a CDN in front of the bucket should honour:
 content-addressed objects are `immutable` for a year, `index` and the heads
 `max-age=30`, since a stale copy of those means readers miss recently pushed
