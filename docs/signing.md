@@ -1,13 +1,12 @@
 # Signing heads
 
-A head is the only mutable pointer in a store, and everything it names is
-content addressed and hash checked on read, so signing heads pins the whole
-graph. It is the only signature hestia makes: NAR responses are served
-unsigned by a substituter Nix has been told to trust.
+Hestia signs heads. A head is the only mutable pointer in a store and
+everything it names is content addressed and hash checked on read, so one
+signature pins the whole graph. NAR responses are served unsigned by a
+substituter Nix has been told to trust.
 
-Buckets and registries have no per-branch scopes, so anyone who can write can
-publish a head into any root, `main-*` included. The trust policy is what
-makes readers ignore those.
+In a bucket or a registry every writer can publish into every root, so
+readers decide by policy whose heads count.
 
 | head | signed payload |
 |---|---|
@@ -30,8 +29,7 @@ writes the matching policy. The job needs `permissions: id-token: write`.
 | `strict` | `<default branch>-*` roots and GC records only from default branch runs, other roots from any ref of this repository |
 
 Verification uses the runner's `gh attestation verify`, signing jobs download
-cosign. Signers the preset does not cover go into `trust-rows`, which is
-consulted first:
+cosign. Further signers go into `trust-rows`, consulted before the preset:
 
 ```yaml
           trust-rows: |
@@ -91,17 +89,10 @@ halves. A head that team B signs into `teama-*` is ignored, the same as any
 other untrusted head. Tenants pushing the same branch name share one root and
 one row, so that separation disappears.
 
-What stays shared:
-
-* **GC.** A run deletes for every root in the store and is checked against
-  the single `@gc` row, so the key behind it must be an authority all tenants
-  trust rather than one of them.
-* **Write access.** Signing decides who is believed, not who can write.
-  Anyone holding the store credentials can delete objects or overwrite the
-  index, which costs availability, not integrity: content addressed data
-  cannot be forged and the index is rebuilt by the next push. Where that
-  matters, give each tenant its own prefix and prefix scoped credentials, at
-  the cost of cross tenant deduplication and one GC run each.
+A GC run covers every root in the store and is checked against the single
+`@gc` row, so that key belongs to whoever operates the cache. Tenants that
+also need separate storage credentials get a prefix each,
+`s3://bucket/<tenant>`, and run their own GC.
 
 ## Rejected heads
 

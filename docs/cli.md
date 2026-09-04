@@ -109,11 +109,9 @@ Only `GetObject` has to be public:
 
 Heads come from `<prefix>/index`, a newline separated list that writers
 rewrite whenever they publish or delete one: a GET for the `ETag`, then a
-conditional PUT, retried when another writer wins. Anonymous listing is never
-used, since it would let anyone page through the whole bucket at the owner's
-expense. That also covers endpoints which cannot list at all, Cloudflare R2
-and Backblaze B2 among them, see the [R2 tutorial](r2.md).
+conditional PUT, retried when another writer wins. Endpoints that serve
+objects but no listings work the same way, Cloudflare R2 and Backblaze B2
+among them, see the [R2 tutorial](r2.md).
 
 Writes carry `Cache-Control` for a CDN: content-addressed objects are
-`immutable` for a year, `index` and heads `max-age=30`. Whoever serves the
-bucket can withhold heads but not forge them, see [signing](signing.md).
+`immutable` for a year, `index` and heads `max-age=30`.
