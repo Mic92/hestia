@@ -233,7 +233,8 @@ The `matrix` subaction has its own inputs (`flake`, `nix-eval-jobs`,
 [`matrix/action.yml`](matrix/action.yml).
 
 Running the `hestia` binary yourself instead of using the action? See the
-[CLI reference](docs/cli.md). How it all works under the hood:
+[CLI reference](docs/cli.md). Storing the cache in Cloudflare R2, public and
+free to read: [R2 tutorial](docs/r2.md). How it all works under the hood:
 [architecture](docs/architecture.md).
 
 ## Eval once, build by drv path

@@ -95,6 +95,9 @@ how GC can delete:
 
 ## Public buckets and CDNs
 
+A worked example for Cloudflare R2, which cannot list publicly at all, is in
+the [R2 tutorial](r2.md).
+
 `HESTIA_S3=https://cache.example.org/hestia` reads a bucket through anything
 that serves its objects over HTTP: the bucket's own public endpoint, a website
 endpoint, or a CDN in front of it. The URL is the bucket root plus an optional
