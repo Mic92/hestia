@@ -1,17 +1,15 @@
 # Signing heads
 
-A head is the only mutable pointer in a store: it names the segment a
-writer published for a root, and everything below it is content addressed
-and hash checked on read. Signing the head therefore pins the whole graph,
-and it is the only signature hestia makes. NAR responses stay unsigned; the
-substituter is registered as a trusted store, and integrity comes from the
-NAR hash and the chunk hashes.
+A head is the only mutable pointer in a store, and everything it names is
+content addressed and hash checked on read, so signing heads pins the whole
+graph. It is the only signature hestia makes: NAR responses are served
+unsigned by a substituter Nix has been told to trust.
 
-This matters wherever a store has no per-branch scopes. In an S3 bucket or
-an OCI registry, anyone who can write can publish a head into any root,
-including `main-*`. A trust policy is what makes readers ignore those.
+Buckets and registries have no per-branch scopes, so anyone who can write can
+publish a head into any root, `main-*` included. The trust policy is what
+makes readers ignore those.
 
-| head | payload that is signed |
+| head | signed payload |
 |---|---|
 | drain `h-*` | its own name (base epoch, root id, time, segment digest) |
 | compaction `c-*` | the record (root, added and replaced segments, time) |
@@ -22,22 +20,8 @@ https://github.com/Mic92/hestia/head/v1`, stored as the head object's body.
 
 ## On GitHub Actions
 
-Set `trust`; the action signs this job's heads keyless with the workflow's
-OIDC identity and writes the matching verification policy:
-
-```yaml
-      - uses: Mic92/hestia@v3
-        with:
-          s3: s3://hestia-cache
-          s3-endpoint: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
-          trust: strict
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_REGION: auto
-```
-
-The job needs `permissions: id-token: write`. Presets:
+`trust` signs this job's heads keyless with the workflow's OIDC identity and
+writes the matching policy. The job needs `permissions: id-token: write`.
 
 | `trust` | accepts |
 |---|---|
@@ -45,47 +29,41 @@ The job needs `permissions: id-token: write`. Presets:
 | `same-repo` | heads attested by any workflow of this repository |
 | `strict` | `<default branch>-*` roots and GC records only from default branch runs, other roots from any ref of this repository |
 
-Verification uses the runner's preinstalled `gh attestation verify`; signing
-jobs download cosign. Add rows for signers the preset does not cover with
-`trust-rows`, one per line, consulted first:
+Verification uses the runner's `gh attestation verify`, signing jobs download
+cosign. Signers the preset does not cover go into `trust-rows`, which is
+consulted first:
 
 ```yaml
           trust-rows: |
             main-* cosign --key hydra.pub --insecure-ignore-tlog=true
 ```
 
-## Outside GitHub
+## Elsewhere
 
-Two environment variables, both read by `hestia serve` and `hestia gc`:
+`hestia serve` and `hestia gc` read two variables:
 
-* `HESTIA_SIGN`: arguments for `cosign attest-blob`. Empty means keyless,
-  which needs an OIDC identity. Unset publishes unsigned heads.
-* `HESTIA_TRUST`: the policy, one row per line
+* `HESTIA_SIGN`: `cosign attest-blob` arguments. Empty signs keyless and
+  needs an OIDC identity, unset publishes unsigned heads.
+* `HESTIA_TRUST`: one row per line, first matching glob wins.
 
   ```
   <root glob | @gc>  <cosign | gh>  <verify args…>
   ```
 
-  First matching glob wins, `@gc` matches GC records. `cosign` rows run
-  `cosign verify-blob-attestation`, `gh` rows run `gh attestation verify`.
-  Unset accepts every head.
+  `@gc` matches GC records. Rows run `cosign verify-blob-attestation` or
+  `gh attestation verify` with those arguments. Unset accepts every head.
 
-With a key pair, for a builder that has no OIDC identity:
+For a builder without an OIDC identity, sign with a key pair:
 
 ```console
 $ COSIGN_PASSWORD= cosign generate-key-pair --output-key-prefix builder
 $ cosign signing-config create --out signing.json
-```
-
-The writer signs:
-
-```console
 $ export COSIGN_PASSWORD=
 $ export HESTIA_SIGN="--key builder.key --signing-config signing.json"
 $ hestia serve --branch main
 ```
 
-and every reader, plus every GC run, carries the public half:
+Readers and GC runs carry the public half:
 
 ```console
 $ export HESTIA_TRUST="main-* cosign --key builder.pub --insecure-ignore-tlog=true
@@ -93,40 +71,37 @@ $ export HESTIA_TRUST="main-* cosign --key builder.pub --insecure-ignore-tlog=tr
 $ hestia serve --branch main
 ```
 
-`--insecure-ignore-tlog=true` is what keeps keyed signing offline; without
-it cosign expects a transparency log entry. A KMS key works the same way:
-`--key awskms:///arn:aws:kms:...` for signing, the public key for verifying.
+`--insecure-ignore-tlog=true` keeps keyed signing offline, without it cosign
+expects a transparency log entry. KMS keys work the same way,
+`--key awskms:///arn:aws:kms:...` to sign, the public key to verify.
 
-## What a rejected head looks like
+## Rejected heads
 
-A head whose proof no row accepts counts as not listed. Nothing errors, the
-data behind it simply is not served:
+A head no row accepts counts as not listed. Nothing fails, the data behind it
+is simply not served:
 
 ```
 hestia: main-x86_64-linux: proof rejected by Cosign … accepted signatures do
 not match threshold, Found: 0, Expected 1
 ```
 
-If that head was the only one naming a root, the store looks empty for that
-root. Unsigned heads pushed into a root whose row demands a signature are
-ignored the same way, while paths from properly signed heads keep serving.
+If it was the only head naming a root, that root looks empty. Unsigned heads
+in a root whose row demands a signature disappear the same way, while
+correctly signed ones keep serving.
 
-**Rotating a key therefore hides everything the old key published.** List
-both public keys while the rotation is in flight:
+Rotating a key therefore hides everything the old one published. Keep both
+rows until a run has republished under the new key:
 
 ```
 main-* cosign --key new.pub --insecure-ignore-tlog=true
 main-* cosign --key old.pub --insecure-ignore-tlog=true
 ```
 
-and drop the old row once a run has republished under the new key.
+## Verifying by hand
 
-## Checking a policy by hand
-
-The body of a drain head is the bundle itself, and its payload is the head
-name. Compaction (`c-*`) and GC (`g-*`) heads wrap record and bundle
-together, so pick an `h-*` head; a root's very first push publishes only a
-`c-*`, later drains add `h-*`:
+A drain head's body is the bundle and its payload is the head name.
+Compaction and GC heads wrap record and bundle together, so pick an `h-*`
+head; a root's first push publishes only a `c-*`.
 
 ```console
 $ head=$(curl -s https://pub-<id>.r2.dev/index | grep ^h- | head -1)
@@ -139,5 +114,5 @@ $ cosign verify-blob-attestation \
 Verified OK
 ```
 
-Readers need `cosign` or `gh` on `PATH`, one process per pending head at
-load time.
+Readers need `cosign` or `gh` on `PATH` and spawn one process per pending
+head at load time.

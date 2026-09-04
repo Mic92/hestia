@@ -95,37 +95,25 @@ how GC can delete:
 
 ## Public buckets and CDNs
 
-A worked example for Cloudflare R2, which cannot list publicly at all, is in
-the [R2 tutorial](r2.md).
+`HESTIA_S3=https://cache.example.org/hestia` reads a bucket through whatever
+serves its objects over HTTP: the bucket's public endpoint, a website
+endpoint, or a CDN. The URL is the bucket root plus an optional prefix, and
+such a store is read-only, `gc` and pushes need `s3://`.
 
-`HESTIA_S3=https://cache.example.org/hestia` reads a bucket through anything
-that serves its objects over HTTP: the bucket's own public endpoint, a website
-endpoint, or a CDN in front of it. The URL is the bucket root plus an optional
-key prefix, and the store is read-only: `gc` and pushing need `s3://`.
-
-Only `GetObject` has to be public. Heads are not discovered by listing but
-read from `<prefix>/index`, a newline-separated list of head names that every
-writer rewrites when it publishes or deletes a head (a GET for the current
-`ETag`, then a conditional PUT, retried if another writer won). Anonymous
-listing would let anyone enumerate and page through the whole bucket, which is
-both a disclosure and a bill, so hestia never asks for it.
-
-An AWS bucket policy is therefore just:
+Only `GetObject` has to be public:
 
 ```json
 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",
   "Action":"s3:GetObject","Resource":"arn:aws:s3:::my-cache/hestia/*"}]}
 ```
 
-which also covers stores whose public endpoint cannot list at all, such as
-Cloudflare R2 and Backblaze B2.
+Heads come from `<prefix>/index`, a newline separated list that writers
+rewrite whenever they publish or delete one: a GET for the `ETag`, then a
+conditional PUT, retried when another writer wins. Anonymous listing is never
+used, since it would let anyone page through the whole bucket at the owner's
+expense. That also covers endpoints which cannot list at all, Cloudflare R2
+and Backblaze B2 among them, see the [R2 tutorial](r2.md).
 
-Whoever serves the bucket can withhold heads (an old `index`, a missing
-object) but cannot forge them: heads carry signatures checked against
-`HESTIA_TRUST`, and everything they name is content-addressed and verified
-on read. A stale or hostile mirror therefore costs cache misses, not trust.
-
-Writes carry the `Cache-Control` a CDN in front of the bucket should honour:
-content-addressed objects are `immutable` for a year, `index` and the heads
-`max-age=30`, since a stale copy of those means readers miss recently pushed
-paths until it expires.
+Writes carry `Cache-Control` for a CDN: content-addressed objects are
+`immutable` for a year, `index` and heads `max-age=30`. Whoever serves the
+bucket can withhold heads but not forge them, see [signing](signing.md).
