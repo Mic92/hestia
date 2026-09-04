@@ -74,7 +74,7 @@ Always exits 0 (a failing post-build-hook would fail the build).
 | `HESTIA_S3` | serve, gc | `s3://<bucket>/<prefix>`: store in an S3-compatible bucket. Credentials from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, region from `AWS_REGION` (default `us-east-1`). Without credentials access is anonymous and read-only. Takes precedence over `HESTIA_OCI`. `https://<host>/<prefix>` reads the same layout over plain HTTP, see [Public buckets and CDNs](#public-buckets-and-cdns). |
 | `HESTIA_S3_ENDPOINT` | serve, gc | Endpoint URL for non-AWS stores, addressed path-style. Without it `https://s3.<region>.amazonaws.com`, virtual-hosted style. |
 | `HESTIA_TRUST` | serve, gc | Head policy, one `<root glob \| @gc> <cosign \| gh> <args…>` per line: a head counts only if a row for its root (first matching glob, `@gc` for GC records) verifies its bundle with `cosign verify-blob-attestation <args>` or `gh attestation verify <args>`. Unset accepts everything. |
-| `HESTIA_SIGN` | serve, gc | `cosign attest-blob` arguments for published heads (empty: keyless). Unset publishes unsigned. |
+| `HESTIA_SIGN` | serve, gc | `cosign attest-blob` arguments for published heads (empty: keyless). Unset publishes unsigned. See [signing](signing.md). |
 | `HESTIA_LISTEN` | prefetch | Address exported by the action for the running Hestia server. |
 | `OUT_PATHS` | hook | Set by Nix when invoking the post-build-hook. |
 
@@ -95,29 +95,23 @@ how GC can delete:
 
 ## Public buckets and CDNs
 
-`HESTIA_S3=https://cache.example.org/hestia` reads a bucket through anything
-that serves its objects over HTTP: the bucket's own public endpoint, a website
-endpoint, or a CDN in front of it. The URL is the bucket root plus an optional
-key prefix, and the store is read-only: `gc` and pushing need `s3://`.
+`HESTIA_S3=https://cache.example.org/hestia` reads a bucket through whatever
+serves its objects over HTTP: the bucket's public endpoint, a website
+endpoint, or a CDN. The URL is the bucket root plus an optional prefix, and
+such a store is read-only, `gc` and pushes need `s3://`.
 
-Only `GetObject` has to be public. Heads are not discovered by listing but
-read from `<prefix>/index`, a newline-separated list of head names that every
-writer rewrites when it publishes or deletes a head (a GET for the current
-`ETag`, then a conditional PUT, retried if another writer won). Anonymous
-listing would let anyone enumerate and page through the whole bucket, which is
-both a disclosure and a bill, so hestia never asks for it.
-
-An AWS bucket policy is therefore just:
+Only `GetObject` has to be public:
 
 ```json
 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",
   "Action":"s3:GetObject","Resource":"arn:aws:s3:::my-cache/hestia/*"}]}
 ```
 
-which also covers stores whose public endpoint cannot list at all, such as
-Cloudflare R2 and Backblaze B2.
+Heads come from `<prefix>/index`, a newline separated list that writers
+rewrite whenever they publish or delete one: a GET for the `ETag`, then a
+conditional PUT, retried when another writer wins. Endpoints that serve
+objects but no listings work the same way, Cloudflare R2 and Backblaze B2
+among them, see the [R2 tutorial](r2.md).
 
-Writes carry the `Cache-Control` a CDN in front of the bucket should honour:
-content-addressed objects are `immutable` for a year, `index` and the heads
-`max-age=30`, since a stale copy of those means readers miss recently pushed
-paths until it expires.
+Writes carry `Cache-Control` for a CDN: content-addressed objects are
+`immutable` for a year, `index` and heads `max-age=30`.
