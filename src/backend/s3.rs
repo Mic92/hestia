@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,6 +45,7 @@ pub struct S3 {
     /// Heads this backend wrote or deleted since the last `flush`, and
     /// whether they still exist.
     own_heads: Arc<Mutex<BTreeMap<String, bool>>>,
+    warned_index: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -106,6 +108,7 @@ impl S3 {
                 origin: Origin::Http(root),
                 prefix,
                 own_heads: Arc::default(),
+                warned_index: Arc::default(),
             });
         }
         let rest = url
@@ -130,6 +133,7 @@ impl S3 {
             origin: Origin::Bucket(Box::new(bucket), credentials),
             prefix: prefix.trim_matches('/').to_owned(),
             own_heads: Arc::default(),
+            warned_index: Arc::default(),
         })
     }
 
@@ -444,6 +448,15 @@ impl S3 {
             return Ok(None);
         }
         let Some(body) = self.get(INDEX, None).await? else {
+            // The likeliest misconfiguration is a URL that misses the
+            // prefix, which would otherwise just look like an empty store.
+            if !self.warned_index.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "hestia: no head index at {}, so this store has nothing to serve; writers \
+                     publishing to the bucket keep it up to date",
+                    self.path(INDEX)
+                );
+            }
             return Ok(Some(Vec::new()));
         };
         let body = String::from_utf8(body.to_vec())
