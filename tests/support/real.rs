@@ -8,8 +8,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use hestia::backend::Backend;
+use hestia::backend::blobdir::BlobDir;
 use hestia::backend::oci::Oci;
-use hestia::backend::s3::S3;
 use rusty_s3::actions::{CreateBucket, S3Action};
 use rusty_s3::{Bucket, Credentials, UrlStyle};
 use tempfile::TempDir;
@@ -102,8 +102,8 @@ impl Server {
     }
 
     pub fn s3(&self, http: &reqwest::Client) -> Backend {
-        Backend::S3(
-            S3::new(
+        Backend::Dir(
+            BlobDir::s3(
                 &format!("s3://{BUCKET}/ci"),
                 Some(&self.base_url),
                 REGION,

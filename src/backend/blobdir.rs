@@ -42,7 +42,7 @@ const MUTABLE: &str = "public, max-age=30";
 const INDEX_ATTEMPTS: u32 = 3;
 
 #[derive(Clone)]
-pub struct S3 {
+pub struct BlobDir {
     http: reqwest::Client,
     origin: Origin,
     prefix: String,
@@ -96,10 +96,10 @@ fn is_head(key: &str) -> bool {
     matches!(key.split_once('-'), Some(("g" | "h" | "c", rest)) if !rest.is_empty())
 }
 
-impl S3 {
+impl BlobDir {
     /// `url` is `s3://<bucket>/<prefix>`. Without `endpoint` it is AWS
     /// virtual-hosted style, with one path style (MinIO, Garage, R2, ...).
-    pub fn new(
+    pub fn s3(
         url: &str,
         endpoint: Option<&str>,
         region: &str,
@@ -137,7 +137,7 @@ impl S3 {
             let origin = Origin::Bucket(Box::new(bucket), credentials);
             (origin, prefix.trim_matches('/').to_owned())
         };
-        Ok(S3 {
+        Ok(BlobDir {
             http,
             origin,
             prefix,
@@ -146,9 +146,9 @@ impl S3 {
         })
     }
 
-    pub fn from_env(url: &str, http: reqwest::Client) -> Result<Self, Error> {
+    pub fn s3_from_env(url: &str, http: reqwest::Client) -> Result<Self, Error> {
         let var = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
-        Self::new(
+        Self::s3(
             url,
             var(ENV_S3_ENDPOINT).as_deref(),
             &var(ENV_S3_REGION).unwrap_or_else(|| "us-east-1".to_owned()),
@@ -491,7 +491,7 @@ mod tests {
             object("h-0000000000000001-x-0-y"),
             "heads/h-0000000000000001-x-0-y"
         );
-        let s3 = S3::new(
+        let s3 = BlobDir::s3(
             "s3://b/store/",
             Some("http://127.0.0.1:9000"),
             "r",

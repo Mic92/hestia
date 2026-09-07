@@ -21,7 +21,7 @@ use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use hestia::backend::Backend;
-use hestia::backend::s3::S3;
+use hestia::backend::blobdir::BlobDir;
 use hestia::gha::rest::format_timestamp;
 use hestia::pipeline::Clock;
 use rusty_s3::Credentials;
@@ -318,8 +318,8 @@ impl FakeS3 {
     }
 
     fn s3(&self, credentials: Option<Credentials>) -> Backend {
-        Backend::S3(
-            S3::new(
+        Backend::Dir(
+            BlobDir::s3(
                 &self.url(),
                 Some(&self.base_url),
                 REGION,
@@ -342,7 +342,9 @@ impl FakeS3 {
     /// The public bucket through plain HTTP, as behind a CDN.
     pub fn cdn(&self) -> Backend {
         let url = format!("{}/{PREFIX}", self.base_url);
-        Backend::S3(S3::new(&url, None, REGION, None, reqwest::Client::new()).expect("http store"))
+        Backend::Dir(
+            BlobDir::s3(&url, None, REGION, None, reqwest::Client::new()).expect("http store"),
+        )
     }
 
     /// What a GET of an absent key answers: a bucket that grants only

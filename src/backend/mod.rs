@@ -7,10 +7,10 @@ use bytes::Bytes;
 
 pub use crate::gha::Error;
 
+pub mod blobdir;
 pub mod gha;
 pub mod ghcr;
 pub mod oci;
-pub mod s3;
 mod urls;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +24,8 @@ pub struct Listed {
 pub enum Backend {
     Gha(gha::Gha),
     Oci(oci::Oci),
-    S3(s3::S3),
+    /// S3, or the same tree read-only over plain HTTP.
+    Dir(blobdir::BlobDir),
 }
 
 pub const ENV_OCI: &str = "HESTIA_OCI";
@@ -36,7 +37,7 @@ impl Backend {
     pub fn from_env(http: reqwest::Client) -> Result<Self, Error> {
         let var = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
         if let Some(url) = var(ENV_S3) {
-            return Ok(Backend::S3(s3::S3::from_env(&url, http)?));
+            return Ok(Backend::Dir(blobdir::BlobDir::s3_from_env(&url, http)?));
         }
         if let Some(repo) = var(ENV_OCI) {
             return Ok(Backend::Oci(oci::Oci::from_env(&repo, http)?));
@@ -49,7 +50,7 @@ impl Backend {
         match self {
             Backend::Gha(b) => b.put(key, data).await,
             Backend::Oci(b) => b.put(key, data).await,
-            Backend::S3(b) => b.put(key, data).await,
+            Backend::Dir(b) => b.put(key, data).await,
         }
     }
 
@@ -58,7 +59,7 @@ impl Backend {
         match self {
             Backend::Gha(b) => b.get(key, range).await,
             Backend::Oci(b) => b.get(key, range).await,
-            Backend::S3(b) => b.get(key, range).await,
+            Backend::Dir(b) => b.get(key, range).await,
         }
     }
 
@@ -67,7 +68,7 @@ impl Backend {
         match self {
             Backend::Gha(b) => b.touch(key).await,
             Backend::Oci(b) => b.exists(key).await,
-            Backend::S3(b) => b.exists(key).await,
+            Backend::Dir(b) => b.exists(key).await,
         }
     }
 
@@ -81,7 +82,7 @@ impl Backend {
         match self {
             Backend::Gha(b) => b.list(prefix, limit).await,
             Backend::Oci(b) => b.list(prefix, limit).await,
-            Backend::S3(b) => b.list(prefix, limit).await,
+            Backend::Dir(b) => b.list(prefix, limit).await,
         }
     }
 
@@ -119,7 +120,7 @@ impl Backend {
         match self {
             Backend::Gha(b) => b.delete(key).await,
             Backend::Oci(b) => b.delete(key).await,
-            Backend::S3(b) => b.delete(key).await,
+            Backend::Dir(b) => b.delete(key).await,
         }
     }
 
@@ -131,8 +132,8 @@ impl Backend {
                  events)"
             }
             Backend::Oci(_) => "the registry credentials are missing or grant no push access",
-            Backend::S3(b) if !b.writable() => "an http(s):// store can only be read",
-            Backend::S3(_) => "the bucket credentials are missing or grant no write access",
+            Backend::Dir(b) if !b.writable() => "an http(s):// store can only be read",
+            Backend::Dir(_) => "the bucket credentials are missing or grant no write access",
         }
     }
 
@@ -140,7 +141,7 @@ impl Backend {
         match self {
             Backend::Gha(b) => b.probe_writable().await,
             Backend::Oci(b) => b.probe_writable().await,
-            Backend::S3(b) => b.probe_writable().await,
+            Backend::Dir(b) => b.probe_writable().await,
         }
     }
 
@@ -148,7 +149,7 @@ impl Backend {
     pub async fn flush(&self) -> Result<(), Error> {
         match self {
             Backend::Gha(_) => Ok(()),
-            Backend::S3(b) => b.flush().await,
+            Backend::Dir(b) => b.flush().await,
             Backend::Oci(b) => b.flush().await,
         }
     }
