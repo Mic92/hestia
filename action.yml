@@ -25,7 +25,7 @@ inputs:
       verified against that repository's build provenance attestations
       before it runs.
     required: false
-    default: "latest"
+    default: "Mic92/hestia-beta@latest"
   github-token:
     description: >
       Token for listing cache entries to find what earlier jobs cached
