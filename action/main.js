@@ -188,9 +188,17 @@ function actionRepo() {
   return process.env.GITHUB_ACTION_REPOSITORY || process.env.GITHUB_REPOSITORY || 'Mic92/hestia';
 }
 
-async function resolveVersion(version) {
+/** `owner/repo@tag` takes the binary from another repository's releases. */
+function parseVersion(input) {
+  const at = input.lastIndexOf('@');
+  if (at > 0 && input.slice(0, at).includes('/')) {
+    return { repo: input.slice(0, at), version: input.slice(at + 1) };
+  }
+  return { repo: actionRepo(), version: input };
+}
+
+async function resolveVersion(repo, version) {
   if (version !== 'latest') return version;
-  const repo = actionRepo();
   // /releases/latest skips prereleases, so list recent releases and pick
   // the highest published (non-draft) version. The list endpoint orders by
   // creation date, so a hotfix for an older line would otherwise downgrade
@@ -217,13 +225,14 @@ async function resolveVersion(version) {
 async function installBinary(installDir) {
   const target = path.join(installDir, 'hestia');
   const binary = getInput('binary');
-  let version = getInput('version');
 
   if (binary) {
     console.log(`hestia-cache: installing from local binary ${binary}`);
     fs.copyFileSync(binary, target);
   } else {
-    version = await resolveVersion(version);
+    const parsed = parseVersion(getInput('version'));
+    const repo = parsed.repo;
+    const version = await resolveVersion(repo, parsed.version);
     const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch] || process.arch;
     // Must match the release.yml build matrix; there is no x86_64-darwin
     // asset, so Intel macs need a locally built binary.
@@ -235,7 +244,6 @@ async function installBinary(installDir) {
           "pass the 'binary' input to use a locally built hestia"
       );
     }
-    const repo = actionRepo();
     const assetName = `hestia-${arch}-${process.platform}`;
     const url = `${serverBase}/${repo}/releases/download/${version}/${assetName}`;
     console.log(`hestia-cache: downloading ${url}`);

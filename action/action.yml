@@ -20,8 +20,10 @@ inputs:
     description: >
       Hestia release tag to download from GitHub releases
       (e.g. "v0.1.0-beta.1"), or "latest" to auto-resolve the newest
-      release.  The downloaded binary is verified against GitHub's build
-      provenance attestations before it runs.
+      release. `owner/repo@tag` downloads from another repository's
+      releases (e.g. "Mic92/hestia-beta@latest"). The downloaded binary is
+      verified against that repository's build provenance attestations
+      before it runs.
     required: false
     default: "latest"
   github-token:
