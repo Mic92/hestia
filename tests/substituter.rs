@@ -253,6 +253,19 @@ async fn ca_build_trace_is_served() {
     .await;
 }
 
+/// Nix before 2.35 omits `executable` when false in `nar ls --json`,
+/// later versions always write it (nix e6dab09c2), as hestia does.
+/// Readers accept both. Compare in the newer form whatever the oracle is.
+fn executable_explicit(v: &mut serde_json::Value) {
+    let Some(obj) = v.as_object_mut() else { return };
+    if obj.get("type").and_then(|t| t.as_str()) == Some("regular") {
+        obj.entry("executable").or_insert(false.into());
+    }
+    if let Some(entries) = obj.get_mut("entries").and_then(|e| e.as_object_mut()) {
+        entries.values_mut().for_each(executable_explicit);
+    }
+}
+
 #[tokio::test]
 async fn narinfo_matches_nix_path_info_oracle() {
     timed(async {
@@ -306,12 +319,11 @@ async fn narinfo_matches_nix_path_info_oracle() {
             .await
             .unwrap();
         assert_eq!(ls["version"], 1);
-        assert_eq!(
-            ls["root"],
-            store
-                .nar_ls_json(&fixture)
-                .expect("nix nar ls oracle unavailable")
-        );
+        let mut oracle_ls = store
+            .nar_ls_json(&fixture)
+            .expect("nix nar ls oracle unavailable");
+        executable_explicit(&mut oracle_ls);
+        assert_eq!(ls["root"], oracle_ls);
         // nix-store --add produces a content-addressed path; CA must round-trip.
         assert_eq!(
             narinfo.get("CA").map(String::as_str),
