@@ -235,7 +235,8 @@ The `matrix` subaction has its own inputs (`flake`, `nix-eval-jobs`,
 
 Running the `hestia` binary yourself instead of using the action? See the
 [CLI reference](docs/cli.md). Storing the cache in Cloudflare R2, public and
-free to read: [R2 tutorial](docs/r2.md). Deciding whose heads a reader
+free to read: [R2 tutorial](docs/r2.md); on a storage box, NAS or
+nginx directory: [WebDAV tutorial](docs/webdav.md). Deciding whose heads a reader
 believes: [signing](docs/signing.md). How it all works under the hood:
 [architecture](docs/architecture.md).
 
@@ -308,7 +309,7 @@ when the branch is deleted. In practice this means:
 
 ### Stores without scopes: head provenance
 
-An OCI registry or S3 bucket has no per-branch scopes: anyone who can
+An OCI registry, S3 bucket or WebDAV share has no per-branch scopes: anyone who can
 push can publish a head into `main-*`. With `trust: strict` (or
 `same-repo`) every head carries a [cosign](https://github.com/sigstore/cosign)
 bundle, keyless from the job's OIDC token by default, and readers and GC

@@ -120,17 +120,10 @@ Writes carry `Cache-Control` for a CDN: content-addressed objects are
 
 ## WebDAV
 
-`HESTIA_DAV=https://cloud.example.org/remote.php/dav/files/ci/hestia` stores
-the same tree a bucket would hold (`pack/<xx>/`, `seg/<xx>/`, `heads/`,
-`index`) on a WebDAV share: Nextcloud/ownCloud, Apache `mod_dav`, nginx with
-`dav_ext`, Hetzner Storage Boxes, most NAS. The collection the URL names must
-exist; directories below it are created with `MKCOL` as needed. Listing is
-`PROPFIND` per directory, which is why content-addressed objects are spread
-over 256 shard directories. The server must accept request bodies of at
-least 70 MiB (nginx: `client_max_body_size`).
-
-Servers that ignore `If-Match` (nginx) make the `index` last-writer-wins
-instead of compare-and-swap; a head lost from it that way reappears with the
-next writer, and DAV readers list `heads/` directly anyway. The tree is
-plain files, so the same prefix served over HTTPS is readable with
-`HESTIA_S3=https://…` and can be mirrored with `rclone`.
+`HESTIA_DAV=https://dav.example.org/hestia` stores the same tree a bucket
+would hold on a WebDAV share: nginx with `dav_ext`, Apache `mod_dav`,
+Hetzner Storage Boxes, most NAS. The
+collection the URL names must exist; directories below it are created with
+`MKCOL` as needed, listing is `PROPFIND` per directory. The tree is plain
+files, so the same prefix served over HTTPS reads with `HESTIA_S3=https://…`.
+Setup for the common servers: [WebDAV tutorial](webdav.md).
