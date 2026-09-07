@@ -828,6 +828,41 @@ mod tests {
         assert!(files[0].created.is_some());
     }
 
+    /// Apache mod_dav: props under a second `lp1:` prefix for DAV:,
+    /// newlines between elements.
+    #[test]
+    fn multistatus_from_apache() {
+        const APACHE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:ns0="DAV:">
+<D:response xmlns:lp1="DAV:" xmlns:lp2="http://apache.org/dav/props/">
+<D:href>/dav/ci/seg/ab/</D:href>
+<D:propstat>
+<D:prop>
+<lp1:resourcetype><D:collection/></lp1:resourcetype>
+<lp1:getlastmodified>Mon, 07 Sep 2026 20:35:47 GMT</lp1:getlastmodified>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+<D:response xmlns:lp1="DAV:" xmlns:lp2="http://apache.org/dav/props/">
+<D:href>/dav/ci/seg/ab/seg-ab01</D:href>
+<D:propstat>
+<D:prop>
+<lp1:resourcetype/>
+<lp1:getlastmodified>Sun, 06 Nov 1994 08:49:37 GMT</lp1:getlastmodified>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+</D:multistatus>
+"#;
+        let (dirs, files) = parse_multistatus(APACHE, "/dav/ci/seg/ab/").unwrap();
+        assert!(dirs.is_empty());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].key, "seg-ab01");
+        assert_eq!(files[0].created, parse_timestamp("1994-11-06T08:49:37Z"));
+    }
+
     #[test]
     fn multistatus_from_sabre() {
         let (dirs, files) = parse_multistatus(SABRE, "/remote.php/dav/files/u/ci/seg/").unwrap();

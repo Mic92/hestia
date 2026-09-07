@@ -137,16 +137,55 @@ async fn distribution_registry() {
     .await;
 }
 
+/// One DAV contract, three implementations: nginx dav_ext (C, quirky),
+/// Apache mod_dav (the reference, weak ETags), rclone (Go x/net/webdav).
+async fn dav_server(name: &str, server: Option<Server>, http: &reqwest::Client) {
+    let Some(server) = server else {
+        eprintln!("{name} not on PATH, skipping");
+        return;
+    };
+    contract(&server.dav(http), false).await;
+    gc_round_trip(server.dav(http), false).await;
+    // Two index rewrites in the same second: Apache's weak-ETag window.
+    let b = server.dav(http);
+    let heads = ["h-00-00-01-y", "h-00-00-02-y"];
+    for head in heads {
+        b.put(head, Bytes::new()).await.unwrap();
+        b.flush().await.unwrap();
+    }
+    let index = b.get("index", None).await.unwrap().expect("index written");
+    let index = std::str::from_utf8(&index).unwrap();
+    for head in heads {
+        assert!(
+            index.lines().any(|l| l == head),
+            "{name}: {head} missing from index:\n{index}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn nginx_dav() {
     timed(async {
         let http = reqwest::Client::new();
-        let Some(server) = Server::nginx_dav(&http).await else {
-            eprintln!("nginx not on PATH, skipping");
-            return;
-        };
-        contract(&server.dav(&http), false).await;
-        gc_round_trip(server.dav(&http), false).await;
+        dav_server("nginx", Server::nginx_dav(&http).await, &http).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn apache_dav() {
+    timed(async {
+        let http = reqwest::Client::new();
+        dav_server("httpd", Server::apache_dav(&http).await, &http).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rclone_dav() {
+    timed(async {
+        let http = reqwest::Client::new();
+        dav_server("rclone", Server::rclone_dav(&http).await, &http).await;
     })
     .await;
 }

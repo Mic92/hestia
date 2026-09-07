@@ -16,8 +16,10 @@
       cosign
       rustfs
       distribution
-      # WebDAV real-server test; stock nginx lacks dav_ext (PROPFIND)
+      # WebDAV real-server tests; stock nginx lacks dav_ext (PROPFIND)
       (nginx.override { modules = [ nginxModules.dav ]; })
+      apacheHttpd
+      rclone
     ];
 
     buildInputs = with pkgs; [

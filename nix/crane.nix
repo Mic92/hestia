@@ -135,6 +135,8 @@ in
         pkgs.rustfs
         pkgs.distribution
         (pkgs.nginx.override { modules = [ pkgs.nginxModules.dav ]; })
+        pkgs.apacheHttpd
+        pkgs.rclone
       ];
       # nix needs a writable HOME.
       preBuild = ''

@@ -1,5 +1,6 @@
 //! Real third-party servers spawned per test: rustfs (S3), the CNCF
-//! distribution registry (OCI) and nginx with dav_ext (WebDAV). Each `start` returns `None` when the
+//! distribution registry (OCI), and for WebDAV nginx with dav_ext,
+//! Apache mod_dav and rclone. Each `start` returns `None` when the
 //! binary is not on PATH so the suite still runs without them.
 
 use std::net::TcpListener;
@@ -187,14 +188,100 @@ impl Server {
                     .arg(dir.join("nginx.conf"));
                 c
             },
-            |base| {
-                http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), format!("{base}/dav/"))
-                    .basic_auth(ACCESS_KEY, Some(SECRET_KEY))
-                    .header("Depth", "0")
-            },
+            |base| Self::propfind_ready(http, base),
         )
         .await;
         Some(server)
+    }
+
+    /// Apache mod_dav_fs: the reference implementation. Weak ETags for
+    /// files modified within the second, which `If-Match` then refuses.
+    pub async fn apache_dav(http: &reqwest::Client) -> Option<Self> {
+        let bin = which("httpd")?;
+        // modules/ sits next to bin/ in the nixpkgs and most other layouts.
+        let modules = bin.canonicalize().ok()?.parent()?.parent()?.join("modules");
+        if !modules.join("mod_dav.so").is_file() {
+            return None;
+        }
+        let server = Self::spawn(
+            |port, dir| {
+                let d = dir.display();
+                let m = modules.display();
+                std::fs::create_dir_all(dir.join("root/dav/ci")).unwrap();
+                // httpd takes no plaintext passwords on Unix.
+                let htpasswd = bin.with_file_name("htpasswd");
+                let ok = Command::new(&htpasswd)
+                    .args(["-bcB"])
+                    .arg(dir.join("htpasswd"))
+                    .args([ACCESS_KEY, SECRET_KEY])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap();
+                assert!(ok.success(), "htpasswd failed");
+                let load: String = [
+                    "mpm_event",
+                    "authn_core",
+                    "authn_file",
+                    "authz_core",
+                    "authz_user",
+                    "auth_basic",
+                    "unixd",
+                    "dav",
+                    "dav_fs",
+                ]
+                .iter()
+                .map(|n| format!("LoadModule {n}_module {m}/mod_{n}.so\n"))
+                .collect();
+                std::fs::write(
+                    dir.join("httpd.conf"),
+                    format!(
+                        "ServerRoot {d}\nPidFile {d}/httpd.pid\nListen 127.0.0.1:{port}\n\
+                         ServerName localhost\nErrorLog {d}/error.log\nLogLevel crit\n{load}\
+                         DavLockDB {d}/davlock\nDocumentRoot {d}/root\n\
+                         <Directory {d}/root>\n Dav On\n AuthType Basic\n AuthName dav\n \
+                         AuthUserFile {d}/htpasswd\n Require valid-user\n</Directory>\n"
+                    ),
+                )
+                .unwrap();
+                let mut c = Command::new(&bin);
+                c.arg("-f").arg(dir.join("httpd.conf")).arg("-DFOREGROUND");
+                c
+            },
+            |base| Self::propfind_ready(http, base),
+        )
+        .await;
+        Some(server)
+    }
+
+    /// rclone serve webdav (Go x/net/webdav): MKCOL on an existing
+    /// collection says 201 again, conditionals are ignored.
+    pub async fn rclone_dav(http: &reqwest::Client) -> Option<Self> {
+        let bin = which("rclone")?;
+        let server = Self::spawn(
+            |port, dir| {
+                std::fs::create_dir_all(dir.join("root/dav/ci")).unwrap();
+                let mut c = Command::new(bin);
+                c.args(["serve", "webdav", "--addr", &format!("127.0.0.1:{port}")])
+                    .args(["--user", ACCESS_KEY, "--pass", SECRET_KEY])
+                    .arg("--config")
+                    .arg(dir.join("rclone.conf"))
+                    .arg(dir.join("root"));
+                c
+            },
+            |base| Self::propfind_ready(http, base),
+        )
+        .await;
+        Some(server)
+    }
+
+    fn propfind_ready(http: &reqwest::Client, base: &str) -> reqwest::RequestBuilder {
+        http.request(
+            reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+            format!("{base}/dav/"),
+        )
+        .basic_auth(ACCESS_KEY, Some(SECRET_KEY))
+        .header("Depth", "0")
     }
 
     pub fn dav(&self, http: &reqwest::Client) -> Backend {
