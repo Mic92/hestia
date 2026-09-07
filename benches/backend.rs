@@ -20,13 +20,14 @@ use hestia::pipeline::AccessLog;
 use hestia::store::Snapshot;
 use hestia::substituter::{ManifestStore, Substituter};
 use hestia::trust::Trust;
+use support::fake_dav::FakeDav;
 use support::fake_gha::FakeGha;
 use support::fake_oci::FakeOci;
 use support::fake_s3::FakeS3;
 use support::net::Net;
 use support::sim::{SimCache, SimPath};
 
-const BACKENDS: [&str; 3] = ["gha", "oci", "s3"];
+const BACKENDS: [&str; 4] = ["gha", "oci", "s3", "dav"];
 const ROOT: &str = "main";
 /// Like nix's default `http-connections`.
 const PARALLEL: usize = 25;
@@ -53,6 +54,7 @@ enum Fake {
     Gha(FakeGha),
     Oci(FakeOci),
     S3(FakeS3),
+    Dav(FakeDav),
 }
 
 impl Fake {
@@ -60,7 +62,8 @@ impl Fake {
         match kind {
             "gha" => Self::Gha(FakeGha::start().await),
             "oci" => Self::Oci(FakeOci::start().await),
-            _ => Self::S3(FakeS3::start().await),
+            "s3" => Self::S3(FakeS3::start().await),
+            _ => Self::Dav(FakeDav::start().await),
         }
     }
 
@@ -69,6 +72,7 @@ impl Fake {
             Self::Gha(f) => &f.net,
             Self::Oci(f) => &f.net,
             Self::S3(f) => &f.net,
+            Self::Dav(f) => &f.net,
         }
     }
 
@@ -77,6 +81,7 @@ impl Fake {
             Self::Gha(f) => f.backend(http),
             Self::Oci(f) => f.backend(http),
             Self::S3(f) => f.backend(),
+            Self::Dav(f) => f.backend(),
         }
     }
 }

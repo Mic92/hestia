@@ -1,24 +1,25 @@
-//! Any S3-compatible bucket. Content-addressed keys are sharded by their
-//! first hash byte, `<prefix>/pack/<xx>/pack-…` and
-//! `<prefix>/seg/<xx>/{seg,tree}-…`: on AWS that spreads request rate
-//! across prefixes, on stores where a prefix is a directory (MinIO,
-//! POSIX gateways, WebDAV) it keeps directories small. Heads are named,
-//! not hashed, and every job lists all of them, so `<prefix>/heads/` is
-//! flat. Nothing is evicted, listings are complete but may lag, deletes
-//! are plain.
+//! Objects as files under a prefix, over three transports: an S3 bucket
+//! (presigned requests, ListObjectsV2), a WebDAV share (Basic auth,
+//! PROPFIND, MKCOL), or read-only plain HTTP through whatever serves the
+//! same tree (a CDN, a bucket website endpoint, the share minus auth).
 //!
-//! Given an `https://` URL instead, the bucket is read anonymously through
-//! whatever serves it there (a CDN, the website endpoint). Only plain GETs:
-//! heads come from `<prefix>/index`, which writers keep up to date, so a
-//! public bucket never has to allow anonymous listing.
+//! Content-addressed keys are sharded by their first hash byte,
+//! `<prefix>/pack/<xx>/pack-…` and `<prefix>/seg/<xx>/{seg,tree}-…`: on
+//! AWS that spreads request rate across prefixes, where a prefix is a
+//! real directory (MinIO, POSIX gateways, WebDAV) it keeps listings
+//! small. Heads are named, not hashed, and every job lists all of them,
+//! so `<prefix>/heads/` is flat. Writers also keep `<prefix>/index`, the
+//! head names one per line, so plain-HTTP readers need no listing.
+//! Nothing is evicted, listings are complete but may lag.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use reqwest::header::HeaderName;
 use reqwest::{Method, Response, StatusCode, Url, header};
 use rusty_s3::actions::{ListObjectsV2, S3Action};
@@ -30,12 +31,16 @@ use crate::gha::rest::parse_timestamp;
 
 pub const ENV_S3_ENDPOINT: &str = "HESTIA_S3_ENDPOINT";
 pub const ENV_S3_REGION: &str = "AWS_REGION";
+pub const ENV_DAV_USER: &str = "HESTIA_DAV_USER";
+pub const ENV_DAV_PASSWORD: &str = "HESTIA_DAV_PASSWORD";
 const SIGNATURE_TTL: Duration = Duration::from_secs(3600);
 const TRANSIENT_RETRIES: u32 = 4;
+/// Shard directories listed in flight during a WebDAV GC listing.
+const PROPFIND_CONCURRENCY: usize = 32;
 
 /// Head names for readers that cannot list, one per line.
 const INDEX: &str = "index";
-/// What a CDN in front of the bucket may cache, and for how long. Only
+/// What a CDN in front of the store may cache, and for how long. Only
 /// heads and the index ever change.
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const MUTABLE: &str = "public, max-age=30";
@@ -45,6 +50,7 @@ const INDEX_ATTEMPTS: u32 = 3;
 pub struct BlobDir {
     http: reqwest::Client,
     origin: Origin,
+    env: &'static str,
     prefix: String,
     /// Heads this backend wrote or deleted since the last `flush`, and
     /// whether they still exist.
@@ -54,9 +60,17 @@ pub struct BlobDir {
 
 #[derive(Clone)]
 enum Origin {
-    Bucket(Box<Bucket>, Option<Credentials>),
-    /// Bucket root over plain HTTP, read-only.
+    S3(Box<Bucket>, Option<Credentials>),
+    /// Store root over plain HTTP, read-only.
     Http(Url),
+    Dav {
+        root: Url,
+        auth: Option<(String, String)>,
+        /// Collections known to exist, so MKCOL runs once per directory.
+        /// Async so concurrent uploads into one new shard wait for the
+        /// first MKCOL instead of each issuing their own.
+        dirs: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    },
 }
 
 /// Object path under the store prefix for a hestia key or listing prefix.
@@ -96,9 +110,19 @@ fn is_head(key: &str) -> bool {
     matches!(key.split_once('-'), Some(("g" | "h" | "c", rest)) if !rest.is_empty())
 }
 
+/// Splits `scheme://[user:pass@]host/prefix` into a root URL and the prefix.
+fn split_url(url: &str, invalid: impl Fn(String) -> Error) -> Result<(Url, String), Error> {
+    let mut root = Url::parse(url).map_err(|e| invalid(e.to_string()))?;
+    let prefix = root.path().trim_matches('/').to_owned();
+    root.set_path("/");
+    root.set_query(None);
+    Ok((root, prefix))
+}
+
 impl BlobDir {
-    /// `url` is `s3://<bucket>/<prefix>`. Without `endpoint` it is AWS
-    /// virtual-hosted style, with one path style (MinIO, Garage, R2, ...).
+    /// `s3://<bucket>/<prefix>`: without `endpoint` AWS virtual-hosted
+    /// style, with one path style (MinIO, Garage, R2, ...). `https://…`:
+    /// the same tree read-only over plain HTTP.
     pub fn s3(
         url: &str,
         endpoint: Option<&str>,
@@ -106,44 +130,36 @@ impl BlobDir {
         credentials: Option<Credentials>,
         http: reqwest::Client,
     ) -> Result<Self, Error> {
-        let invalid = |reason: String| Error::InvalidEnv {
-            name: super::ENV_S3,
-            reason,
+        let env = super::ENV_S3;
+        let invalid = |reason: String| Error::InvalidEnv { name: env, reason };
+        if url.starts_with("http://") || url.starts_with("https://") {
+            let (root, prefix) = split_url(url, invalid)?;
+            return Ok(Self::with(http, Origin::Http(root), env, prefix));
+        }
+        let rest = url
+            .strip_prefix("s3://")
+            .filter(|r| !r.is_empty() && !r.starts_with('/'))
+            .ok_or_else(|| {
+                invalid("want s3://<bucket>/<prefix> or https://<host>/<prefix>".into())
+            })?;
+        let (name, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+        let (endpoint, style) = match endpoint {
+            Some(e) => (e.to_owned(), UrlStyle::Path),
+            None => (
+                format!("https://s3.{region}.amazonaws.com"),
+                UrlStyle::VirtualHost,
+            ),
         };
-        let (origin, prefix) = if url.starts_with("http://") || url.starts_with("https://") {
-            let mut root = Url::parse(url).map_err(|e| invalid(e.to_string()))?;
-            let prefix = root.path().trim_matches('/').to_owned();
-            root.set_path("/");
-            root.set_query(None);
-            (Origin::Http(root), prefix)
-        } else {
-            let rest = url
-                .strip_prefix("s3://")
-                .filter(|r| !r.is_empty() && !r.starts_with('/'))
-                .ok_or_else(|| {
-                    invalid("want s3://<bucket>/<prefix> or https://<host>/<prefix>".into())
-                })?;
-            let (name, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-            let (endpoint, style) = match endpoint {
-                Some(e) => (e.to_owned(), UrlStyle::Path),
-                None => (
-                    format!("https://s3.{region}.amazonaws.com"),
-                    UrlStyle::VirtualHost,
-                ),
-            };
-            let endpoint = Url::parse(&endpoint).map_err(|e| invalid(e.to_string()))?;
-            let bucket = Bucket::new(endpoint, style, name.to_owned(), region.to_owned())
-                .map_err(|e| invalid(e.to_string()))?;
-            let origin = Origin::Bucket(Box::new(bucket), credentials);
-            (origin, prefix.trim_matches('/').to_owned())
-        };
-        Ok(BlobDir {
+        let endpoint = Url::parse(&endpoint).map_err(|e| invalid(e.to_string()))?;
+        let bucket = Bucket::new(endpoint, style, name.to_owned(), region.to_owned())
+            .map_err(|e| invalid(e.to_string()))?;
+        let origin = Origin::S3(Box::new(bucket), credentials);
+        Ok(Self::with(
             http,
             origin,
-            prefix,
-            own_heads: Arc::default(),
-            warned_index: Arc::default(),
-        })
+            env,
+            prefix.trim_matches('/').to_owned(),
+        ))
     }
 
     pub fn s3_from_env(url: &str, http: reqwest::Client) -> Result<Self, Error> {
@@ -157,10 +173,53 @@ impl BlobDir {
         )
     }
 
-    fn path(&self, key: &str) -> String {
+    /// `http[s]://[user:password@]host/<prefix>`, a WebDAV collection.
+    pub fn dav(
+        url: &str,
+        auth: Option<(String, String)>,
+        http: reqwest::Client,
+    ) -> Result<Self, Error> {
+        let env = super::ENV_DAV;
+        let invalid = |reason: String| Error::InvalidEnv { name: env, reason };
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(invalid("want http(s)://<host>/<prefix>".into()));
+        }
+        let (mut root, prefix) = split_url(url, invalid)?;
+        let from_url = match (root.username(), root.password()) {
+            ("", _) => None,
+            (u, p) => Some((percent_decode(u), percent_decode(p.unwrap_or_default()))),
+        };
+        let _ = root.set_username("");
+        let _ = root.set_password(None);
+        let origin = Origin::Dav {
+            root,
+            auth: auth.or(from_url),
+            dirs: Arc::default(),
+        };
+        Ok(Self::with(http, origin, env, prefix))
+    }
+
+    pub fn dav_from_env(url: &str, http: reqwest::Client) -> Result<Self, Error> {
+        let var = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
+        let auth = var(ENV_DAV_USER).map(|u| (u, var(ENV_DAV_PASSWORD).unwrap_or_default()));
+        Self::dav(url, auth, http)
+    }
+
+    fn with(http: reqwest::Client, origin: Origin, env: &'static str, prefix: String) -> Self {
+        BlobDir {
+            http,
+            origin,
+            env,
+            prefix,
+            own_heads: Arc::default(),
+            warned_index: Arc::default(),
+        }
+    }
+
+    fn path(&self, rel: &str) -> String {
         match self.prefix.as_str() {
-            "" => object(key),
-            p => format!("{p}/{}", object(key)),
+            "" => rel.to_owned(),
+            p => format!("{p}/{rel}"),
         }
     }
 
@@ -177,6 +236,12 @@ impl BlobDir {
         let mut attempt = 0;
         loop {
             let mut b = self.http.request(method.clone(), url.clone());
+            if let Origin::Dav {
+                auth: Some((u, p)), ..
+            } = &self.origin
+            {
+                b = b.basic_auth(u, Some(p));
+            }
             if let Some((data, cache)) = &body {
                 // reqwest omits Content-Length for an empty body and rustfs
                 // then rejects the PUT.
@@ -191,7 +256,9 @@ impl BlobDir {
             let result = b.send().await.map_err(Error::Http);
             let transient = match &result {
                 Ok(r) => {
-                    r.status().is_server_error() || r.status() == StatusCode::TOO_MANY_REQUESTS
+                    !ok.contains(&r.status())
+                        && (r.status().is_server_error()
+                            || r.status() == StatusCode::TOO_MANY_REQUESTS)
                 }
                 Err(e) => is_transient(e),
             };
@@ -207,6 +274,24 @@ impl BlobDir {
         }
     }
 
+    fn url(&self, method: &Method, rel: &str) -> Url {
+        let p = self.path(rel);
+        match &self.origin {
+            Origin::Http(root) | Origin::Dav { root, .. } => {
+                root.join(&p).expect("object path is a valid URL path")
+            }
+            Origin::S3(bucket, c) => {
+                let c = c.as_ref();
+                match *method {
+                    Method::PUT => bucket.put_object(c, &p).sign(SIGNATURE_TTL),
+                    Method::HEAD => bucket.head_object(c, &p).sign(SIGNATURE_TTL),
+                    Method::DELETE => bucket.delete_object(c, &p).sign(SIGNATURE_TTL),
+                    _ => bucket.get_object(c, &p).sign(SIGNATURE_TTL),
+                }
+            }
+        }
+    }
+
     /// GET/HEAD/PUT/DELETE on the key's object.
     async fn object(
         &self,
@@ -216,29 +301,79 @@ impl BlobDir {
         headers: &[(HeaderName, String)],
         ok: &[StatusCode],
     ) -> Result<Response, Error> {
-        let p = self.path(key);
-        let url = match &self.origin {
-            Origin::Http(root) => root.join(&p).expect("object path is a valid URL path"),
-            Origin::Bucket(bucket, c) => {
-                let c = c.as_ref();
-                match method {
-                    Method::PUT => bucket.put_object(c, &p).sign(SIGNATURE_TTL),
-                    Method::HEAD => bucket.head_object(c, &p).sign(SIGNATURE_TTL),
-                    Method::DELETE => bucket.delete_object(c, &p).sign(SIGNATURE_TTL),
-                    _ => bucket.get_object(c, &p).sign(SIGNATURE_TTL),
-                }
-            }
-        };
+        let url = self.url(&method, &object(key));
         let body = body.map(|b| (b, cache_control(key)));
         self.request(method, url, body, headers, ok).await
     }
 
+    /// `false` if a create-once PUT found the key already there.
     pub async fn put(&self, key: &str, data: Bytes) -> Result<bool, Error> {
-        self.check_writable()?;
-        self.object(Method::PUT, key, Some(data), &[], &[StatusCode::OK])
-            .await?;
+        // Hardening only: S3 stores without conditional PUT and nginx
+        // ignore it and overwrite with the same bytes.
+        let once: Vec<_> = (!is_head(key) && key != INDEX)
+            .then(|| (header::IF_NONE_MATCH, "*".to_owned()))
+            .into_iter()
+            .collect();
+        let r = self.put_object(key, data, &once).await?;
         self.remember_head(key, true);
-        Ok(true)
+        Ok(r.status() != StatusCode::PRECONDITION_FAILED)
+    }
+
+    async fn put_object(
+        &self,
+        key: &str,
+        data: Bytes,
+        headers: &[(HeaderName, String)],
+    ) -> Result<Response, Error> {
+        self.check_writable()?;
+        self.make_parents(&object(key)).await?;
+        let ok = [
+            StatusCode::OK,
+            StatusCode::CREATED,
+            StatusCode::NO_CONTENT,
+            StatusCode::PRECONDITION_FAILED,
+        ];
+        let r = self
+            .object(Method::PUT, key, Some(data), headers, &ok)
+            .await?;
+        match self.absent().contains(&r.status()) {
+            true => Err(status_error(self.url(&Method::PUT, &object(key)).as_str(), r).await),
+            false => Ok(r),
+        }
+    }
+
+    /// WebDAV refuses a PUT below a missing collection (409, nginx: 500),
+    /// so MKCOL every directory between the share and `rel` once per
+    /// process. The collection HESTIA_DAV names is the operator's.
+    async fn make_parents(&self, rel: &str) -> Result<(), Error> {
+        let Origin::Dav { root, dirs, .. } = &self.origin else {
+            return Ok(());
+        };
+        let Some((dir_path, _)) = rel.rsplit_once('/') else {
+            return Ok(());
+        };
+        let mut known = dirs.lock().await;
+        let mut dir = self.path("");
+        for part in dir_path.split('/') {
+            dir.push_str(part);
+            dir.push('/');
+            if known.contains(&dir) {
+                continue;
+            }
+            // nginx wants the trailing slash, 405 means it exists.
+            let url = root
+                .join(&dir)
+                .expect("collection path is a valid URL path");
+            let ok = [
+                StatusCode::CREATED,
+                StatusCode::METHOD_NOT_ALLOWED,
+                StatusCode::MOVED_PERMANENTLY,
+            ];
+            self.request(Method::from_bytes(b"MKCOL").unwrap(), url, None, &[], &ok)
+                .await?;
+            known.insert(dir.clone());
+        }
+        Ok(())
     }
 
     fn remember_head(&self, key: &str, exists: bool) {
@@ -250,15 +385,15 @@ impl BlobDir {
         }
     }
 
-    /// An `https://` origin is somebody else's bucket seen through a CDN.
+    /// An `https://` S3 origin is somebody else's bucket seen through a CDN.
     pub fn writable(&self) -> bool {
-        matches!(self.origin, Origin::Bucket(..))
+        !matches!(self.origin, Origin::Http(_))
     }
 
     fn check_writable(&self) -> Result<(), Error> {
         self.writable().then_some(()).ok_or(Error::InvalidEnv {
-            name: super::ENV_S3,
-            reason: "an http(s):// store is read-only, writing needs s3://".into(),
+            name: self.env,
+            reason: "an http(s):// store is read-only, writing needs s3:// or HESTIA_DAV".into(),
         })
     }
 
@@ -266,8 +401,8 @@ impl BlobDir {
     /// says 403: telling the two apart would leak whether keys exist.
     fn absent(&self) -> &'static [StatusCode] {
         match self.origin {
-            Origin::Bucket(..) => &[StatusCode::NOT_FOUND],
             Origin::Http(_) => &[StatusCode::NOT_FOUND, StatusCode::FORBIDDEN],
+            _ => &[StatusCode::NOT_FOUND],
         }
     }
 
@@ -334,11 +469,8 @@ impl BlobDir {
                 .filter(|(_, exists)| **exists)
                 .map(|(key, _)| format!("{key}\n"))
                 .collect();
-            let ok = [StatusCode::OK, StatusCode::PRECONDITION_FAILED];
-            let r = self
-                .object(Method::PUT, INDEX, Some(body.into()), &precondition, &ok)
-                .await?;
-            if r.status() == StatusCode::OK {
+            let r = self.put_object(INDEX, body.into(), &precondition).await?;
+            if r.status() != StatusCode::PRECONDITION_FAILED {
                 // Whatever a concurrent writer added meanwhile stays.
                 let mut pending = self.own_heads.lock().unwrap();
                 pending.retain(|key, exists| own.get(key) != Some(exists));
@@ -356,8 +488,8 @@ impl BlobDir {
     }
 
     /// What the index must still look like for our rewrite of it to count.
-    /// A store that answers without an `ETag` cannot compare and swap, so
-    /// there the last writer simply wins.
+    /// A store that answers without an `ETag`, or ignores `If-Match`
+    /// (nginx), cannot compare and swap, so there the last writer wins.
     async fn index_precondition(&self) -> Result<Option<(HeaderName, String)>, Error> {
         let current = self
             .object(Method::HEAD, INDEX, None, &[], &[StatusCode::OK])
@@ -380,7 +512,8 @@ impl BlobDir {
     ) -> Result<Option<Vec<Listed>>, Error> {
         match &self.origin {
             Origin::Http(_) => self.list_index(prefix).await,
-            Origin::Bucket(bucket, c) => self.list_bucket(bucket, c.as_ref(), prefix, limit).await,
+            Origin::S3(bucket, c) => self.list_bucket(bucket, c.as_ref(), prefix, limit).await,
+            Origin::Dav { .. } => self.list_dav(prefix, limit).await,
         }
     }
 
@@ -391,7 +524,7 @@ impl BlobDir {
         prefix: &str,
         limit: Option<u64>,
     ) -> Result<Option<Vec<Listed>>, Error> {
-        let full = self.path(prefix);
+        let full = self.path(&object(prefix));
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -456,24 +589,153 @@ impl BlobDir {
         ))
     }
 
+    /// PROPFIND has neither paging nor a prefix filter: list the key's
+    /// directory, for sharded kinds every shard below it that exists.
+    async fn list_dav(
+        &self,
+        prefix: &str,
+        limit: Option<u64>,
+    ) -> Result<Option<Vec<Listed>>, Error> {
+        let dir = object(prefix);
+        let dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
+        let sharded = !dir.starts_with("heads");
+        let dirs: Vec<String> = if sharded {
+            let (shards, _) = self.propfind(&format!("{dir}/")).await?;
+            shards.into_iter().map(|s| format!("{dir}/{s}/")).collect()
+        } else {
+            vec![format!("{dir}/")]
+        };
+        let pages: Vec<Vec<Listed>> = stream::iter(dirs)
+            .map(|d| async move { Ok::<_, Error>(self.propfind(&d).await?.1) })
+            .buffer_unordered(PROPFIND_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let out: Vec<Listed> = pages
+            .into_iter()
+            .flatten()
+            .filter(|l| l.key.starts_with(prefix))
+            .collect();
+        if limit.is_some_and(|l| out.len() as u64 > l) {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
+
+    /// `Depth: 1` listing of one collection: (sub-collections, files).
+    /// A missing collection is empty, nothing was written there yet.
+    async fn propfind(&self, rel_dir: &str) -> Result<(Vec<String>, Vec<Listed>), Error> {
+        let url = self.url(&Method::GET, rel_dir);
+        let headers = [
+            (HeaderName::from_static("depth"), "1".to_owned()),
+            (header::CONTENT_TYPE, "application/xml".to_owned()),
+        ];
+        let body = Bytes::from_static(PROPFIND_BODY.as_bytes());
+        let r = self
+            .request(
+                Method::from_bytes(b"PROPFIND").unwrap(),
+                url.clone(),
+                Some((body, MUTABLE)),
+                &headers,
+                &[StatusCode::MULTI_STATUS],
+            )
+            .await?;
+        if r.status() != StatusCode::MULTI_STATUS {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        parse_multistatus(&r.text().await?, url.path())
+            .map_err(|e| Error::InvalidResponse(format!("PROPFIND {url}: {e}")))
+    }
+
     pub async fn probe_writable(&self) -> Result<bool, Error> {
-        if !matches!(self.origin, Origin::Bucket(_, Some(_))) {
+        if matches!(self.origin, Origin::S3(_, None) | Origin::Http(_)) {
             // Anonymous S3 cannot sign a PUT at all.
             return Ok(false);
         }
-        let ok = [
-            StatusCode::OK,
-            StatusCode::FORBIDDEN,
-            StatusCode::UNAUTHORIZED,
-        ];
-        let r = self
-            .object(Method::PUT, "x-probe", Some(Bytes::new()), &[], &ok)
-            .await?;
-        if r.status() != StatusCode::OK {
-            return Ok(false);
+        match self.put_object("x-probe", Bytes::new(), &[]).await {
+            Ok(_) => self.delete("x-probe").await,
+            Err(Error::Status {
+                status: 401 | 403, ..
+            }) => Ok(false),
+            Err(e) => Err(e),
         }
-        self.delete("x-probe").await
     }
+}
+
+const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><resourcetype/><getlastmodified/></prop></propfind>"#;
+
+/// The entries of a `207 Multi-Status` below the collection at
+/// `base_path`: names of sub-collections, and files as `Listed`.
+/// Servers differ in namespace prefixes, absolute vs. relative hrefs,
+/// trailing slashes and percent-encoding; only local names are matched.
+fn parse_multistatus(xml: &str, base_path: &str) -> Result<(Vec<String>, Vec<Listed>), String> {
+    use xmlparser::{ElementEnd, Token};
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let (mut href, mut modified, mut collection) = (String::new(), None, false);
+    let mut text_of: Option<&str> = None;
+    let base = base_path.trim_end_matches('/');
+    for token in xmlparser::Tokenizer::from(xml) {
+        match token.map_err(|e| e.to_string())? {
+            Token::ElementStart { local, .. } => match local.as_str() {
+                "response" => (href, modified, collection) = (String::new(), None, false),
+                "href" => text_of = Some("href"),
+                "getlastmodified" => text_of = Some("getlastmodified"),
+                "collection" => collection = true,
+                _ => {}
+            },
+            Token::Text { text } | Token::Cdata { text, .. } => match text_of {
+                Some("href") => href.push_str(text.as_str().trim()),
+                Some("getlastmodified") => modified = parse_http_date(text.as_str().trim()),
+                _ => {}
+            },
+            Token::ElementEnd {
+                end: ElementEnd::Close(_, local),
+                ..
+            } => {
+                text_of = None;
+                if local.as_str() != "response" {
+                    continue;
+                }
+                // Absolute URL, absolute path, or relative: reduce to a path.
+                let path = match Url::parse(&href) {
+                    Ok(u) => u.path().to_owned(),
+                    Err(_) => href.clone(),
+                };
+                let path = percent_decode(path.trim_end_matches('/'));
+                if path == base || !path.starts_with(base) {
+                    continue;
+                }
+                let name = key_of(&path).to_owned();
+                if collection {
+                    dirs.push(name);
+                } else {
+                    files.push(Listed {
+                        key: name,
+                        created: modified,
+                        last_accessed: None,
+                    });
+                }
+            }
+            Token::ElementEnd {
+                end: ElementEnd::Empty,
+                ..
+            } => text_of = None,
+            _ => {}
+        }
+    }
+    Ok((dirs, files))
+}
+
+fn percent_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// RFC 7231 date, `Sun, 06 Nov 1994 08:49:37 GMT`, as unix seconds.
+fn parse_http_date(s: &str) -> Option<u64> {
+    let t = httpdate::parse_http_date(s).ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
 }
 
 #[cfg(test)]
@@ -499,7 +761,76 @@ mod tests {
             reqwest::Client::new(),
         )
         .unwrap();
-        assert_eq!(s3.path("g-1"), "store/heads/g-1");
+        assert_eq!(s3.path(&object("g-1")), "store/heads/g-1");
         assert_eq!(key_of("store/pack/ab/pack-abcdef"), "pack-abcdef");
+    }
+
+    #[test]
+    fn dav_url_credentials() {
+        let d = BlobDir::dav(
+            "https://u:p%40ss@host/dav/ci/",
+            None,
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        let Origin::Dav { root, auth, .. } = &d.origin else {
+            panic!()
+        };
+        assert_eq!(root.as_str(), "https://host/");
+        assert_eq!(d.prefix, "dav/ci");
+        assert_eq!(auth.as_ref().unwrap(), &("u".to_owned(), "p@ss".to_owned()));
+    }
+
+    #[test]
+    fn http_dates() {
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            parse_timestamp("1994-11-06T08:49:37Z")
+        );
+        assert_eq!(parse_http_date("garbage"), None);
+    }
+
+    /// nginx: `D:` prefix, absolute hrefs, the collection itself first.
+    const NGINX: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
+<D:multistatus xmlns:D="DAV:">
+<D:response><D:href>/store/pack/ab/</D:href><D:propstat><D:prop>
+<D:getlastmodified>Mon, 07 Sep 2026 19:15:58 GMT</D:getlastmodified>
+<D:resourcetype><D:collection/></D:resourcetype></D:prop>
+<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+<D:response><D:href>/store/pack/ab/pack-abc</D:href><D:propstat><D:prop>
+<D:getcontentlength>100</D:getcontentlength>
+<D:getlastmodified>Mon, 07 Sep 2026 19:15:58 GMT</D:getlastmodified>
+<D:resourcetype></D:resourcetype></D:prop>
+<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+</D:multistatus>"#;
+
+    /// SabreDAV: `d:` prefix, hrefs percent-encoded with trailing
+    /// slash on collections, full URL on some setups.
+    const SABRE: &str = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+ <d:response><d:href>/remote.php/dav/files/u/ci/seg/</d:href>
+  <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+ <d:response><d:href>/remote.php/dav/files/u/ci/seg/0a/</d:href>
+  <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+ <d:response><d:href>https://cloud.example/remote.php/dav/files/u/ci/seg/seg%2Dff</d:href>
+  <d:propstat><d:prop><d:getlastmodified>Tue, 01 Jan 2030 00:00:00 GMT</d:getlastmodified><d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+</d:multistatus>"#;
+
+    #[test]
+    fn multistatus_from_nginx() {
+        let (dirs, files) = parse_multistatus(NGINX, "/store/pack/ab/").unwrap();
+        assert!(dirs.is_empty());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].key, "pack-abc");
+        assert!(files[0].created.is_some());
+    }
+
+    #[test]
+    fn multistatus_from_sabre() {
+        let (dirs, files) = parse_multistatus(SABRE, "/remote.php/dav/files/u/ci/seg/").unwrap();
+        assert_eq!(dirs, ["0a"]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].key, "seg-ff");
+        assert_eq!(files[0].created, parse_timestamp("2030-01-01T00:00:00Z"));
     }
 }

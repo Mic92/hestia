@@ -113,3 +113,40 @@ pub async fn assert_all_chunks_locatable(snapshot: &Snapshot) {
             .unwrap_or_else(|err| panic!("path {hash} does not resolve: {err}"));
     }
 }
+
+/// A GET answer honouring `Range: bytes=s-e`: 206 with the slice, 416
+/// past the end, 200 with everything when no range was asked for.
+pub fn serve_range(body: Bytes, range: Option<&str>) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    let etag = format!("\"{}\"", hestia::manifest::Hash32::digest(&body));
+    let Some(spec) = range else {
+        return (StatusCode::OK, [(header::ETAG, etag)], body).into_response();
+    };
+    let parse = || -> Option<(usize, usize)> {
+        let (s, e) = spec.strip_prefix("bytes=")?.split_once('-')?;
+        let s: usize = s.parse().ok()?;
+        let e = if e.is_empty() {
+            body.len().checked_sub(1)?
+        } else {
+            e.parse::<usize>().ok()?.min(body.len().checked_sub(1)?)
+        };
+        (s <= e).then_some((s, e))
+    };
+    match parse() {
+        Some((s, e)) => (
+            StatusCode::PARTIAL_CONTENT,
+            [(
+                header::CONTENT_RANGE,
+                format!("bytes {s}-{e}/{}", body.len()),
+            )],
+            body.slice(s..=e),
+        )
+            .into_response(),
+        None => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, format!("bytes */{}", body.len()))],
+        )
+            .into_response(),
+    }
+}

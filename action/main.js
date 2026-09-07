@@ -483,6 +483,10 @@ function startDaemon(hestiaBin, listen, socket, logFile) {
       env.HESTIA_S3_ENDPOINT = endpoint;
     }
   }
+  const dav = getInput('dav');
+  if (dav) {
+    env.HESTIA_DAV = dav;
+  }
   const daemon = spawn(hestiaBin, args, {
     detached: true,
     stdio: ['ignore', log, log],

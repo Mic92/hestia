@@ -222,6 +222,7 @@ All inputs are optional; the defaults work for the quick start above.
 | `oci` | — | `<registry>/<repository>` (e.g. `ghcr.io/OWNER/REPO/hestia`): store in an OCI registry instead of the Actions cache. On ghcr.io the job token is the credential (`packages: write` to upload, public packages substitute anonymously). GC needs `packages: write` there. Other registries must accept manifest deletes and run their own blob GC. |
 | `trust`, `trust-rows`, `sign` | `open` | Head provenance, see [Security](#stores-without-scopes-head-provenance). `strict`: default-branch roots and GC only from default-branch workflows. `same-repo`: any workflow of this repository. Needs `id-token: write` and cosign. |
 | `s3`, `s3-endpoint` | — | `s3://BUCKET/PREFIX` (plus an endpoint URL for MinIO, R2, Garage, Ceph, ...): store in an S3-compatible bucket. Credentials from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_REGION` in `env`. Jobs without credentials substitute if the bucket allows public reads. |
+| `dav` | — | `https://HOST/PREFIX` of a WebDAV collection (nginx dav_ext, Apache mod_dav, Hetzner Storage Box, a NAS, ...). Credentials from `HESTIA_DAV_USER`/`HESTIA_DAV_PASSWORD` in `env`. Same directory layout as the S3 store, so the tree can also be read over plain HTTP with `s3: https://…`. |
 | `read-only` | `false` | Substitute from the cache but never write to it (no post-build-hook, no drain). |
 | `no-closure` | `false` | Cache built paths only, without their runtime closure. |
 

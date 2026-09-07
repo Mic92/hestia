@@ -1,5 +1,5 @@
-//! Real third-party servers spawned per test: rustfs (S3) and the CNCF
-//! distribution registry (OCI). Each `start` returns `None` when the
+//! Real third-party servers spawned per test: rustfs (S3), the CNCF
+//! distribution registry (OCI) and nginx with dav_ext (WebDAV). Each `start` returns `None` when the
 //! binary is not on PATH so the suite still runs without them.
 
 use std::net::TcpListener;
@@ -10,6 +10,7 @@ use std::time::Duration;
 use hestia::backend::Backend;
 use hestia::backend::blobdir::BlobDir;
 use hestia::backend::oci::Oci;
+
 use rusty_s3::actions::{CreateBucket, S3Action};
 use rusty_s3::{Bucket, Credentials, UrlStyle};
 use tempfile::TempDir;
@@ -146,6 +147,61 @@ impl Server {
                 &format!("{}/hestia/cache", self.base_url),
                 None,
                 None,
+                http.clone(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// nginx is the strict and quirky DAV server: 500 for a PUT below a
+    /// missing collection, MKCOL only with a trailing slash, conditional
+    /// headers ignored. Needs the dav_ext module for PROPFIND.
+    pub async fn nginx_dav(http: &reqwest::Client) -> Option<Self> {
+        let bin = which("nginx")?;
+        let server = Self::spawn(
+            |port, dir| {
+                let d = dir.display();
+                std::fs::create_dir_all(dir.join("root/dav/ci")).unwrap();
+                std::fs::create_dir_all(dir.join("tmp")).unwrap();
+                std::fs::write(dir.join("htpasswd"), format!("{ACCESS_KEY}:{{PLAIN}}{SECRET_KEY}\n"))
+                    .unwrap();
+                std::fs::write(
+                    dir.join("nginx.conf"),
+                    format!(
+                        "daemon off; pid {d}/nginx.pid; error_log stderr crit;\n\
+                         events {{}}\n\
+                         http {{ access_log off; client_max_body_size 128m;\n\
+                           client_body_temp_path {d}/tmp; proxy_temp_path {d}/tmp;\n\
+                           fastcgi_temp_path {d}/tmp; uwsgi_temp_path {d}/tmp; scgi_temp_path {d}/tmp;\n\
+                           server {{ listen 127.0.0.1:{port}; root {d}/root;\n\
+                             location / {{ auth_basic dav; auth_basic_user_file {d}/htpasswd;\n\
+                               dav_methods PUT DELETE MKCOL; dav_ext_methods PROPFIND OPTIONS;\n\
+                               create_full_put_path off; }} }} }}\n"
+                    ),
+                )
+                .unwrap();
+                let mut c = Command::new(bin);
+                c.args(["-e", "stderr", "-p"])
+                    .arg(dir)
+                    .arg("-c")
+                    .arg(dir.join("nginx.conf"));
+                c
+            },
+            |base| {
+                http.request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), format!("{base}/dav/"))
+                    .basic_auth(ACCESS_KEY, Some(SECRET_KEY))
+                    .header("Depth", "0")
+            },
+        )
+        .await;
+        Some(server)
+    }
+
+    pub fn dav(&self, http: &reqwest::Client) -> Backend {
+        Backend::Dir(
+            BlobDir::dav(
+                &format!("{}/dav/ci", self.base_url),
+                Some((ACCESS_KEY.to_owned(), SECRET_KEY.to_owned())),
                 http.clone(),
             )
             .unwrap(),

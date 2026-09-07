@@ -1,5 +1,5 @@
 //! The same backend contract and GC round trip against real servers:
-//! rustfs for S3 and the distribution registry for OCI. Skipped when the
+//! rustfs for S3, the distribution registry for OCI, nginx for WebDAV. Skipped when the
 //! binaries are not on PATH.
 
 mod support;
@@ -133,6 +133,20 @@ async fn distribution_registry() {
         };
         contract(&server.oci(&http), true).await;
         gc_round_trip(server.oci(&http), true).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn nginx_dav() {
+    timed(async {
+        let http = reqwest::Client::new();
+        let Some(server) = Server::nginx_dav(&http).await else {
+            eprintln!("nginx not on PATH, skipping");
+            return;
+        };
+        contract(&server.dav(&http), false).await;
+        gc_round_trip(server.dav(&http), false).await;
     })
     .await;
 }

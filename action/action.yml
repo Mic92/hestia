@@ -92,6 +92,14 @@ inputs:
       addressed path-style.
     required: false
     default: ""
+  dav:
+    description: >
+      `https://HOST/PREFIX` of a WebDAV collection (nginx dav_ext,
+      Apache mod_dav, a storage box or NAS) to store in instead of the
+      Actions cache. Credentials from `HESTIA_DAV_USER` and
+      `HESTIA_DAV_PASSWORD` in `env`.
+    required: false
+    default: ""
   trust:
     description: >
       Which heads the daemon and GC accept. `open`: everything, nothing

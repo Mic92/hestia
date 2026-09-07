@@ -73,6 +73,8 @@ Always exits 0 (a failing post-build-hook would fail the build).
 | `HESTIA_OCI_USER`, `HESTIA_OCI_PASSWORD` | serve, gc | Registry credentials. On ghcr.io `GITHUB_TOKEN` is used when unset. Without any, access is anonymous and read-only. |
 | `HESTIA_S3` | serve, gc | `s3://<bucket>/<prefix>`: store in an S3-compatible bucket. Credentials from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, region from `AWS_REGION` (default `us-east-1`). Without credentials access is anonymous and read-only. Takes precedence over `HESTIA_OCI`. `https://<host>/<prefix>` reads the same layout over plain HTTP, see [Public buckets and CDNs](#public-buckets-and-cdns). |
 | `HESTIA_S3_ENDPOINT` | serve, gc | Endpoint URL for non-AWS stores, addressed path-style. Without it `https://s3.<region>.amazonaws.com`, virtual-hosted style. |
+| `HESTIA_DAV` | serve, gc | `https://<host>/<prefix>`: store in a WebDAV collection, same layout as a bucket, see [WebDAV](#webdav). After `HESTIA_S3`, before `HESTIA_OCI`. |
+| `HESTIA_DAV_USER`, `HESTIA_DAV_PASSWORD` | serve, gc | Basic auth for the share, sent with every request. `user:password@` in the URL works too. Without either, reads are anonymous and writes are probed. |
 | `HESTIA_TRUST` | serve, gc | Head policy, one `<root glob \| @gc> <cosign \| gh> <args…>` per line: a head counts only if a row for its root (first matching glob, `@gc` for GC records) verifies its bundle with `cosign verify-blob-attestation <args>` or `gh attestation verify <args>`. Unset accepts everything. |
 | `HESTIA_SIGN` | serve, gc | `cosign attest-blob` arguments for published heads (empty: keyless). Unset publishes unsigned. See [signing](signing.md). |
 | `HESTIA_LISTEN` | prefetch | Address exported by the action for the running Hestia server. |
@@ -115,3 +117,20 @@ among them, see the [R2 tutorial](r2.md).
 
 Writes carry `Cache-Control` for a CDN: content-addressed objects are
 `immutable` for a year, `index` and heads `max-age=30`.
+
+## WebDAV
+
+`HESTIA_DAV=https://cloud.example.org/remote.php/dav/files/ci/hestia` stores
+the same tree a bucket would hold (`pack/<xx>/`, `seg/<xx>/`, `heads/`,
+`index`) on a WebDAV share: Nextcloud/ownCloud, Apache `mod_dav`, nginx with
+`dav_ext`, Hetzner Storage Boxes, most NAS. The collection the URL names must
+exist; directories below it are created with `MKCOL` as needed. Listing is
+`PROPFIND` per directory, which is why content-addressed objects are spread
+over 256 shard directories. The server must accept request bodies of at
+least 70 MiB (nginx: `client_max_body_size`).
+
+Servers that ignore `If-Match` (nginx) make the `index` last-writer-wins
+instead of compare-and-swap; a head lost from it that way reappears with the
+next writer, and DAV readers list `heads/` directly anyway. The tree is
+plain files, so the same prefix served over HTTPS is readable with
+`HESTIA_S3=https://…` and can be mirrored with `rclone`.

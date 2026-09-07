@@ -81,6 +81,11 @@ harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev =
 harmonia-utils-io = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
 harmonia-utils-signature = { git = "https://github.com/nix-community/harmonia", rev = "bba51756f92a488d440e4c426747fb681abce4a7" }
 rusty-s3 = "0.10.2"
+# WebDAV: PROPFIND multistatus, hrefs and dates in it (all already in
+# the tree via rusty-s3, url and hyper)
+xmlparser = "0.13"
+percent-encoding = "2"
+httpdate = "1"
 tempfile = "3"
 
 [dev-dependencies]
@@ -90,8 +95,9 @@ tokio = { version = "1", features = ["process"] }
 proptest = "1"
 # Blob storage directory for the fake GHA backend
 tempfile = "3"
-# Basic auth check in the fake OCI registry
+# Basic auth check in the fake OCI registry and DAV share
 base64 = "0.22"
+httpdate = "1"
 divan = "0.1"
 
 [[bench]]

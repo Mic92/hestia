@@ -134,6 +134,7 @@ in
         pkgs.cosign
         pkgs.rustfs
         pkgs.distribution
+        (pkgs.nginx.override { modules = [ pkgs.nginxModules.dav ]; })
       ];
       # nix needs a writable HOME.
       preBuild = ''

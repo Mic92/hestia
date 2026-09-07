@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod common;
+pub mod fake_dav;
 pub mod fake_gha;
 pub mod fake_oci;
 pub mod fake_s3;

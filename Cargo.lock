@@ -1059,9 +1059,11 @@ dependencies = [
  "harmonia-utils-hash",
  "harmonia-utils-io",
  "harmonia-utils-signature",
+ "httpdate",
  "libc",
  "memmap2",
  "minicbor",
+ "percent-encoding",
  "proptest",
  "reqwest",
  "rusqlite",
@@ -1071,6 +1073,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "xmlparser",
  "zstd",
 ]
 

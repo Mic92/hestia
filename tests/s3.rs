@@ -278,7 +278,7 @@ async fn read_only_http_stores_do_not_blame_github_tokens() {
     timed(async {
         let fake = FakeS3::start().await;
         assert!(fake.cdn().read_only_hint().contains("http"));
-        assert!(fake.anonymous().read_only_hint().contains("bucket"));
+        assert!(fake.anonymous().read_only_hint().contains("credentials"));
     })
     .await;
 }

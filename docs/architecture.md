@@ -50,10 +50,11 @@ SHA-256 of its bytes, so the same names work as OCI blob digests.
 
 The same objects go into one of three stores: the Actions cache (the
 default, evicts by LRU), an OCI registry (blobs plus one manifest each,
-tagged with the key, untagged on GHCR where a ledger tracks them) or an S3-compatible bucket (`pack/<xx>/`, `seg/<xx>/`,
-`heads/` under a prefix). A bucket can also be read over plain HTTP
-through a CDN, where heads come from an index object rather than a
-listing, so the bucket only has to make objects public. The rest of this
+tagged with the key, untagged on GHCR where a ledger tracks them) or a
+directory tree (`pack/<xx>/`, `seg/<xx>/`, `heads/` under a prefix) in an
+S3-compatible bucket or on a WebDAV share. The tree can also be read over
+plain HTTP through a CDN, where heads come from an index object rather
+than a listing, so the bucket only has to make objects public. The rest of this
 document is store-agnostic: a store only needs put, ranged get, list by
 prefix and delete.
 

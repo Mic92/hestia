@@ -24,20 +24,25 @@ pub struct Listed {
 pub enum Backend {
     Gha(gha::Gha),
     Oci(oci::Oci),
-    /// S3, or the same tree read-only over plain HTTP.
+    /// S3, WebDAV, or the same tree read-only over plain HTTP.
     Dir(blobdir::BlobDir),
 }
 
 pub const ENV_OCI: &str = "HESTIA_OCI";
 pub const ENV_S3: &str = "HESTIA_S3";
+pub const ENV_DAV: &str = "HESTIA_DAV";
 
 impl Backend {
     /// `HESTIA_S3=s3://<bucket>/<prefix>` selects a bucket,
+    /// `HESTIA_DAV=https://<host>/<prefix>` a WebDAV share,
     /// `HESTIA_OCI=<registry>/<repository>` a registry, else the Actions cache.
     pub fn from_env(http: reqwest::Client) -> Result<Self, Error> {
         let var = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
         if let Some(url) = var(ENV_S3) {
             return Ok(Backend::Dir(blobdir::BlobDir::s3_from_env(&url, http)?));
+        }
+        if let Some(url) = var(ENV_DAV) {
+            return Ok(Backend::Dir(blobdir::BlobDir::dav_from_env(&url, http)?));
         }
         if let Some(repo) = var(ENV_OCI) {
             return Ok(Backend::Oci(oci::Oci::from_env(&repo, http)?));
@@ -133,7 +138,7 @@ impl Backend {
             }
             Backend::Oci(_) => "the registry credentials are missing or grant no push access",
             Backend::Dir(b) if !b.writable() => "an http(s):// store can only be read",
-            Backend::Dir(_) => "the bucket credentials are missing or grant no write access",
+            Backend::Dir(_) => "the store credentials are missing or grant no write access",
         }
     }
 

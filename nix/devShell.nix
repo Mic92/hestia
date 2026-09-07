@@ -16,6 +16,8 @@
       cosign
       rustfs
       distribution
+      # WebDAV real-server test; stock nginx lacks dav_ext (PROPFIND)
+      (nginx.override { modules = [ nginxModules.dav ]; })
     ];
 
     buildInputs = with pkgs; [
