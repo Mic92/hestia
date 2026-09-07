@@ -15,7 +15,7 @@ use hestia::pipeline::AccessLog;
 use hestia::store::Snapshot;
 use hestia::substituter::{ManifestStore, Substituter};
 use support::common::{TEST_ROOT_KEY, pipeline_context_with, to_path_set};
-use support::fake_dav::{FakeDav, PREFIX};
+use support::fake_dav::{FakeDav, Flavor, PREFIX};
 use support::sim::{SimCache, SimPath};
 use support::store::{ScratchStore, assert_trees_equal, nix_copy};
 
@@ -150,23 +150,34 @@ async fn mkcol_runs_once_per_directory() {
     .await;
 }
 
+/// Every server flavour the fake models must pass the basic write path:
+/// probe, create-once pack, two index rewrites, and a plain-HTTP reader
+/// finding the head through the index afterwards.
 #[tokio::test]
-async fn nginx_quirks() {
+async fn server_flavours() {
     timed(async {
-        let fake = FakeDav::start().await;
-        fake.set_nginx(true);
-        let b = fake.backend();
-        assert!(b.probe_writable().await.unwrap());
-        let pack = Bytes::from_static(b"frames");
-        assert!(b.put(&key("pack", &pack), pack.clone()).await.unwrap());
-        assert!(
-            b.put(&key("pack", &pack), pack.clone()).await.unwrap(),
-            "nginx ignores If-None-Match, so an overwrite looks like a create"
-        );
-        b.put(HEAD, Bytes::new()).await.unwrap();
-        b.flush().await.unwrap();
-        fake.set_public(true);
-        assert_eq!(listed(&fake.plain_http(), "h-").await, [HEAD]);
+        for flavor in [Flavor::Plain, Flavor::Nginx, Flavor::Apache, Flavor::Rclone] {
+            let fake = FakeDav::start().await;
+            fake.set_flavor(flavor);
+            let b = fake.backend();
+            assert!(b.probe_writable().await.unwrap());
+            let pack = Bytes::from_static(b"frames");
+            assert!(b.put(&key("pack", &pack), pack.clone()).await.unwrap());
+            let honours_conditionals = matches!(flavor, Flavor::Plain | Flavor::Apache);
+            assert_eq!(
+                b.put(&key("pack", &pack), pack.clone()).await.unwrap(),
+                !honours_conditionals,
+                "create-once on an existing key"
+            );
+            b.put(HEAD, Bytes::new()).await.unwrap();
+            b.flush().await.unwrap();
+            // Second rewrite goes through If-Match on the first one's ETag.
+            let head2 = "h-0000000000000000-00000000075bcd15-0000000000000002-y";
+            b.put(head2, Bytes::new()).await.unwrap();
+            b.flush().await.unwrap();
+            fake.set_public(true);
+            assert_eq!(listed(&fake.plain_http(), "h-").await, [HEAD, head2]);
+        }
     })
     .await;
 }

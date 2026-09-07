@@ -6,8 +6,11 @@
 //!   when it exists, 409 for a missing parent or no trailing slash),
 //!   PROPFIND `Depth: 1` answering a `D:`-prefixed 207 with absolute
 //!   hrefs and RFC 1123 dates
-//! * PUT below a missing collection is 409, or 500 in `nginx` mode,
-//!   which also ignores `If-Match`/`If-None-Match` like nginx does
+//! * `Flavor` switches on what real servers do differently: nginx says
+//!   500 for a PUT below a missing collection and ignores `If-Match`/
+//!   `If-None-Match`; Apache hands out weak ETags for fresh files that
+//!   then never satisfy `If-Match`; rclone answers MKCOL 201 even when
+//!   the collection exists and ignores conditionals too
 //! * Basic auth on everything unless `public` (then reads are open);
 //!   `read_only` answers writes with 403
 
@@ -38,8 +41,18 @@ struct Inner {
     clock: u64,
     public: bool,
     read_only: bool,
-    nginx: bool,
+    flavor: Flavor,
     mkcols: u64,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum Flavor {
+    /// RFC 4918 by the book, strong ETags, conditionals honoured.
+    #[default]
+    Plain,
+    Nginx,
+    Apache,
+    Rclone,
 }
 
 #[derive(Clone)]
@@ -60,8 +73,9 @@ impl Drop for FakeDav {
     }
 }
 
-fn etag(body: &Bytes) -> String {
-    format!("\"{}\"", hestia::manifest::Hash32::digest(body))
+fn etag(body: &Bytes, flavor: Flavor) -> String {
+    let weak = if flavor == Flavor::Apache { "W/" } else { "" };
+    format!("{weak}\"{}\"", hestia::manifest::Hash32::digest(body))
 }
 
 fn parent(path: &str) -> String {
@@ -114,20 +128,23 @@ async fn handle(State(state): State<AppState>, req: Request) -> Response {
     let mut inner = state.inner.lock().unwrap();
     match method.as_str() {
         "PUT" => {
+            let flavor = inner.flavor;
             if !inner.dirs.contains(&parent(&path)) {
-                return match inner.nginx {
-                    true => StatusCode::INTERNAL_SERVER_ERROR,
-                    false => StatusCode::CONFLICT,
+                return match flavor {
+                    Flavor::Nginx => StatusCode::INTERNAL_SERVER_ERROR,
+                    _ => StatusCode::CONFLICT,
                 }
                 .into_response();
             }
-            let current = inner.files.get(&path).map(|(b, _)| etag(b));
-            if !inner.nginx {
+            let current = inner.files.get(&path).map(|(b, _)| etag(b, flavor));
+            if matches!(flavor, Flavor::Plain | Flavor::Apache) {
                 if if_none_match.as_deref() == Some("*") && current.is_some() {
                     return StatusCode::PRECONDITION_FAILED.into_response();
                 }
+                // RFC 7232: If-Match uses the strong comparison, which a
+                // weak ETag never passes. Apache does exactly that.
                 if let Some(want) = &if_match
-                    && current.as_deref() != Some(want.as_str())
+                    && (want.starts_with("W/") || current.as_deref() != Some(want.as_str()))
                 {
                     return StatusCode::PRECONDITION_FAILED.into_response();
                 }
@@ -145,7 +162,7 @@ async fn handle(State(state): State<AppState>, req: Request) -> Response {
             if !path.ends_with('/') || !inner.dirs.contains(&parent(&path)) {
                 return StatusCode::CONFLICT.into_response();
             }
-            match inner.dirs.insert(path) {
+            match inner.dirs.insert(path) || inner.flavor == Flavor::Rclone {
                 true => StatusCode::CREATED,
                 false => StatusCode::METHOD_NOT_ALLOWED,
             }
@@ -158,7 +175,7 @@ async fn handle(State(state): State<AppState>, req: Request) -> Response {
             if method == Method::HEAD {
                 let headers = [
                     (header::CONTENT_LENGTH, body.len().to_string()),
-                    (header::ETAG, etag(&body)),
+                    (header::ETAG, etag(&body, inner.flavor)),
                 ];
                 return (StatusCode::OK, headers).into_response();
             }
@@ -277,9 +294,8 @@ impl FakeDav {
         self.inner.lock().unwrap().read_only = read_only;
     }
 
-    /// 500 for a missing parent and no conditional requests.
-    pub fn set_nginx(&self, nginx: bool) {
-        self.inner.lock().unwrap().nginx = nginx;
+    pub fn set_flavor(&self, flavor: Flavor) {
+        self.inner.lock().unwrap().flavor = flavor;
     }
 
     pub fn mkcols(&self) -> u64 {

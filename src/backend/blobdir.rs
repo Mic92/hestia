@@ -488,8 +488,10 @@ impl BlobDir {
     }
 
     /// What the index must still look like for our rewrite of it to count.
-    /// A store that answers without an `ETag`, or ignores `If-Match`
-    /// (nginx), cannot compare and swap, so there the last writer wins.
+    /// A store that answers without an `ETag`, with a weak one (Apache,
+    /// for a file modified this second; `If-Match` compares strongly so
+    /// it could never pass), or that ignores `If-Match` (nginx) cannot
+    /// compare and swap, so there the last writer wins.
     async fn index_precondition(&self) -> Result<Option<(HeaderName, String)>, Error> {
         let current = self
             .object(Method::HEAD, INDEX, None, &[], &[StatusCode::OK])
@@ -501,6 +503,7 @@ impl BlobDir {
             .headers()
             .get(header::ETAG)
             .and_then(|e| e.to_str().ok())
+            .filter(|etag| !etag.starts_with("W/"))
             .map(|etag| (header::IF_MATCH, etag.to_owned())))
     }
 
