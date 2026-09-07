@@ -189,3 +189,34 @@ async fn rclone_dav() {
     })
     .await;
 }
+
+/// Any share: `HESTIA_TEST_DAV=http://u:p@host/prefix cargo test --test
+/// real_servers external_dav`. The prefix must exist and be disposable.
+#[tokio::test]
+async fn external_dav() {
+    let Ok(url) = std::env::var("HESTIA_TEST_DAV") else {
+        return;
+    };
+    let http = reqwest::Client::new();
+    let b = || {
+        hestia::backend::Backend::Dir(
+            hestia::backend::blobdir::BlobDir::dav(&url, None, http.clone()).unwrap(),
+        )
+    };
+    contract(&b(), false).await;
+    gc_round_trip(b(), false).await;
+    let d = b();
+    let heads = ["h-00-00-01-y", "h-00-00-02-y"];
+    for head in heads {
+        d.put(head, Bytes::new()).await.unwrap();
+        d.flush().await.unwrap();
+    }
+    let index = d.get("index", None).await.unwrap().expect("index written");
+    let index = std::str::from_utf8(&index).unwrap();
+    for head in heads {
+        assert!(
+            index.lines().any(|l| l == head),
+            "{head} missing from index:\n{index}"
+        );
+    }
+}
