@@ -36,7 +36,7 @@ libc = "0.2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-zstd = "0.13"
+zstd = "0.14"
 
 # HTTP client (Twirp, GitHub REST, Azure blob) and substituter server
 reqwest = { version = "0.13", default-features = false, features = [
