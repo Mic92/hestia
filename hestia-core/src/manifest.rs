@@ -278,7 +278,7 @@ pub struct PathEntry<C = ChunkList> {
 
 impl<C> PathEntry<C> {
     /// Convert the file contents with `f`, keeping everything else.
-    fn map_contents<D, E>(self, f: &mut impl FnMut(&C) -> Result<D, E>) -> Result<PathEntry<D>, E> {
+    fn map_contents<D, E>(self, f: &mut impl FnMut(C) -> Result<D, E>) -> Result<PathEntry<D>, E> {
         Ok(PathEntry {
             store_path: self.store_path,
             nar_hash: self.nar_hash,
@@ -286,7 +286,7 @@ impl<C> PathEntry<C> {
             references: self.references,
             ca: self.ca,
             deriver: self.deriver,
-            tree: map_tree(&self.tree, f)?,
+            tree: map_tree(self.tree, f)?,
             last_reachable: self.last_reachable,
             last_pushed: self.last_pushed,
         })
@@ -578,20 +578,20 @@ struct WireManifest {
 
 /// Rebuild a tree with its file contents transformed by `f`.
 fn map_tree<A, B, E>(
-    tree: &FileTree<A>,
-    f: &mut impl FnMut(&A) -> Result<B, E>,
+    tree: FileTree<A>,
+    f: &mut impl FnMut(A) -> Result<B, E>,
 ) -> Result<FileTree<B>, E> {
-    Ok(FileTree(match &tree.0 {
+    Ok(FileTree(match tree.0 {
         FileSystemObject::Regular(regular) => FileSystemObject::Regular(Regular {
             executable: regular.executable,
-            contents: f(&regular.contents)?,
+            contents: f(regular.contents)?,
         }),
-        FileSystemObject::Symlink(symlink) => FileSystemObject::Symlink(symlink.clone()),
+        FileSystemObject::Symlink(symlink) => FileSystemObject::Symlink(symlink),
         FileSystemObject::Directory(directory) => FileSystemObject::Directory(Directory {
             entries: directory
                 .entries
-                .iter()
-                .map(|(name, child)| Ok((name.clone(), Box::new(map_tree(child, f)?))))
+                .into_iter()
+                .map(|(name, child)| Ok((name, Box::new(map_tree(*child, f)?))))
                 .collect::<Result<BTreeMap<_, _>, E>>()?,
         }),
     }))
@@ -710,10 +710,10 @@ impl Manifest {
             .paths
             .iter()
             .map(|(hash, entry)| {
-                let entry = entry.clone().map_contents(&mut |list: &ChunkList| {
+                let entry = entry.clone().map_contents(&mut |list: ChunkList| {
                     Ok::<_, Error>(WireChunkList {
                         chunks: list.chunks.iter().map(|hash| chunk_index[hash]).collect(),
-                        rewrites: list.rewrites.clone(),
+                        rewrites: list.rewrites,
                     })
                 })?;
                 Ok((*hash, entry))
@@ -743,14 +743,18 @@ impl Manifest {
         let chunk_table: Vec<ChunkHash> = wire
             .chunk_hashes
             .0
-            .chunks_exact(ChunkHash::LEN)
-            .map(|bytes| Blake3Chunk(bytes.try_into().expect("chunks_exact yields exact lengths")))
+            .as_chunks::<{ ChunkHash::LEN }>()
+            .0
+            .iter()
+            .map(|bytes| Blake3Chunk(*bytes))
             .collect();
         let pack_table: Vec<PackHash> = wire
             .pack_hashes
             .0
-            .chunks_exact(PackHash::LEN)
-            .map(|bytes| Blake3Pack(bytes.try_into().expect("chunks_exact yields exact lengths")))
+            .as_chunks::<{ PackHash::LEN }>()
+            .0
+            .iter()
+            .map(|bytes| Blake3Pack(*bytes))
             .collect();
         let chunk_at = |index: u64| {
             chunk_table
@@ -815,14 +819,14 @@ impl Manifest {
             .paths
             .into_iter()
             .map(|(hash, entry)| {
-                let entry = entry.map_contents(&mut |list: &WireChunkList| {
+                let entry = entry.map_contents(&mut |list: WireChunkList| {
                     Ok::<_, Error>(ChunkList {
                         chunks: list
                             .chunks
-                            .iter()
-                            .map(|&index| chunk_at(index))
+                            .into_iter()
+                            .map(chunk_at)
                             .collect::<Result<Vec<_>, Error>>()?,
-                        rewrites: list.rewrites.clone(),
+                        rewrites: list.rewrites,
                     })
                 })?;
                 Ok((hash, entry))
