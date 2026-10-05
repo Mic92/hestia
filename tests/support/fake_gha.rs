@@ -8,7 +8,7 @@
 //!   GetCacheEntryDownloadURL, with real reservation semantics
 //!   (`already_exists` blocks reserved-but-unfinalized keys too).
 //! * Azure blob: PUT BlockBlob / GET with Range, gated on signed URLs.
-//! * GitHub REST: list (prefix + pagination) / delete by key.
+//! * GitHub REST: list (prefix + pagination) / delete by key or ID.
 //!
 //! Test-only injection endpoints simulate the failure modes GitHub will
 //! throw at us in production:
@@ -40,7 +40,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -522,6 +522,19 @@ async fn rest_delete(State(state): State<AppState>, Query(query): Query<ListQuer
     .into_response()
 }
 
+async fn rest_delete_by_id(
+    State(state): State<AppState>,
+    Path((_, _, id)): Path<(String, String, u64)>,
+) -> StatusCode {
+    let mut inner = state.inner.lock().unwrap();
+    let Some(index) = inner.entries.iter().position(|entry| entry.id == id) else {
+        return StatusCode::NOT_FOUND;
+    };
+    let entry = inner.entries.remove(index);
+    let _ = std::fs::remove_file(inner.blob_path(entry.id));
+    StatusCode::NO_CONTENT
+}
+
 // ---------------------------------------------------------------------------
 // Test-only injection endpoints
 // ---------------------------------------------------------------------------
@@ -640,6 +653,10 @@ impl FakeGha {
             .route(
                 "/repos/{owner}/{repo}/actions/caches",
                 get(rest_list).delete(rest_delete),
+            )
+            .route(
+                "/repos/{owner}/{repo}/actions/caches/{id}",
+                delete(rest_delete_by_id),
             )
             .route("/test/evict", post(test_evict))
             .route("/test/expire-urls", post(test_expire_urls))
