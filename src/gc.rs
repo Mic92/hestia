@@ -1157,8 +1157,8 @@ impl GcContext {
     }
 
     /// Execute step 6 of 6: delete superseded manifest versions (`m#K` for
-    /// `K < newest`). Without this, every drain and GC commit leaves one
-    /// dead entry behind forever.
+    /// `K < newest` within each ref). Without this, every drain and GC
+    /// commit leaves one dead entry behind forever.
     pub async fn cleanup_manifests(&self, now: u64) -> Result<usize, Error> {
         let prefix = format!("{}#", self.manifest_prefix);
         let entries = self.rest.list_caches(&prefix).await?;
@@ -1170,9 +1170,15 @@ impl GcContext {
             .filter(|entry| entry.version == self.twirp.version())
             .filter_map(|entry| Some((parse_manifest_index(&prefix, &entry.key)?, entry)))
             .collect();
-        let Some(newest) = indexed.iter().map(|(index, _)| *index).max() else {
-            return Ok(0);
-        };
+        // SaveMutable sequences fork per ref: a higher PR index does not
+        // supersede the default branch's head (or another PR's head).
+        let mut newest_by_ref: BTreeMap<&str, u64> = BTreeMap::new();
+        for (index, entry) in &indexed {
+            newest_by_ref
+                .entry(entry.ref_name.as_str())
+                .and_modify(|newest| *newest = (*newest).max(*index))
+                .or_insert(*index);
+        }
 
         let mut deleted = 0;
         for (index, entry) in indexed {
@@ -1184,9 +1190,9 @@ impl GcContext {
                 continue;
             };
             let age = now.saturating_sub(created);
-            if index < newest
+            if index < newest_by_ref[entry.ref_name.as_str()]
                 && age > self.policy.min_age
-                && !self.rest.delete_by_key(&entry.key).await?.is_empty()
+                && self.rest.delete_by_id(entry.id).await?
             {
                 deleted += 1;
             }

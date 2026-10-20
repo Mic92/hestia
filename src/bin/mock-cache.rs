@@ -7,7 +7,7 @@
 //! * Twirp: CreateCacheEntry / FinalizeCacheEntryUpload /
 //!   GetCacheEntryDownloadURL, with real reservation semantics.
 //! * Azure blob: PUT BlockBlob / GET with Range.
-//! * GitHub REST: list (prefix + pagination + sort) / delete by key.
+//! * GitHub REST: list (prefix + pagination + sort) / delete by key or ID.
 //!
 //! Blobs are stored on disk under `--data-dir`. This is a plain, always-
 //! healthy server: no token expiry, quota, eviction, or eventual-consistency
@@ -28,7 +28,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use clap::Parser;
 use serde::Deserialize;
 use serde_json::json;
@@ -345,6 +345,19 @@ async fn rest_delete(State(state): State<AppState>, Query(query): Query<ListQuer
         .into_response()
 }
 
+async fn rest_delete_by_id(
+    State(state): State<AppState>,
+    Path((_, _, id)): Path<(String, String, u64)>,
+) -> StatusCode {
+    let mut inner = state.inner.lock().unwrap();
+    let Some(index) = inner.entries.iter().position(|entry| entry.id == id) else {
+        return StatusCode::NOT_FOUND;
+    };
+    let entry = inner.entries.remove(index);
+    let _ = std::fs::remove_file(inner.blob_path(entry.id));
+    StatusCode::NO_CONTENT
+}
+
 fn env_exports(base_url: &str) -> String {
     [
         ("ACTIONS_RESULTS_URL", base_url),
@@ -398,6 +411,10 @@ async fn main() {
         .route(
             "/repos/{owner}/{repo}/actions/caches",
             get(rest_list).delete(rest_delete),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/caches/{id}",
+            delete(rest_delete_by_id),
         )
         .with_state(state);
 
