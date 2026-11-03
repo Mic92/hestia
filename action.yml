@@ -77,6 +77,13 @@ inputs:
       consume what a central job cached.
     required: false
     default: "false"
+  pr-manifest:
+    description: >
+      Commit manifests to the pull-request chain (`m3pr#`) and read it
+      unioned with the default branch's. Implied when the job runs on
+      `refs/pull/*`.
+    required: false
+    default: "false"
   no-closure:
     description: >
       Cache built paths only, without their runtime closure (dependencies

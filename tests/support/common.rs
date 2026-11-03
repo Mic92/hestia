@@ -50,6 +50,7 @@ pub fn pipeline_context_with(
         root_key: TEST_ROOT_KEY.to_string(),
         run_id: Some("test-run".to_string()),
         manifest_prefix: MANIFEST_PREFIX.to_string(),
+        base_manifest_prefix: None,
         pack_target_size: PACK_TARGET_SIZE,
         read_only: Arc::new(AtomicBool::new(false)),
         publish: None,

@@ -85,6 +85,7 @@ integration tests use it.
 | `upstream-cache-key-names` | `cache.nixos.org-1` | Space-separated key names treated as upstream caches by the filter. |
 | `filter-drv-closures` | `false` | Apply the upstream filter to registered derivation closures; requires `upstream-cache-filter`. Use `hestia prefetch` for bulk closure fetching. |
 | `read-only` | `false` | Substitute from the cache but never write to it (no post-build-hook, no drain). |
+| `pr-manifest` | `false` | Commit manifests to the pull-request chain and read it unioned with the default branch's. Implied when the job runs on `refs/pull/*`. |
 | `no-closure` | `false` | Cache built paths only, without their runtime closure. |
 
 ## Garbage collection

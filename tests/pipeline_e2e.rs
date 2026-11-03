@@ -658,3 +658,58 @@ async fn write_probe_detects_a_read_only_token() {
         "a write-denying backend must probe as read-only"
     );
 }
+
+#[tokio::test]
+async fn pull_request_scope_reads_both_chains_and_writes_only_its_own() {
+    let Some(store) = ScratchStore::create() else {
+        return;
+    };
+    let on_main_first = store.add_fixture("main-first", 21);
+    let on_pr = store.add_fixture("pr-only", 22);
+    let on_main_later = store.add_fixture("main-later", 23);
+
+    let fake = FakeGha::start().await;
+    let http = reqwest::Client::new();
+    let main_ctx = context(&fake, &http, store.database());
+    let mut pr_ctx = context(&fake, &http, store.database());
+    pr_ctx.manifest_prefix = hestia::pipeline::pr_manifest_prefix(&main_ctx.manifest_prefix);
+    pr_ctx.base_manifest_prefix = Some(main_ctx.manifest_prefix.clone());
+
+    let now = now_unix();
+    main_ctx
+        .run(to_path_set(&[&on_main_first]), BTreeSet::new(), now)
+        .await
+        .expect("main run failed");
+
+    // The PR sees main's path (dedup-skips it) and commits to its own chain.
+    let stats = pr_ctx
+        .run(
+            to_path_set(&[&on_main_first, &on_pr]),
+            BTreeSet::new(),
+            now + 10,
+        )
+        .await
+        .expect("PR run failed");
+    assert_eq!(stats.pushed, 1);
+    assert_eq!(stats.skipped_existing, 1);
+    assert_eq!(stats.manifest_version, 1, "PR chain starts at its own 1");
+
+    // Main moves on after the PR wrote its first manifest.
+    main_ctx
+        .run(to_path_set(&[&on_main_later]), BTreeSet::new(), now + 20)
+        .await
+        .expect("second main run failed");
+
+    // The PR reads the union: its own path plus both of main's, including
+    // the one main added after the PR's manifest existed.
+    let (index, union) = pr_ctx.load_manifest_versioned().await.unwrap();
+    assert_eq!(index, 1);
+    for path in [&on_main_first, &on_pr, &on_main_later] {
+        assert!(union.paths.contains_key(&path_hash_of(path)));
+    }
+
+    // Main's chain never saw the PR's path.
+    let (main_index, main_manifest) = committed_manifest(&fake, &http).await.unwrap();
+    assert_eq!(main_index, 2);
+    assert!(!main_manifest.paths.contains_key(&path_hash_of(&on_pr)));
+}
