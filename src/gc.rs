@@ -51,7 +51,7 @@ use crate::gha::{Error as GhaError, blob};
 use crate::manifest::{
     Blake3Pack, ChunkHash, ChunkLocation, FileSystemObject, Manifest, PackHash, PackInfo, PathHash,
 };
-use crate::pipeline::{MANIFEST_PREFIX, now_unix, upload_pack};
+use crate::pipeline::{MANIFEST_PREFIX, now_unix, pr_manifest_prefix, upload_pack};
 
 pub const SECS_PER_HOUR: u64 = 3_600;
 pub const SECS_PER_DAY: u64 = 86_400;
@@ -826,20 +826,26 @@ impl GcContext {
     /// version that fails to decode aborts the run, since deleting with
     /// unknown references is unsafe.
     pub async fn protected_packs(&self) -> Result<BTreeSet<PackHash>, Error> {
-        let prefix = format!("{}#", self.manifest_prefix);
-        let entries = self.rest.list_caches(&prefix).await?;
         let mut protected: BTreeSet<PackHash> = BTreeSet::new();
-        for entry in entries
-            .iter()
-            .filter(|entry| entry.version == self.twirp.version())
-        {
-            match self.twirp.get_download_url(&entry.key, &[]).await? {
-                DownloadUrl::Hit { url, .. } => {
-                    let data = blob::get(&self.http, &url, None).await?;
-                    let manifest = Manifest::decode(&data)?;
-                    protected.extend(manifest.packs.keys().copied());
+        // Pull-request scopes commit to their own family; their packs are
+        // live too (a PR may still be building on them).
+        for family in [
+            self.manifest_prefix.clone(),
+            pr_manifest_prefix(&self.manifest_prefix),
+        ] {
+            let entries = self.rest.list_caches(&format!("{family}#")).await?;
+            for entry in entries
+                .iter()
+                .filter(|entry| entry.version == self.twirp.version())
+            {
+                match self.twirp.get_download_url(&entry.key, &[]).await? {
+                    DownloadUrl::Hit { url, .. } => {
+                        let data = blob::get(&self.http, &url, None).await?;
+                        let manifest = Manifest::decode(&data)?;
+                        protected.extend(manifest.packs.keys().copied());
+                    }
+                    DownloadUrl::Miss => {}
                 }
-                DownloadUrl::Miss => {}
             }
         }
         Ok(protected)
@@ -1157,10 +1163,20 @@ impl GcContext {
     }
 
     /// Execute step 6 of 6: delete superseded manifest versions (`m#K` for
-    /// `K < newest`). Without this, every drain and GC commit leaves one
-    /// dead entry behind forever.
+    /// `K < newest`) in the default family and the pull-request family
+    /// (`m3pr#K`). Without this, every drain and GC commit leaves one dead
+    /// entry behind forever.
     pub async fn cleanup_manifests(&self, now: u64) -> Result<usize, Error> {
-        let prefix = format!("{}#", self.manifest_prefix);
+        Ok(self
+            .cleanup_manifest_family(&self.manifest_prefix, now)
+            .await?
+            + self
+                .cleanup_manifest_family(&pr_manifest_prefix(&self.manifest_prefix), now)
+                .await?)
+    }
+
+    async fn cleanup_manifest_family(&self, family: &str, now: u64) -> Result<usize, Error> {
+        let prefix = format!("{family}#");
         let entries = self.rest.list_caches(&prefix).await?;
         let indexed: Vec<(u64, &CacheEntry)> = entries
             .iter()

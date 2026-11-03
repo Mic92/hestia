@@ -418,6 +418,33 @@ impl Daemon {
     }
 }
 
+/// Manifest families this daemon reads and writes (see
+/// [`pipeline::pr_manifest_prefix`]).
+struct ManifestFamilies {
+    /// Chain this daemon commits to.
+    own: String,
+    /// Default-branch chain unioned into every read (pull-request scope).
+    base: Option<String>,
+}
+
+impl ManifestFamilies {
+    /// Pull-request scope (`explicit`, or `git_ref` under `refs/pull/`)
+    /// writes its own family and reads the default branch's too.
+    fn new(explicit: bool, git_ref: Option<&str>) -> Self {
+        if explicit || git_ref.is_some_and(|git_ref| git_ref.starts_with("refs/pull/")) {
+            Self {
+                own: pipeline::pr_manifest_prefix(MANIFEST_PREFIX),
+                base: Some(MANIFEST_PREFIX.to_string()),
+            }
+        } else {
+            Self {
+                own: MANIFEST_PREFIX.to_string(),
+                base: None,
+            }
+        }
+    }
+}
+
 /// Load the newest committed manifest and publish it into the served
 /// store if it is newer than the current view. A drain may have published
 /// a newer manifest while the load was in flight (or the load may return a
@@ -428,12 +455,19 @@ async fn load_published_manifest(
     twirp: &TwirpClient,
     http: &reqwest::Client,
     manifest_store: &ManifestStore,
+    families: &ManifestFamilies,
 ) {
-    let save = crate::gha::savemutable::SaveMutable::new(twirp, http, MANIFEST_PREFIX);
-    match save.load().await {
-        Ok(Some(entry)) => manifest_store
-            .set_version_if_newer(pipeline::decode_manifest_or_empty(&entry.data), entry.index),
-        Ok(None) => {}
+    match pipeline::load_union(twirp, http, &families.own, families.base.as_deref()).await {
+        Ok((index, manifest)) => {
+            if let Some(base) = &families.base {
+                eprintln!(
+                    "hestia serve: manifest {}#{index} unioned with {base}#: {} paths",
+                    families.own,
+                    manifest.paths.len()
+                );
+            }
+            manifest_store.set_version_if_newer(manifest, index);
+        }
         Err(err) => {
             eprintln!("hestia serve: cannot load the manifest, substituting nothing: {err}");
         }
@@ -592,6 +626,9 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
     // the listeners are bound (below).
     let read_only = Arc::new(AtomicBool::new(args.read_only));
 
+    let git_ref = std::env::var("GITHUB_REF").ok();
+    let families = Arc::new(ManifestFamilies::new(args.pr_manifest, git_ref.as_deref()));
+
     let store_dir = store.store_dir().clone();
     let root_key = pipeline::root_key(&branch, &system);
     let pipeline = PipelineContext {
@@ -605,7 +642,8 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         run_id: std::env::var("GITHUB_RUN_ID")
             .ok()
             .filter(|id| !id.is_empty()),
-        manifest_prefix: MANIFEST_PREFIX.to_string(),
+        manifest_prefix: families.own.clone(),
+        base_manifest_prefix: families.base.clone(),
         pack_target_size: pipeline::PACK_TARGET_SIZE,
         read_only: read_only.clone(),
         // Replaced by Daemon::bind with the daemon's shared ManifestStore.
@@ -666,12 +704,14 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         let twirp = twirp.clone();
         let http = http.clone();
         let manifest_store = manifest_store.clone();
+        let families = families.clone();
         Arc::new(move || {
             let twirp = twirp.clone();
             let http = http.clone();
             let manifest_store = manifest_store.clone();
+            let families = families.clone();
             Box::pin(async move {
-                load_published_manifest(&twirp, &http, &manifest_store).await;
+                load_published_manifest(&twirp, &http, &manifest_store, &families).await;
             })
         })
     });
@@ -692,12 +732,14 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
         let http = http.clone();
         let manifest_store = manifest_store.clone();
         let min_version = args.wait_manifest_version;
+        let families = families.clone();
         tokio::spawn(async move {
             let reload = || {
                 let twirp = twirp.clone();
                 let http = http.clone();
                 let manifest_store = manifest_store.clone();
-                async move { load_published_manifest(&twirp, &http, &manifest_store).await }
+                let families = families.clone();
+                async move { load_published_manifest(&twirp, &http, &manifest_store, &families).await }
             };
             wait_for_manifest_version(&manifest_store, min_version, reload).await;
             let _ = manifest_ready_tx.send(true);
@@ -854,5 +896,26 @@ mod tests {
         assert!(!is_transient_accept_error(
             &std::io::Error::from_raw_os_error(libc::EBADF)
         ));
+    }
+
+    #[test]
+    fn pull_request_refs_use_the_pr_manifest_family() {
+        for (explicit, git_ref, pr) in [
+            (false, Some("refs/pull/7/merge"), true),
+            (true, Some("refs/heads/main"), true),
+            (true, None, true),
+            (false, Some("refs/heads/main"), false),
+            (false, Some("refs/tags/v1"), false),
+            (false, None, false),
+        ] {
+            let families = ManifestFamilies::new(explicit, git_ref);
+            if pr {
+                assert_eq!(families.own, "m3pr");
+                assert_eq!(families.base.as_deref(), Some("m3"));
+            } else {
+                assert_eq!(families.own, "m3");
+                assert_eq!(families.base, None);
+            }
+        }
     }
 }

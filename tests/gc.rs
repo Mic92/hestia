@@ -1000,6 +1000,63 @@ async fn stale_drain_resurrecting_dropped_path_keeps_its_pack() {
 }
 
 #[tokio::test]
+async fn packs_held_by_a_pull_request_manifest_survive_gc() {
+    // A PR chain (m3pr#) may still reference packs main has repacked away.
+    timed(async {
+        for pr_holds_pack in [false, true] {
+            let fake = FakeGha::start().await;
+            let http = client();
+            let sim = SimCache::new(&fake, &http);
+
+            let big = SimPath::new("big-app", 1, 200_000);
+            let small = SimPath::new("small-lib", 2, 40_000);
+            fake.set_clock(T0);
+            sim.push(
+                "main",
+                &[big.clone(), small.clone()],
+                &[big.clone(), small.clone()],
+                T0,
+            )
+            .await;
+            let original_pack = *sim.manifest().await.packs.keys().next().unwrap();
+
+            if pr_holds_pack {
+                let snapshot = sim.manifest().await;
+                SaveMutable::new(&sim.twirp, &sim.http, "m3pr")
+                    .save(|_| {
+                        snapshot
+                            .encode()
+                            .map_err(|err| GhaError::InvalidResponse(err.to_string()))
+                    })
+                    .await
+                    .expect("PR manifest commit");
+            }
+
+            // big dies on main; superseded main manifests guard its pack
+            // for a couple of runs, so GC daily until they are gone.
+            let t1 = T0 + 20 * DAY;
+            fake.set_clock(t1);
+            sim.push("main", &[], std::slice::from_ref(&small), t1)
+                .await;
+            for day in 0..4 {
+                let now = t1 + day * DAY;
+                fake.set_clock(now);
+                sim.gc(GcPolicy::default()).run(false, now).await.unwrap();
+            }
+
+            assert_eq!(
+                sim.stored_pack_keys()
+                    .await
+                    .contains(&pack_cache_key(&original_pack)),
+                pr_holds_pack,
+                "the old pack must survive exactly when a PR manifest references it"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn cas_dedup_touch_shields_orphan_from_the_sweep() {
     // Regression (found by docs/gc.als, DedupTargetSafe/InFlightUploadSafe):
     // a drain whose pack upload is a CAS no-op depends on an existing entry
