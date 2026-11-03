@@ -458,7 +458,16 @@ async fn load_published_manifest(
     families: &ManifestFamilies,
 ) {
     match pipeline::load_union(twirp, http, &families.own, families.base.as_deref()).await {
-        Ok((index, manifest)) => manifest_store.set_version_if_newer(manifest, index),
+        Ok((index, manifest)) => {
+            if let Some(base) = &families.base {
+                eprintln!(
+                    "hestia serve: manifest {}#{index} unioned with {base}#: {} paths",
+                    families.own,
+                    manifest.paths.len()
+                );
+            }
+            manifest_store.set_version_if_newer(manifest, index);
+        }
         Err(err) => {
             eprintln!("hestia serve: cannot load the manifest, substituting nothing: {err}");
         }
