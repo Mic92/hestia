@@ -368,7 +368,9 @@ impl ChunkFetcher {
     ///
     /// * expired signed URL (401/403) → refresh via Twirp, once;
     /// * transient network/server failure (connection drop, timeout, 5xx)
-    ///   → retry the same URL up to [`TRANSIENT_READ_RETRIES`] times.
+    ///   → retry the same URL up to [`TRANSIENT_READ_RETRIES`] times with
+    ///   backoff (an immediate retry of a throttled 503 just hits the same
+    ///   throttle).
     async fn read_pack_range(
         &self,
         pack: PackHash,
@@ -377,6 +379,7 @@ impl ChunkFetcher {
         let mut url = self.pack_url(pack, false).await?;
         let mut refreshed = false;
         let mut transient_left = TRANSIENT_READ_RETRIES;
+        let mut delay = blob::TRANSIENT_RETRY_DELAY;
         loop {
             match blob::get(&self.http, &url, Some(range.clone())).await {
                 Err(GhaError::Status { status, .. })
@@ -391,6 +394,8 @@ impl ChunkFetcher {
                         "hestia substituter: transient error reading pack {}, retrying: {err}",
                         pack_cache_key(&pack)
                     );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
                 }
                 result => return Ok(result?),
             }

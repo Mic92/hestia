@@ -28,7 +28,7 @@ const API_VERSION: &str = "2020-04-08";
 const TRANSIENT_RETRIES: u32 = 3;
 
 /// First retry delay; doubles per attempt.
-const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(500);
+pub const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Format a half-open byte range as an HTTP `Range` header value
 /// (inclusive on both ends per RFC 9110).

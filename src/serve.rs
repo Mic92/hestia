@@ -46,6 +46,10 @@ use tokio::net::{UnixListener, UnixStream};
 /// 64 MiB pack target keeps real repositories well below this.
 const MAX_PACK_VERIFY_ENTRIES: u64 = 1000;
 
+/// How long a pack Range read may go without receiving bytes before it
+/// counts as a transient failure (an idle timeout, not a total one).
+const PACK_READ_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 use crate::cli::ServeArgs;
 use crate::gha::twirp::TwirpClient;
 use crate::pathinfo::StoreDatabase;
@@ -653,12 +657,24 @@ pub async fn run(args: &ServeArgs) -> ExitCode {
 
     // The substituter HTTP server shares the manifest and access log with
     // the daemon and runs until the daemon exits.
+    //
+    // Its pack Range reads get their own client with a read timeout: a
+    // throttled Azure account can leave a read hanging forever while it
+    // holds the per-path lock, so every later request for that NAR fails.
+    // Timing out turns the stall into a transient error that is retried.
+    // (Not on the shared client: there the timer would also run while a
+    // large pack upload is still sending.)
+    let pack_http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(PACK_READ_STALL_TIMEOUT)
+        .build()
+        .expect("building the HTTP client failed");
     let substituter = Substituter::new(
         store_dir,
         manifest_store.clone(),
         daemon.access_log(),
         twirp.clone(),
-        http.clone(),
+        pack_http,
     )
     .with_activity_hook(daemon.activity_hook())
     .with_manifest_ready(manifest_ready_rx)
