@@ -734,6 +734,123 @@ async fn stale_manifest_lookup_aborts_gc_instead_of_wiping_the_cache() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn manifest_cleanup_preserves_ref_heads_and_protected_entries() {
+    timed(async {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        use axum::extract::{Path, Query, State};
+        use axum::http::StatusCode;
+        use axum::response::Json;
+        use axum::routing::{delete, get};
+        use hestia::gha::rest::{RestClient, format_timestamp};
+        use hestia::gha::twirp::TwirpClient;
+        use serde_json::{Value, json};
+
+        type Entries = Arc<Mutex<Vec<Value>>>;
+
+        async fn list(State(entries): State<Entries>) -> Json<Value> {
+            let entries = entries.lock().unwrap();
+            Json(json!({ "total_count": entries.len(), "actions_caches": *entries }))
+        }
+
+        async fn delete_key(
+            State(entries): State<Entries>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            let mut entries = entries.lock().unwrap();
+            let (deleted, kept): (Vec<_>, Vec<_>) = entries
+                .drain(..)
+                .partition(|entry| entry["key"] == query["key"]);
+            *entries = kept;
+            Json(json!({ "total_count": deleted.len(), "actions_caches": deleted }))
+        }
+
+        async fn delete_id(
+            State(entries): State<Entries>,
+            Path((_, _, id)): Path<(String, String, u64)>,
+        ) -> StatusCode {
+            let mut entries = entries.lock().unwrap();
+            let count = entries.len();
+            entries.retain(|entry| entry["id"] != id);
+            if entries.len() < count {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        }
+
+        let entries: Entries = Arc::new(Mutex::new(Vec::new()));
+        let router = axum::Router::new()
+            .route(
+                "/repos/{owner}/{repo}/actions/caches",
+                get(list).delete(delete_key),
+            )
+            .route(
+                "/repos/{owner}/{repo}/actions/caches/{id}",
+                delete(delete_id),
+            )
+            .with_state(entries.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = client();
+        let gc = SimCache {
+            http: http.clone(),
+            twirp: TwirpClient::new(http.clone(), &url, "fake-token"),
+            rest: RestClient::new(http, &url, "fake/repo", "fake-token")
+                .with_pacing(Duration::ZERO, Duration::ZERO),
+        }
+        .gc(GcPolicy::default());
+        let own = gc.twirp.version();
+
+        // Exercise both the issue's young main entry and an aged main head:
+        // a higher PR index supersedes neither one.
+        for main_age in [60, 2 * HOUR] {
+            let entry = |id, suffix, ref_name, version, created: String| {
+                json!({
+                    "id": id, "key": format!("{MANIFEST_PREFIX}#{suffix}"),
+                    "ref": ref_name, "version": version, "created_at": created,
+                })
+            };
+            let timestamp = |age| format_timestamp(T0 - age);
+            let old = timestamp(2 * HOUR);
+            let young = timestamp(60);
+            let future = format_timestamp(T0 + HOUR);
+            let main_ref = "refs/heads/main";
+            let pr_ref = "refs/pull/1/merge";
+            *entries.lock().unwrap() = vec![
+                entry(1, "10", main_ref, own, timestamp(main_age)),
+                entry(2, "10", pr_ref, own, old.clone()),
+                entry(3, "11", pr_ref, own, old.clone()),
+                entry(4, "7", "refs/heads/feature", own, old.clone()),
+                entry(5, "10", pr_ref, "other-version", old.clone()),
+                entry(6, "9", main_ref, own, young),
+                entry(7, "9", pr_ref, own, old.clone()),
+                entry(8, "8", pr_ref, own, timestamp(HOUR)),
+                entry(9, "7", pr_ref, own, "invalid".to_string()),
+                entry(10, "6", pr_ref, own, future),
+                entry(11, "+99", main_ref, own, old.clone()),
+                entry(12, "99", main_ref, "other-version", old),
+            ];
+            let expected: Vec<Value> = entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["id"] != 2 && entry["id"] != 7)
+                .cloned()
+                .collect();
+            assert_eq!(gc.cleanup_manifests(T0).await.unwrap(), 2);
+            assert_eq!(*entries.lock().unwrap(), expected);
+            assert_eq!(gc.cleanup_manifests(T0).await.unwrap(), 0);
+            assert!(!gc.rest.delete_by_id(2).await.unwrap());
+        }
+        server.abort();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn gc_never_deletes_packs_of_another_cache_version_namespace() {
     timed(async {
         let fake = FakeGha::start().await;
@@ -774,9 +891,8 @@ async fn gc_never_deletes_packs_of_another_cache_version_namespace() {
         // Production GC two hours later (the salted entries are past
         // min_age). The salted pack is referenced only by the salted
         // namespace's manifest, which production GC cannot read - it must
-        // not be judged a production orphan. Manifest `m#N` entries are
-        // not covered by this isolation: REST deletion is by key across
-        // versions.
+        // not be judged a production orphan. Its manifest must also survive
+        // production manifest cleanup.
         let t1 = T0 + 2 * HOUR;
         fake.set_clock(t1);
         let report = sim.gc(GcPolicy::default()).run(false, t1).await.unwrap();
@@ -793,6 +909,7 @@ async fn gc_never_deletes_packs_of_another_cache_version_namespace() {
             "the salted namespace's pack must survive production GC"
         );
         sim.assert_readable(&[&prod_path]).await;
+        assert_eq!(salted.manifest().await, salted_manifest);
     })
     .await;
 }

@@ -7,6 +7,7 @@
 //! ```text
 //! GET    /repos/{repo}/actions/caches?key={prefix}&per_page=&page=
 //! DELETE /repos/{repo}/actions/caches?key={key}
+//! DELETE /repos/{repo}/actions/caches/{id}
 //! ```
 //!
 //! The workflow needs `permissions: actions: write` for deletion.
@@ -185,6 +186,9 @@ pub fn format_timestamp(seconds: u64) -> String {
 /// path bump it, which is what makes 1-byte Range reads work as GC touches.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheEntry {
+    pub id: u64,
+    #[serde(rename = "ref")]
+    pub ref_name: String,
     pub key: String,
     /// Cache `version` namespace the entry was created under (the value the
     /// Twirp client sent with CreateCacheEntry). Lets GC distinguish its own
@@ -305,20 +309,20 @@ impl RestClient {
         *last = Some(Instant::now());
     }
 
-    /// Send a request and decode the response, waiting and retrying when
+    /// Send a request, waiting and retrying when
     /// GitHub rate-limits it and retrying transient failures (5xx, dropped
     /// connections) with bounded backoff. `mutating` requests are
     /// additionally paced. Every request this client sends is idempotent
-    /// (listing pages, delete-by-key), so retrying is always safe.
+    /// (listing pages, cache deletion).
     ///
     /// Rate limits answer 403 or 429; a Retry-After header or a "rate
     /// limit" message distinguishes them from a real permission error.
-    async fn send<T: serde::de::DeserializeOwned>(
+    async fn send(
         &self,
         url: &str,
         request: reqwest::RequestBuilder,
         mutating: bool,
-    ) -> Result<T, Error> {
+    ) -> Result<reqwest::Response, Error> {
         let mut attempts = 0;
         let mut transient_left = TRANSIENT_RETRIES;
         let mut transient_delay = TRANSIENT_RETRY_DELAY;
@@ -346,7 +350,7 @@ impl RestClient {
             };
             let status = response.status();
             if status.is_success() {
-                return Ok(response.json().await?);
+                return Ok(response);
             }
 
             if status.is_server_error() && transient_left > 0 {
@@ -419,7 +423,7 @@ impl RestClient {
             if !key_prefix.is_empty() {
                 request = request.query(&[("key", key_prefix)]);
             }
-            let list: CacheList = self.send(&url, request, false).await?;
+            let list: CacheList = self.send(&url, request, false).await?.json().await?;
             if list.total_count > max_total {
                 return Ok(None);
             }
@@ -447,9 +451,22 @@ impl RestClient {
             .request(reqwest::Method::DELETE, &url)
             .query(&[("key", key)]);
         match self.send(&url, request, true).await {
-            Ok(CacheList { actions_caches, .. }) => Ok(actions_caches),
+            Ok(response) => Ok(response.json::<CacheList>().await?.actions_caches),
             // GitHub returns 404 when nothing matched the key.
             Err(Error::Status { status: 404, .. }) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Delete one cache entry by ID without affecting same-key copies in
+    /// other versions or refs. Returns false if it was already gone.
+    pub async fn delete_by_id(&self, id: u64) -> Result<bool, Error> {
+        let url = format!("{}/{id}", self.caches_url());
+        let request = self.request(reqwest::Method::DELETE, &url);
+        match self.send(&url, request, true).await {
+            // The ID endpoint returns 204 No Content, not a JSON listing.
+            Ok(_) => Ok(true),
+            Err(Error::Status { status: 404, .. }) => Ok(false),
             Err(err) => Err(err),
         }
     }
@@ -546,6 +563,8 @@ mod tests {
         }"#;
         let list: CacheList = serde_json::from_str(json).unwrap();
         assert_eq!(list.total_count, 1);
+        assert_eq!(list.actions_caches[0].id, 505);
+        assert_eq!(list.actions_caches[0].ref_name, "refs/heads/main");
         assert_eq!(list.actions_caches[0].key, "pack-abc123");
         assert_eq!(list.actions_caches[0].size_in_bytes, 1024);
     }

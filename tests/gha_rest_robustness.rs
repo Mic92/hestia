@@ -21,7 +21,7 @@ use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use serde_json::json;
 
 use hestia::gha::rest::{RestClient, format_timestamp};
@@ -245,6 +245,15 @@ async fn rate_limited_delete_handler(
     single_entry_listing(&key).into_response()
 }
 
+async fn rate_limited_delete_by_id_handler(
+    State(state): State<Arc<Mutex<RateLimitedServer>>>,
+) -> Response {
+    if let Some(limited) = state.lock().unwrap().admit() {
+        return limited;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn rate_limited_list_handler(State(state): State<Arc<Mutex<RateLimitedServer>>>) -> Response {
     if let Some(limited) = state.lock().unwrap().admit() {
         return limited;
@@ -263,6 +272,10 @@ async fn start_rate_limited_server(
         .route(
             "/repos/{owner}/{repo}/actions/caches",
             get(rate_limited_list_handler).delete(rate_limited_delete_handler),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/caches/{id}",
+            delete(rate_limited_delete_by_id_handler),
         )
         .with_state(state.clone());
     (start_server(router).await, state)
@@ -343,15 +356,20 @@ async fn persistent_server_errors_still_fail() {
 #[tokio::test]
 async fn delete_retries_after_secondary_rate_limit() {
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let (url, state) = start_rate_limited_server(1).await;
-        let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
-            .with_pacing(Duration::ZERO, Duration::from_millis(100));
+        for by_id in [false, true] {
+            let (url, state) = start_rate_limited_server(1).await;
+            let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
+                .with_pacing(Duration::ZERO, Duration::from_millis(100));
 
-        // GitHub answered the first DELETE with a secondary rate limit
-        // error; the client must wait and retry instead of failing GC.
-        let deleted = rest.delete_by_key("pack-rate-limited").await.unwrap();
-        assert_eq!(deleted.len(), 1);
-        assert_eq!(state.lock().unwrap().requests.len(), 2);
+            // Both DELETE endpoints share the rate-limit retry policy.
+            if by_id {
+                assert!(rest.delete_by_id(1).await.unwrap());
+            } else {
+                let deleted = rest.delete_by_key("pack-rate-limited").await.unwrap();
+                assert_eq!(deleted.len(), 1);
+            }
+            assert_eq!(state.lock().unwrap().requests.len(), 2);
+        }
     })
     .await
     .expect("test timed out");
@@ -399,9 +417,9 @@ async fn mutating_requests_are_paced() {
         let rest = RestClient::new(reqwest::Client::new(), &url, "fake/repo", "fake-token")
             .with_pacing(interval, Duration::from_secs(1));
 
-        for i in 0..3 {
-            rest.delete_by_key(&format!("pack-{i}")).await.unwrap();
-        }
+        rest.delete_by_key("pack-0").await.unwrap();
+        assert!(rest.clone().delete_by_id(1).await.unwrap());
+        rest.delete_by_key("pack-2").await.unwrap();
 
         // Three deletes, two enforced gaps. Checking the gap between
         // consecutive server-side arrivals (not total elapsed time) so a
