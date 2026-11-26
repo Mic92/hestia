@@ -371,6 +371,9 @@ function serveFlags() {
   if (readOnly()) {
     flags.push('--read-only');
   }
+  if (getInput('pr-manifest') === 'true') {
+    flags.push('--pr-manifest');
+  }
   const waitManifestVersion = getInput('wait-manifest-version');
   if (waitManifestVersion && waitManifestVersion !== '0') {
     flags.push('--wait-manifest-version', waitManifestVersion);

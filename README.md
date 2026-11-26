@@ -204,6 +204,23 @@ Roots are how hestia decides what is still alive. They are unrelated to
 GitHub's own cache access scoping (who may read or write entries, see
 [Security](#security)), which applies on top.
 
+### Pull request manifests
+
+The manifest (the index of what the cache holds) is a chain of entries
+`m3#1`, `m3#2`, … committed with GitHub cache keys. GitHub resolves a key
+in the job's own scope first, so a PR that committed to `m3#` would shadow
+every later manifest of the default branch and never see what `main`
+cached after the PR started. A job on `refs/pull/*` (detected from
+`$GITHUB_REF`, or forced with `--pr-manifest` / the `pr-manifest` input)
+therefore commits to its own chain, `m3pr#1`, `m3pr#2`, … and reads the
+union of that chain and the default branch's `m3#`. The PR substitutes
+whatever `main` has cached so far plus its own builds, and `main`'s chain
+never contains PR paths.
+
+GC keeps the newest entry of every ref in both chains and treats the packs
+of all PR manifests as live, so a PR's longer chain never supersedes
+`main`'s head.
+
 ## Configuration
 
 All inputs are optional; the defaults work for the quick start above.
@@ -220,6 +237,7 @@ All inputs are optional; the defaults work for the quick start above.
 | `upstream-cache-key-names` | `cache.nixos.org-1` | Space-separated key names treated as upstream caches by the filter. |
 | `filter-drv-closures` | `false` | Apply the upstream filter to registered derivation closures; requires `upstream-cache-filter`. Use `hestia prefetch` for bulk closure fetching. |
 | `read-only` | `false` | Substitute from the cache but never write to it (no post-build-hook, no drain). |
+| `pr-manifest` | `false` | Commit manifests to the pull-request chain and read it unioned with the default branch's. Implied when the job runs on `refs/pull/*`. |
 | `no-closure` | `false` | Cache built paths only, without their runtime closure. |
 
 The GC workflow takes one input: `dry-run` (plan only, delete nothing); see
@@ -317,7 +335,8 @@ rebuilt.
   only their own scope; GitHub enforces this server-side and it cannot be
   disabled. The shared cache therefore only grows when the default branch
   builds, and main does one full rebuild of changed paths after every merge.
-  Run GC on the default branch only.
+  Run GC on the default branch only. PRs see `main`'s later manifests
+  through the [union read](#pull-request-manifests).
 * **CI-only.** The cache API is unreachable from outside GitHub Actions;
   hestia cannot serve developer machines. Use cachix/attic for that.
 * **Token lifetime.** The cache API token is a ~6 h JWT. Jobs that run

@@ -86,6 +86,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub read_only: bool,
 
+    /// Write manifests to the pull-request family and read it unioned with
+    /// the default branch's. Implied when $GITHUB_REF is refs/pull/*.
+    #[arg(long)]
+    pub pr_manifest: bool,
+
     /// Nix store database to read path metadata from.
     #[arg(long, default_value = crate::pathinfo::DEFAULT_DB_PATH)]
     pub db_path: PathBuf,

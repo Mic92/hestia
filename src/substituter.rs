@@ -208,13 +208,15 @@ impl ManifestStore {
             Arc::new(ManifestView::new(manifest, version));
     }
 
-    /// Replace the served manifest only if `version` is newer than the
-    /// served one. Used by the startup load, which runs concurrently with
+    /// Replace the served manifest only if `version` is at least the
+    /// served one (equal: the same own chain, whose base-chain union may
+    /// have grown; a pull-request scope starts at version 0 with the
+    /// default branch's manifest as its only content). Used by the startup load, which runs concurrently with
     /// the daemon: a drain may commit (and publish) a newer manifest before
     /// the initial load finishes, and that newer version must win.
     pub fn set_version_if_newer(&self, manifest: Manifest, version: u64) {
         let mut inner = self.inner.write().expect("manifest lock poisoned");
-        if version > inner.version {
+        if version >= inner.version {
             *inner = Arc::new(ManifestView::new(manifest, version));
         }
     }

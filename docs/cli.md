@@ -17,6 +17,7 @@ setups, or hacking on hestia).
 | `--upstream-cache-key-name <KEY_NAME>` | `cache.nixos.org-1` | Key names treated as upstream caches by the filter. Repeatable. |
 | `--filter-drv-closures` | off | Apply the upstream filter to registered derivation closures. Requires `--upstream-cache-filter`; use `hestia prefetch` to retain bulk closure fetching. |
 | `--read-only` | off | Serve the cache for substitution but never write to it (no uploads, no manifest commits). |
+| `--pr-manifest` | off | Commit manifests to the pull-request chain (`m3pr#`) and read it unioned with the default branch's. Implied when `$GITHUB_REF` is `refs/pull/*`. |
 | `--no-closure` | off | Cache built paths only, without their runtime closure. |
 | `--db-path <PATH>` | `/nix/var/nix/db/db.sqlite` | Nix store database to read path metadata from. |
 

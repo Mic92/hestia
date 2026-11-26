@@ -42,6 +42,17 @@ use futures_util::{StreamExt as _, TryStreamExt as _};
 /// orphaned packs age out through GC and eviction.
 pub const MANIFEST_PREFIX: &str = "m3";
 
+/// Manifest family a pull-request scope writes to, given the default
+/// family `prefix` (`m3` → `m3pr`). GitHub resolves a lookup in the run's
+/// own ref scope before the default branch, so a PR that wrote to the
+/// default family would shadow every later default-branch manifest, and
+/// GC's cross-ref cleanup would mix the two chains. A separate family
+/// lets a PR read both chains (`m3#` only ever holds default-branch
+/// entries, `m3pr#` only the PR's own) and keeps the chains disjoint.
+pub fn pr_manifest_prefix(prefix: &str) -> String {
+    format!("{prefix}pr")
+}
+
 /// Compressed bytes per pack before a new pack is started.
 pub const PACK_TARGET_SIZE: u64 = 64 * 1024 * 1024;
 
@@ -225,6 +236,11 @@ pub struct PipelineContext {
     /// SaveMutable family prefix (always [`MANIFEST_PREFIX`] in production;
     /// tests use distinct prefixes to isolate scenarios).
     pub manifest_prefix: String,
+    /// Family read in addition to `manifest_prefix` and unioned with it
+    /// (`None` on the default branch). Set in pull-request scope, where
+    /// `manifest_prefix` is [`pr_manifest_prefix`] and this is the
+    /// default branch's family. Never written.
+    pub base_manifest_prefix: Option<String>,
     /// Compressed bytes per pack ([`PACK_TARGET_SIZE`] in production; tests
     /// use small values to exercise pack splitting).
     pub pack_target_size: u64,
@@ -267,6 +283,28 @@ enum Verified {
     VerifyFailed,
 }
 
+/// Load the newest manifest of the `own` family, unioned with the newest
+/// of `base` when given. The returned index is the `own` chain's (the one
+/// this scope writes and reserves against; 0 when it has no entry yet).
+pub async fn load_union(
+    twirp: &TwirpClient,
+    http: &reqwest::Client,
+    own: &str,
+    base: Option<&str>,
+) -> Result<(u64, Manifest), Error> {
+    let (index, manifest) = match SaveMutable::new(twirp, http, own).load().await? {
+        Some(entry) => (entry.index, decode_manifest_or_empty(&entry.data)),
+        None => (0, Manifest::new()),
+    };
+    let Some(base) = base else {
+        return Ok((index, manifest));
+    };
+    match SaveMutable::new(twirp, http, base).load().await? {
+        Some(entry) => Ok((index, decode_manifest_or_empty(&entry.data).merge(manifest))),
+        None => Ok((index, manifest)),
+    }
+}
+
 impl PipelineContext {
     fn save_mutable(&self) -> SaveMutable<'_> {
         SaveMutable::new(&self.twirp, &self.http, &self.manifest_prefix)
@@ -281,10 +319,13 @@ impl PipelineContext {
     /// Like [`Self::load_manifest`], but also returns the SaveMutable index
     /// the manifest was loaded from (0 when none exists yet).
     pub async fn load_manifest_versioned(&self) -> Result<(u64, Manifest), Error> {
-        match self.save_mutable().load().await? {
-            Some(entry) => Ok((entry.index, decode_manifest_or_empty(&entry.data))),
-            None => Ok((0, Manifest::new())),
-        }
+        load_union(
+            &self.twirp,
+            &self.http,
+            &self.manifest_prefix,
+            self.base_manifest_prefix.as_deref(),
+        )
+        .await
     }
 
     /// Run the write pipeline.
